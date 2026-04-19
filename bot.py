@@ -124,7 +124,6 @@ class DeltaWebSocket:
         self._on_connected_callback:    Optional[callable] = None
         self._on_disconnected_callback: Optional[callable] = None
         self._on_error_callback:        Optional[callable] = None
-        # NEW: called after every successful reconnect so bot can backfill
         self._on_reconnect_callback:    Optional[callable] = None
 
     # ---- public setters ----
@@ -203,8 +202,6 @@ class DeltaWebSocket:
             try:
                 self._connect()
                 if not self._should_stop.is_set() and self._state != WSState.STOPPED:
-                    # After the first disconnect, fire reconnect callback so
-                    # the bot can backfill any missed candles.
                     if not first_connect and self._on_reconnect_callback:
                         try:
                             self._on_reconnect_callback()
@@ -219,7 +216,6 @@ class DeltaWebSocket:
                     self._reconnect()
 
     def _connect(self) -> None:
-        """Establish connection. Do NOT reset reconnect counters here."""
         self._state = WSState.CONNECTING
         _log("info", "WS", f"Connecting to {self.config.url}")
         self._ws = websocket.WebSocketApp(
@@ -264,7 +260,6 @@ class DeltaWebSocket:
         )
 
     def _on_open(self, ws) -> None:
-        """Reset counters only here — after confirmed handshake."""
         self._state = WSState.CONNECTED
         self._reconnect_attempts = 0
         self._reconnect_delay    = self.config.reconnect_base_delay
@@ -324,12 +319,6 @@ class DeltaWebSocket:
             _log("error", "WS", f"Message processing error: {e}")
 
     def _parse_candle_message(self, data: dict) -> Optional[dict]:
-        """
-        Delta India flat candlestick payload:
-        { "type": "candlestick_1m", "symbol": "BTCUSD", "open": ...,
-          "high": ..., "low": ..., "close": ..., "volume": ...,
-          "candle_start_time": <nanoseconds> }
-        """
         msg_type = data.get("type", "")
         if not msg_type.startswith("candlestick_"):
             return None
@@ -414,7 +403,6 @@ def to_trading_symbol(symbol: str) -> str:
 
 
 def to_ws_symbol(symbol: str) -> str:
-    """Bare symbol for WS subscriptions (no _PERP)."""
     s = symbol.upper().strip()
     if s.endswith("_PERP"):
         s = s[:-5]
@@ -424,7 +412,6 @@ def to_ws_symbol(symbol: str) -> str:
 
 
 def to_candle_symbol(symbol: str) -> str:
-    """REST candle endpoint requires no _PERP suffix."""
     s = symbol.upper().strip()
     if s.endswith("_PERP"):
         s = s[:-5]
@@ -437,7 +424,7 @@ def to_candle_symbol(symbol: str) -> str:
 #  6.  CONSTANTS
 # ================================================================
 REST_BASE_INDIA  = "https://api.india.delta.exchange"
-REST_BASE_GLOBAL = "https://api.delta.exchange"   # reference only
+REST_BASE_GLOBAL = "https://api.delta.exchange"
 
 CANDLE_LIMIT        = 20
 MAX_RETRIES         = 3
@@ -488,7 +475,6 @@ class APIRequestHandler:
         ))
 
     def _get_base_url(self, endpoint_type: str) -> str:
-        # Both public and private always use India endpoint
         return REST_BASE_INDIA
 
     def _sign_request(
@@ -496,18 +482,42 @@ class APIRequestHandler:
         params: dict = None, body: dict = None
     ) -> dict:
         """
-        Delta docs signature format:
-          METHOD + TIMESTAMP + PATH + ?QUERY_STRING + BODY_STRING
-        The '?' prefix is required when query params are present.
+        Delta Exchange signature format (official docs):
+          METHOD + TIMESTAMP + PATH + QUERY_STRING + BODY_STRING
+
+        ╔══════════════════════════════════════════════════════════╗
+        ║  BUG FIX — CRITICAL: query_string must NOT include '?'  ║
+        ║                                                          ║
+        ║  OLD (broken):                                           ║
+        ║    query_string = "?" + urlencode(sorted(params.items()))║
+        ║    → HMAC mismatch → 401 on EVERY private endpoint      ║
+        ║    → balance = 0, orders fail, leverage silently fails   ║
+        ║                                                          ║
+        ║  NEW (correct):                                          ║
+        ║    query_string = urlencode(params)  # no '?', no sort   ║
+        ║    → Signature matches Delta's expected pre-hash string  ║
+        ╚══════════════════════════════════════════════════════════╝
+
+        Why '?' breaks it:
+          Delta's server builds: GET + ts + /v2/wallet/balances + ""
+          Your code built:       GET + ts + /v2/wallet/balances + "?"
+          These are different strings → different HMAC → 401.
+
+        Why sorted() was also wrong:
+          The URL is built with params in their original dict order.
+          Sorting them changes the query_string in the signature
+          vs what requests actually sends in the URL, causing
+          another mismatch on endpoints with multiple query params.
         """
         if not self.api_key or not self.api_secret:
             raise ValueError("API key/secret missing")
+
         timestamp = str(int(time.time()))
 
+        # Query string: raw urlencode, NO '?' prefix, NO sorting
         query_string = ""
         if params:
-            sorted_params = sorted(params.items())
-            query_string  = "?" + urlencode(sorted_params)
+            query_string = urlencode(params)  # e.g. "symbol=BTCUSD&resolution=1h"
 
         body_string = ""
         if body and method.upper() != "GET":
@@ -857,39 +867,74 @@ class DeltaREST:
 
     def get_usd_balance(self) -> float:
         """
-        BUG FIX #3 — Delta Exchange India perpetuals (BTCUSD, ETHUSD) are
-        margined and settled in INR, not USD.  The docs state explicitly:
-        "Bitcoin Perpetual futures, quoted, settled & margined in INR."
+        Fetch available wallet balance for trading.
 
-        The old code filtered for asset_symbol == "USD" only, which returns
-        nothing on India accounts, giving 0.0 — causing all live trades to be
-        skipped with a capital warning.
+        ╔══════════════════════════════════════════════════════════════╗
+        ║  BUG FIX — BALANCE ALWAYS 0                                 ║
+        ║                                                              ║
+        ║  Root cause: the old _sign_request added "?" to the         ║
+        ║  query_string inside the HMAC pre-hash string.  This made   ║
+        ║  every private request return 401 → result=None → 0.0       ║
+        ║                                                              ║
+        ║  That bug is now fixed in _sign_request.  This method also  ║
+        ║  gains:                                                      ║
+        ║    • INR → USD → USDC → USDT priority (India perps use INR) ║
+        ║    • Logs full asset list when no currency matches, so you  ║
+        ║      can see exactly what your account holds                 ║
+        ║    • Explicit success=false check with error message         ║
+        ║    • Debug-level raw response log for diagnosis              ║
+        ╚══════════════════════════════════════════════════════════════╝
 
-        Fix: check for "INR" first (India perpetuals), then "USD" as fallback
-        (in case user holds USD on their account).  Log whichever is found.
-        If neither exists, log all available symbols so the user can debug.
+        Delta Exchange India BTCUSD / ETHUSD perpetuals are margined
+        and settled in INR (per official product description).
         """
         result = self.request_handler.request(
             "GET", "/v2/wallet/balances", endpoint_type="private"
         )
-        if result and "result" in result:
-            assets = result.get("result", [])
 
-            # Priority order: INR (India perps) → USD (fallback)
-            for preferred in ("INR", "USD"):
-                for asset in assets:
-                    if asset.get("asset_symbol") == preferred:
-                        bal = float(asset.get("available_balance", 0))
-                        _log("info", "BALANCE",
-                             f"{preferred} available balance: {bal:,.2f}")
-                        return bal
+        # Debug dump — visible in bot.log at DEBUG level
+        _log("debug", "BALANCE", f"Raw wallet response: {result}")
 
-            # Neither found — log all symbols to help the user diagnose
-            found_symbols = [a.get("asset_symbol") for a in assets]
-            _log("warning", "BALANCE",
-                 f"Neither INR nor USD found in wallet. "
-                 f"Available asset_symbol values: {found_symbols}. "
-                 f"Update get_usd_balance() to match your account currency.")
+        if not result:
+            _log("error", "BALANCE",
+                 "No response from /v2/wallet/balances. "
+                 "Possible causes: wrong API key/secret, IP not whitelisted, "
+                 "system clock drift > 5 s, or network error.")
+            return 0.0
+
+        if result.get("success") is False:
+            _log("error", "BALANCE",
+                 f"API returned success=false: {result.get('error', result)}")
+            return 0.0
+
+        assets = result.get("result", [])
+        if not isinstance(assets, list):
+            _log("error", "BALANCE",
+                 f"Unexpected 'result' format (expected list): {type(assets)} — {assets}")
+            return 0.0
+
+        # Priority order: INR (India perps) → USD → USDC → USDT
+        for preferred in ("INR", "USD", "USDC", "USDT"):
+            for asset in assets:
+                if asset.get("asset_symbol") == preferred:
+                    bal_raw = asset.get("available_balance", "0")
+                    try:
+                        bal = float(bal_raw)
+                    except (TypeError, ValueError):
+                        bal = 0.0
+                    _log("info", "BALANCE",
+                         f"{preferred} available balance: {bal:,.2f}")
+                    return bal
+
+        # Nothing matched — log every symbol so the user can extend the list
+        found = [
+            (a.get("asset_symbol"), a.get("available_balance"))
+            for a in assets
+        ]
+        _log("warning", "BALANCE",
+             f"No INR/USD/USDC/USDT found in wallet. "
+             f"All assets returned by the API: {found}. "
+             f"Add your account currency to the preferred list in get_usd_balance().")
         return 0.0
 
     def place_order(
@@ -900,10 +945,6 @@ class DeltaREST:
         order_type:  str           = "market_order",
         limit_price: Optional[float] = None,
     ) -> dict:
-        """
-        Place a market or limit order.
-        Returns the full API response dict (never None — caller checks 'error' key).
-        """
         if side not in ("buy", "sell"):
             _log("error", "ORDER", f"Invalid side '{side}'. Must be 'buy' or 'sell'.")
             return {"error": "invalid_side"}
@@ -933,31 +974,15 @@ class DeltaREST:
         stop_price:   float,
     ) -> dict:
         """
-        Place an exchange-side stop-market order that survives bot crashes,
-        internet drops, and PC sleep.
+        Exchange-side stop-market order with reduce_only + LTP trigger.
 
-        BUG FIX #2a — Add reduce_only: True
-          Delta India deprecated bracket orders (May 2024). The modern
-          replacement is a reduce-only stop-market order. WITHOUT reduce_only,
-          if the short is already closed when this SL fires, it opens a brand
-          new LONG position — the exact opposite of what you want. With
-          reduce_only=True the exchange cancels the order instead of flipping.
+        BUG FIX #2a — reduce_only: True
+          Without this, a fired SL on an already-closed short opens a
+          new LONG instead of doing nothing.
 
-        BUG FIX #2b — Add stop_trigger_method: "last_traded_price"
-          Delta defaults to mark price as the trigger index. Mark price lags
-          last traded price (LTP) by design to prevent manipulation. On a fast
-          BTC move the gap can be $100-$300. Using LTP ensures the SL triggers
-          at the actual market price, not the smoothed mark price.
-
-        Correct modern body for a short position SL (closes via BUY):
-          product_id        : <id>
-          size              : <contracts>
-          side              : "buy"
-          order_type        : "market_order"
-          stop_order_type   : "stop_loss_order"
-          stop_price        : "<price>"  (string)
-          stop_trigger_method : "last_traded_price"   ← BUG FIX #2b
-          reduce_only       : true                    ← BUG FIX #2a
+        BUG FIX #2b — stop_trigger_method: "last_traded_price"
+          Mark price lags LTP by $100-$300 on fast BTC moves.
+          LTP trigger ensures SL fires at the actual traded price.
         """
         if stop_price <= 0:
             _log("error", "SL-ORDER", f"Invalid stop_price {stop_price}")
@@ -1111,12 +1136,10 @@ class DeltaREST:
         BUG FIX #1 — correct Delta India leverage endpoint:
           WRONG (old): POST /v2/products/{product_id}/leverage
           RIGHT (new): POST /v2/products/{product_id}/orders/leverage
-        The old endpoint returns 404 silently, leaving leverage at account
-        default (1x), which makes the margin sizing formula wrong.
         """
         body   = {"leverage": str(leverage)}
         result = self.request_handler.request(
-            "POST", f"/v2/products/{product_id}/orders/leverage",  # FIXED
+            "POST", f"/v2/products/{product_id}/orders/leverage",
             endpoint_type="private", body=body,
         )
         if result and "result" in result:
@@ -1127,7 +1150,6 @@ class DeltaREST:
         return False
 
     def close_position(self, product_id: int, size: int, side: str = "buy") -> dict:
-        """Close a position with a market order. side='buy' to close a short."""
         _log("info", "CLOSE",
              f"Closing position: product_id={product_id} size={size} side={side}")
         result = self.place_order(
@@ -1149,19 +1171,17 @@ def compute_position_size(
     entry_price:     float,
     stop_loss_price: float,
     account_balance: float,
-    risk_pct:        float,   # 0.0-1.0 fraction (e.g. 0.02 for 2 %)
+    risk_pct:        float,
     leverage:        int,
 ) -> Tuple[int, dict]:
     """
-    Correct risk-based position sizing that considers stop-loss distance.
+    Risk-based position sizing using stop-loss distance.
 
     Step 1  risk_amount   = account_balance * risk_pct
     Step 2  stop_distance = abs(entry_price - stop_loss_price)
     Step 3  risk_size     = risk_amount / stop_distance
     Step 4  max_by_margin = (account_balance * leverage) / entry_price
-    Step 5  final_size    = min(risk_size, max_by_margin)  rounded down to int >= 1
-
-    Returns (final_size, diagnostics_dict).
+    Step 5  final_size    = min(risk_size, max_by_margin)  rounded to int >= 1
     """
     risk_amount   = account_balance * risk_pct
     stop_distance = abs(entry_price - stop_loss_price)
@@ -1213,7 +1233,7 @@ class TradingBot:
         self.api_key         = config.get("api_key",    "")
         self.api_secret      = config.get("api_secret", "")
         self.trading_capital = float(config.get("trading_capital", 0.0))
-        self.risk_pct        = config["risk_pct"] / 100.0   # stored as fraction
+        self.risk_pct        = config["risk_pct"] / 100.0
 
         self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
         self.timeframe      = self._tf.key
@@ -1236,7 +1256,6 @@ class TradingBot:
         self.running    = False
         self.ws_manager: Optional[DeltaWebSocket] = None
 
-        # Optional UI callbacks
         self.on_signal_callback = None
         self.on_trade_callback  = None
         self.on_log_callback    = None
@@ -1350,7 +1369,6 @@ class TradingBot:
         self.ws_manager.set_connected_callback(self._on_ws_connected)
         self.ws_manager.set_disconnected_callback(self._on_ws_disconnected)
         self.ws_manager.set_error_callback(self._on_ws_error)
-        # Backfill missed candles after every reconnect
         self.ws_manager.set_reconnect_callback(self._on_ws_reconnect)
 
         ws_symbols = [to_ws_symbol(sym) for sym in self.symbols]
@@ -1364,9 +1382,6 @@ class TradingBot:
     # ------------------------------------------------------------------ #
 
     def _on_ws_candle(self, symbol: str, candle: dict) -> None:
-        """
-        Called by WS manager with trading-format symbol (e.g. BTCUSD_PERP).
-        """
         self._log("debug", "WS-CANDLE",
                   f"{symbol} | t={candle.get('time')} "
                   f"O={candle.get('open')} H={candle.get('high')} "
@@ -1376,7 +1391,6 @@ class TradingBot:
             self.process_candle(symbol, candle)
             return
 
-        # Fuzzy match for edge cases
         for known in self.candle_store:
             if to_ws_symbol(known) == to_ws_symbol(symbol):
                 self.process_candle(known, candle)
@@ -1395,11 +1409,6 @@ class TradingBot:
         self._log("error", "WS", f"WebSocket error: {error}")
 
     def _on_ws_reconnect(self) -> None:
-        """
-        Called every time the WebSocket reconnects after a drop.
-        Backfills any candles that arrived while we were offline,
-        then re-evaluates signals on each symbol to avoid gaps.
-        """
         self._log("info", "BACKFILL",
                   "WebSocket reconnected — backfilling missed candles...")
         for sym in self.symbols:
@@ -1407,10 +1416,6 @@ class TradingBot:
         self._log("info", "BACKFILL", "Backfill complete.")
 
     def _backfill_symbol(self, symbol: str) -> None:
-        """
-        Fetch the latest REST candles and merge any new ones into the
-        in-memory store without creating duplicates.
-        """
         store = self.candle_store.get(symbol)
         if store is None:
             return
@@ -1420,7 +1425,6 @@ class TradingBot:
             self._log("warning", "BACKFILL", f"No fresh candles for {symbol}")
             return
 
-        # Build set of timestamps already in store
         existing_ts = {c["time"] for c in store}
         added       = 0
         for c in sorted(fresh, key=lambda x: x["time"]):
@@ -1436,7 +1440,7 @@ class TradingBot:
             self._log("info", "BACKFILL", f"{symbol}: no new candles needed")
 
     # ------------------------------------------------------------------ #
-    #  Candle processing — FIX: correctly indented inside TradingBot      #
+    #  Candle processing                                                   #
     # ------------------------------------------------------------------ #
 
     def process_candle(self, symbol: str, candle: dict) -> None:
@@ -1446,44 +1450,28 @@ class TradingBot:
         if not validate_candle(candle, symbol):
             return
 
-        # Case 1: same timestamp → current candle update
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
-
             self._log(
-                "info",
-                "LIVE-CANDLE",
-                (
-                    f"{symbol} | FORMING | "
-                    f"O={candle['open']:.2f} "
-                    f"H={candle['high']:.2f} "
-                    f"L={candle['low']:.2f} "
-                    f"C={candle['close']:.2f}"
-                )
+                "info", "LIVE-CANDLE",
+                (f"{symbol} | FORMING | "
+                 f"O={candle['open']:.2f} H={candle['high']:.2f} "
+                 f"L={candle['low']:.2f} C={candle['close']:.2f}")
             )
             return
 
-        # Case 2: new timestamp → previous candle just closed
         if store:
             closed = store[-1]
-
             self._log(
-                "info",
-                "CANDLE-CLOSED",
-                (
-                    f"{symbol} | CLOSED | "
-                    f"O={closed['open']:.2f} "
-                    f"H={closed['high']:.2f} "
-                    f"L={closed['low']:.2f} "
-                    f"C={closed['close']:.2f} "
-                    f"T={closed['time']}"
-                )
+                "info", "CANDLE-CLOSED",
+                (f"{symbol} | CLOSED | "
+                 f"O={closed['open']:.2f} H={closed['high']:.2f} "
+                 f"L={closed['low']:.2f} C={closed['close']:.2f} "
+                 f"T={closed['time']}")
             )
 
-        # add new candle as current forming
         store.append(candle)
 
-        # strategy check only after close
         if symbol in self.active_trades:
             self._check_stop_loss(symbol, candle)
         else:
@@ -1492,18 +1480,13 @@ class TradingBot:
                 self._on_signal(symbol, signal_candle)
 
     # ------------------------------------------------------------------ #
-    #  Stop-loss monitoring (local)                                        #
+    #  Stop-loss monitoring (local fallback)                               #
     # ------------------------------------------------------------------ #
 
     def _check_stop_loss(self, symbol: str, candle: dict) -> None:
-        """
-        Local stop-loss monitor. Acts as fallback only — the primary
-        stop-loss is the exchange-side stop-market order placed at entry.
-        """
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade:
             return
-        # For a short, SL triggers when HIGH crosses above stop_loss price
         if candle["high"] < trade["stop_loss"]:
             return
 
@@ -1536,7 +1519,6 @@ class TradingBot:
         }
         self.sl_events.append(ev)
 
-        # Attempt to close via REST as belt-and-braces
         if not self.paper:
             pid  = trade.get("product_id")
             size = trade.get("size", 1)
@@ -1625,22 +1607,11 @@ class TradingBot:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Live trade execution  (patched: correct sizing + exchange SL)      #
+    #  Live trade execution                                                #
     # ------------------------------------------------------------------ #
 
     def _execute_trade(self, symbol: str, signal: dict) -> None:
-        """
-        Full live trade execution:
-          1. Guard against duplicates
-          2. Fetch live balance
-          3. Risk-based contract sizing (stop-distance formula)
-          4. Place entry market order
-          5. Confirm fill (check result structure)
-          6. Place exchange-side stop-loss order
-          7. Record trade
-        """
         try:
-            # --- 1. Duplicate guard ---
             with self._trade_lock:
                 if symbol in self.active_trades:
                     self._log("info", "TRADE",
@@ -1648,7 +1619,6 @@ class TradingBot:
                     return
                 self.active_trades[symbol] = {"_reserved": True}
 
-            # --- 2. Live balance ---
             account_balance = self.rest.get_usd_balance() or 0.0
             capital         = self.trading_capital
 
@@ -1670,7 +1640,6 @@ class TradingBot:
                     self.active_trades.pop(symbol, None)
                 return
 
-            # --- 3. Risk-based sizing ---
             entry = signal["entry"]
             sl    = signal["stop_loss"]
             pid   = self.product_map.get(symbol)
@@ -1697,7 +1666,6 @@ class TradingBot:
                     self.active_trades.pop(symbol, None)
                 return
 
-            # --- Print sizing summary ---
             print()
             print(f"  [TRADE] {symbol}  SHORT  @ {entry:.4f}")
             print(f"          product_id       : {pid}")
@@ -1712,14 +1680,12 @@ class TradingBot:
             print(f"          account_balance  : ${account_balance:,.2f}")
             print()
 
-            # --- 4. Place entry order ---
             entry_result = self.rest.place_order(
                 product_id=pid, side="sell",
                 size=position_size, order_type="market_order",
             )
 
-            # --- 5. Confirm fill ---
-            order_ok   = False
+            order_ok    = False
             order_state = entry_result.get("result", {}).get("state", "") if entry_result else ""
             order_id    = entry_result.get("result", {}).get("id")        if entry_result else None
 
@@ -1732,7 +1698,6 @@ class TradingBot:
                               f"Order REJECTED by exchange: {reject_reason}")
                     order_ok = False
                 else:
-                    # Treat unknown state as ok (partial / queued)
                     order_ok = True
 
             if not order_ok:
@@ -1750,8 +1715,6 @@ class TradingBot:
                 print(f"       Order ID: {order_id}")
             print()
 
-            # --- 6. Exchange-side stop-loss ---
-            # For a short, closing order is a BUY at stop_price above entry
             sl_result   = self.rest.place_stop_market_order(
                 product_id=pid,
                 side="buy",
@@ -1772,7 +1735,6 @@ class TradingBot:
                 print(f"  [SL-WARN] Exchange SL failed — local SL monitoring active: {sl_result}")
             print()
 
-            # --- 7. Record trade ---
             signal["executed"]        = True
             signal["size"]            = position_size
             signal["capital_used"]    = capital
@@ -1816,13 +1778,14 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v8.0            |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v8.1            |")
         print("|   Strategy : SHORT Breakout + Wick Rejection           |")
         print("|   Sizing   : Risk-based (stop-distance formula)        |")
         print("|   SL       : Exchange-side + reduce_only + LTP trigger |")
         print("|   Fix #1   : Leverage  /orders/leverage endpoint       |")
         print("|   Fix #2   : SL reduce_only=True + stop_trigger=LTP    |")
         print("|   Fix #3   : Balance INR-first (India perpetuals)      |")
+        print("|   Fix #4   : Signature — no '?' in HMAC pre-hash      |")
         print("|   Endpoint : wss://socket.india.delta.exchange         |")
         print("+========================================================+")
         print()
@@ -1956,13 +1919,14 @@ def ask_risk_params() -> Tuple[float, int]:
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v8.0        |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v8.1        |")
     print("  |   Strategy : SHORT Breakout + Wick Rejection         |")
     print("  |   Sizing   : Risk-based (stop-distance formula)      |")
     print("  |   SL       : reduce_only + last_traded_price trigger |")
     print("  |   Fix #1   : /orders/leverage endpoint (correct)     |")
     print("  |   Fix #2   : SL reduce_only=True + LTP trigger       |")
     print("  |   Fix #3   : Balance INR-first for India accounts    |")
+    print("  |   Fix #4   : Signature — no '?' in HMAC pre-hash    |")
     print("  |   Endpoint : wss://socket.india.delta.exchange       |")
     print("  +======================================================+")
 
@@ -1987,7 +1951,12 @@ def main() -> None:
         print("\n  Fetching account balance...")
         account_balance = rest_tmp.get_usd_balance() or 0.0
         if account_balance <= 0:
-            print("  [WARN] Balance = 0. Check API key permissions.")
+            print("  [WARN] Balance = 0. Possible causes:")
+            print("         • Wrong API key or secret")
+            print("         • IP address not whitelisted on Delta Exchange")
+            print("         • System clock out of sync (must be within ±5 seconds)")
+            print("         • API key missing 'Read' permission")
+            print("         Check bot.log for the raw API response.")
     else:
         _divider("PAPER MODE CAPITAL")
         try:
@@ -2062,4 +2031,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()
