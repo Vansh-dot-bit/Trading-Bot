@@ -479,7 +479,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "DeltaBot/8.0",
+            "User-Agent":   "DeltaBot/9.0",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -496,39 +496,22 @@ class APIRequestHandler:
         params: dict = None, body: dict = None
     ) -> dict:
         """
-        Delta Exchange official signature format:
-          METHOD + TIMESTAMP + PATH + QUERY_STRING + BODY_STRING
-
-        ══════════════════════════════════════════════════════════
-        FIX 1 — Removed "?" prefix from query_string in HMAC msg
-          OLD (broken): query_string = "?" + urlencode(sorted(...))
-          NEW (correct): query_string = urlencode(params)
-
-          Why it broke everything:
-            Delta server computes: "GET" + ts + "/v2/wallet/balances" + ""
-            Old code computed:     "GET" + ts + "/v2/wallet/balances" + "?"
-            Different string → different HMAC → 401 on every private call
-            → verify_account() = None, get_usd_balance() = 0.0,
-              set_leverage() silent fail, place_order() fail
-
-        FIX 2 — Removed sorted() from params
-          sorted() changes param order in the signature string but
-          requests sends them in original order in the URL, causing
-          a second mismatch on any endpoint with multiple params.
-        ══════════════════════════════════════════════════════════
+        Delta docs signature format:
+          METHOD + TIMESTAMP + PATH + ?QUERY_STRING + BODY_STRING
+        The '?' prefix is required when query params are present.
         """
         if not self.api_key or not self.api_secret:
             raise ValueError("API key/secret missing")
         timestamp = str(int(time.time()))
 
-        # ✅ No "?" prefix. No sorting. Raw urlencode only.
         query_string = ""
         if params:
-            query_string = urlencode(params)
+            sorted_params = sorted(params.items())
+            query_string  = "?" + urlencode(sorted_params)
 
         body_string = ""
         if body and method.upper() != "GET":
-            body_string = json.dumps(body, separators=(",", ":"))
+            body_string = json.dumps(body)
 
         message   = method.upper() + timestamp + path + query_string + body_string
         signature = hmac.new(
@@ -874,77 +857,23 @@ class DeltaREST:
 
     def get_usd_balance(self) -> float:
         """
-        Fetch available wallet balance.
+        Fetch available trading balance.
 
-        ══════════════════════════════════════════════════════════
-        FIX 3 — Currency priority: INR first, then USD fallbacks
-
-          OLD (broken): only checked asset_symbol == "USD"
-            Delta Exchange India perpetuals (BTCUSD, ETHUSD) are
-            margined and settled in INR per the official product
-            description. An India account has no "USD" asset row,
-            so the loop found nothing and returned 0.0 every time.
-
-          NEW (correct): INR → USD → USDC → USDT priority scan
-            Finds INR on India accounts immediately.
-            Falls back to USD/USDC/USDT for non-India or mixed accounts.
-            If nothing matches, logs ALL asset symbols returned by the
-            API so you can see exactly what your account holds and
-            extend the list if needed.
-
-        FIX 4 — Explicit success=False guard
-          If the signature was wrong, the API returns
-          {"success": false, "error": "SignatureDoesNotMatch"}.
-          The old code only checked "result" in result, which is
-          falsy on error responses, so it silently returned 0.0
-          with no explanation. Now we log the actual error text.
-        ══════════════════════════════════════════════════════════
+        NOTE (Problem 2 kept unfixed per user instruction):
+        Checks USDT and USD asset symbols only.
+        Delta India perps settle in INR — if live balance returns 0.0,
+        change the check below to "INR" to match your account.
         """
         result = self.request_handler.request(
             "GET", "/v2/wallet/balances", endpoint_type="private"
         )
-
-        # Full raw response at DEBUG level → visible in bot.log
-        _log("debug", "BALANCE", f"Raw wallet response: {result}")
-
-        if not result:
-            _log("error", "BALANCE",
-                 "No response from /v2/wallet/balances. "
-                 "Causes: wrong API key/secret, IP not whitelisted, "
-                 "clock drift > 5 s, or network error.")
-            return 0.0
-
-        # Explicit API-level error check (e.g. SignatureDoesNotMatch)
-        if result.get("success") is False:
-            _log("error", "BALANCE",
-                 f"API error: {result.get('error', result)}")
-            return 0.0
-
-        assets = result.get("result", [])
-        if not isinstance(assets, list):
-            _log("error", "BALANCE",
-                 f"Unexpected result format: {type(assets)} — {assets}")
-            return 0.0
-
-        # ✅ Check INR first (India perpetuals), then USD variants
-        for preferred in ("INR", "USD", "USDC", "USDT"):
-            for asset in assets:
-                if asset.get("asset_symbol") == preferred:
-                    bal_raw = asset.get("available_balance", "0")
-                    try:
-                        bal = float(bal_raw)
-                    except (TypeError, ValueError):
-                        bal = 0.0
+        if result and "result" in result:
+            for asset in result.get("result", []):
+                if asset.get("asset_symbol") in ("USDT", "USD"):
+                    bal = float(asset.get("available_balance", 0))
                     _log("info", "BALANCE",
-                         f"{preferred} available balance: {bal:,.2f}")
+                         f"Balance ({asset.get('asset_symbol')}) available: {bal:,.2f}")
                     return bal
-
-        # Nothing matched — show exactly what the API returned
-        found = [(a.get("asset_symbol"), a.get("available_balance")) for a in assets]
-        _log("warning", "BALANCE",
-             f"No INR/USD/USDC/USDT in wallet. "
-             f"API returned these assets: {found}. "
-             f"Add your currency to the preferred list in get_usd_balance().")
         return 0.0
 
     def place_order(
@@ -1495,56 +1424,41 @@ class TradingBot:
     # ------------------------------------------------------------------ #
 
     def process_candle(self, symbol: str, candle: dict) -> None:
+        """
+        Main candle dispatch:
+          - If timestamp == last stored  → update forming candle, check local SL
+          - If timestamp > last stored   → close previous candle, run strategy,
+                                           then append new forming candle
+        """
         store = self.candle_store.get(symbol)
         if store is None:
             return
+
         if not validate_candle(candle, symbol):
             return
 
-        # Case 1: same timestamp → current candle update
+        # --- Forming candle update ---
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
-
-            self._log(
-                "info",
-                "LIVE-CANDLE",
-                (
-                    f"{symbol} | FORMING | "
-                    f"O={candle['open']:.2f} "
-                    f"H={candle['high']:.2f} "
-                    f"L={candle['low']:.2f} "
-                    f"C={candle['close']:.2f}"
-                )
-            )
+            if symbol in self.active_trades:
+                self._check_stop_loss(symbol, candle)
             return
 
-        # Case 2: new timestamp → previous candle just closed
+        # --- New candle: previous candle just closed ---
         if store:
             closed = store[-1]
+            self._log("info", "CANDLE-CLOSED",
+                      f"{symbol} | {self.timeframe} | CLOSED | "
+                      f"O={closed['open']:.2f} H={closed['high']:.2f} "
+                      f"L={closed['low']:.2f} C={closed['close']:.2f} "
+                      f"V={closed.get('volume', 0):.2f}")
 
-            self._log(
-                "info",
-                "CANDLE-CLOSED",
-                (
-                    f"{symbol} | CLOSED | "
-                    f"O={closed['open']:.2f} "
-                    f"H={closed['high']:.2f} "
-                    f"L={closed['low']:.2f} "
-                    f"C={closed['close']:.2f} "
-                    f"T={closed['time']}"
-                )
-            )
+            if symbol not in self.active_trades:
+                if check_short_signal(list(store)):
+                    self._on_signal(symbol, closed)
 
-        # add new candle as current forming
+        # Append new forming candle
         store.append(candle)
-
-        # strategy check only after close
-        if symbol in self.active_trades:
-            self._check_stop_loss(symbol, candle)
-        else:
-            if check_short_signal(list(store)):
-                signal_candle = store[-2] if len(store) >= 2 else store[-1]
-                self._on_signal(symbol, signal_candle)
 
     # ------------------------------------------------------------------ #
     #  Stop-loss monitoring (local)                                        #
@@ -1871,14 +1785,15 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v8.0            |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v9.0            |")
         print("|   Strategy : SHORT Breakout + Wick Rejection           |")
         print("|   Sizing   : Risk-based (stop-distance formula)        |")
         print("|   SL       : Exchange-side + reduce_only + LTP trigger |")
         print("|   Fix #1   : Leverage  /orders/leverage endpoint       |")
         print("|   Fix #2   : SL reduce_only=True + stop_trigger=LTP    |")
-        print("|   Fix #3   : Balance INR-first (India perpetuals)      |")
-        print("|   Fix #4   : Signature — no '?' in HMAC pre-hash      |")
+        print("|   Fix #3   : No /v2/time — local time.time() only      |")
+        print("|   Fix #4   : process_candle appends AFTER strategy     |")
+        print("|   Note     : Balance uses USDT/USD (Problem 2 open)    |")
         print("|   Endpoint : wss://socket.india.delta.exchange         |")
         print("+========================================================+")
         print()
@@ -2012,14 +1927,15 @@ def ask_risk_params() -> Tuple[float, int]:
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v8.0        |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v9.0        |")
     print("  |   Strategy : SHORT Breakout + Wick Rejection         |")
     print("  |   Sizing   : Risk-based (stop-distance formula)      |")
-    print("  |   SL       : reduce_only + last_traded_price trigger |")
-    print("  |   Fix #1   : /orders/leverage endpoint (correct)     |")
+    print("  |   SL       : reduce_only=True + last_traded_price    |")
+    print("  |   Fix #1   : Leverage  /orders/leverage endpoint     |")
     print("  |   Fix #2   : SL reduce_only=True + LTP trigger       |")
-    print("  |   Fix #3   : Balance INR-first for India accounts    |")
-    print("  |   Fix #4   : Signature — no '?' in HMAC pre-hash    |")
+    print("  |   Fix #3   : No /v2/time — uses time.time() only     |")
+    print("  |   Fix #4   : process_candle appends AFTER strategy   |")
+    print("  |   Note     : Balance uses USDT/USD (Problem 2 open)  |")
     print("  |   Endpoint : wss://socket.india.delta.exchange       |")
     print("  +======================================================+")
 
@@ -2044,12 +1960,7 @@ def main() -> None:
         print("\n  Fetching account balance...")
         account_balance = rest_tmp.get_usd_balance() or 0.0
         if account_balance <= 0:
-            print("  [WARN] Balance = 0. Possible causes:")
-            print("         • Wrong API key or secret")
-            print("         • IP address not whitelisted on Delta Exchange")
-            print("         • System clock out of sync (must be within ±5 seconds)")
-            print("         • API key missing 'Read' permission")
-            print("         Check bot.log for the raw API response.")
+            print("  [WARN] Balance = 0. Check API key permissions.")
     else:
         _divider("PAPER MODE CAPITAL")
         try:
