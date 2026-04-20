@@ -705,7 +705,7 @@ def check_short_signal(candles: List[dict]) -> bool:
     Conditions:
       1. i2.close > i3.high   (1st breakout)
       2. i1.close > i2.high   (2nd breakout)
-      3. i .close > i1.high   (3rd breakout)
+      3. i .higH > i1.high   (3rd breakout)
       4. upper_wick(i) > body(i)  (rejection wick)
     """
     if len(candles) < 5:
@@ -715,7 +715,7 @@ def check_short_signal(candles: List[dict]) -> bool:
     i2 = candles[-4]
     i3 = candles[-5]
     breakout  = (
-        i["close"]  > i1["high"] and
+        i["high"]  > i1["high"] and
         i1["close"] > i2["high"] and
         i2["close"] > i3["high"]
     )
