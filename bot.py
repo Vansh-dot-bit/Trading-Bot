@@ -124,7 +124,6 @@ class DeltaWebSocket:
         self._on_connected_callback:    Optional[callable] = None
         self._on_disconnected_callback: Optional[callable] = None
         self._on_error_callback:        Optional[callable] = None
-        # NEW: called after every successful reconnect so bot can backfill
         self._on_reconnect_callback:    Optional[callable] = None
 
     # ---- public setters ----
@@ -203,8 +202,6 @@ class DeltaWebSocket:
             try:
                 self._connect()
                 if not self._should_stop.is_set() and self._state != WSState.STOPPED:
-                    # After the first disconnect, fire reconnect callback so
-                    # the bot can backfill any missed candles.
                     if not first_connect and self._on_reconnect_callback:
                         try:
                             self._on_reconnect_callback()
@@ -219,7 +216,6 @@ class DeltaWebSocket:
                     self._reconnect()
 
     def _connect(self) -> None:
-        """Establish connection. Do NOT reset reconnect counters here."""
         self._state = WSState.CONNECTING
         _log("info", "WS", f"Connecting to {self.config.url}")
         self._ws = websocket.WebSocketApp(
@@ -264,7 +260,6 @@ class DeltaWebSocket:
         )
 
     def _on_open(self, ws) -> None:
-        """Reset counters only here — after confirmed handshake."""
         self._state = WSState.CONNECTED
         self._reconnect_attempts = 0
         self._reconnect_delay    = self.config.reconnect_base_delay
@@ -414,7 +409,6 @@ def to_trading_symbol(symbol: str) -> str:
 
 
 def to_ws_symbol(symbol: str) -> str:
-    """Bare symbol for WS subscriptions (no _PERP)."""
     s = symbol.upper().strip()
     if s.endswith("_PERP"):
         s = s[:-5]
@@ -424,7 +418,6 @@ def to_ws_symbol(symbol: str) -> str:
 
 
 def to_candle_symbol(symbol: str) -> str:
-    """REST candle endpoint requires no _PERP suffix."""
     s = symbol.upper().strip()
     if s.endswith("_PERP"):
         s = s[:-5]
@@ -437,7 +430,7 @@ def to_candle_symbol(symbol: str) -> str:
 #  6.  CONSTANTS
 # ================================================================
 REST_BASE_INDIA  = "https://api.india.delta.exchange"
-REST_BASE_GLOBAL = "https://api.delta.exchange"   # reference only
+REST_BASE_GLOBAL = "https://api.delta.exchange"
 
 CANDLE_LIMIT        = 20
 MAX_RETRIES         = 3
@@ -471,15 +464,13 @@ def warm_up_connection() -> None:
 # ================================================================
 
 class APIRequestHandler:
-    """Centralised REST request handler with retry logic."""
-
     def __init__(self, api_key: str = "", api_secret: str = ""):
         self.api_key    = api_key
         self.api_secret = api_secret
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "DeltaBot/9.0",
+            "User-Agent":   "DeltaBot/9.1",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -488,18 +479,12 @@ class APIRequestHandler:
         ))
 
     def _get_base_url(self, endpoint_type: str) -> str:
-        # Both public and private always use India endpoint
         return REST_BASE_INDIA
 
     def _sign_request(
         self, method: str, path: str,
         params: dict = None, body: dict = None
     ) -> dict:
-        """
-        Delta docs signature format:
-          METHOD + TIMESTAMP + PATH + ?QUERY_STRING + BODY_STRING
-        The '?' prefix is required when query params are present.
-        """
         if not self.api_key or not self.api_secret:
             raise ValueError("API key/secret missing")
         timestamp = str(int(time.time()))
@@ -690,37 +675,43 @@ def upper_wick(c: dict) -> float:
     return c["high"] - max(c["open"], c["close"])
 
 
-def check_short_signal(candles: List[dict]) -> bool:
+def check_short_signal(candles: List[dict]) -> Tuple[bool, Optional[dict]]:
     """
-    4-candle breakout + wick-rejection short entry.
-
-    Index  Role
-    ----   ----
-    [-1]   currently forming — IGNORED
-    [-2]   i   last CLOSED candle (signal candle)
-    [-3]   i1  previous closed
-    [-4]   i2  previous closed
-    [-5]   i3  base candle
-
-    Conditions:
-      1. i2.close > i3.high   (1st breakout)
-      2. i1.close > i2.high   (2nd breakout)
-      3. i .higH > i1.high   (3rd breakout)
-      4. upper_wick(i) > body(i)  (rejection wick)
+    MODIFIED STRATEGY - No wick rejection, open equals previous close
+    
+    ╔══════════════════════════════════════════════════════════════╗
+    ║  UPDATED STRATEGY (modified per user request):              ║
+    ╠══════════════════════════════════════════════════════════════╣
+    ║                                                              ║
+    ║  Conditions (NO wick rejection required):                   ║
+    ║    1. i["open"] == i1["close"]   (open equals previous close)║
+    ║    2. i1["close"] > i2["high"]   (2nd breakout)              ║
+    ║    3. i2["close"] > i3["high"]   (1st breakout)              ║
+    ║                                                              ║
+    ║  Returns: (True, signal_candle_dict) or (False, None)       ║
+    ╚══════════════════════════════════════════════════════════════╝
     """
-    if len(candles) < 5:
-        return False
-    i  = candles[-2]
-    i1 = candles[-3]
-    i2 = candles[-4]
-    i3 = candles[-5]
-    breakout  = (
-        i["high"]  > i1["high"] and
-        i1["close"] > i2["high"] and
-        i2["close"] > i3["high"]
+    if len(candles) < 4:
+        # Need at least 4 closed candles: i, i1, i2, i3
+        return False, None
+
+    i  = candles[-1]   # signal candle = last CLOSED candle
+    i1 = candles[-2]   # previous closed
+    i2 = candles[-3]   # previous closed
+    i3 = candles[-4]   # base candle
+
+    # Modified conditions: open equals previous close, and two breakouts
+    # No wick rejection condition
+    conditions = (
+        abs(i["open"] - i1["close"]) < 0.0001 and  # Open equals previous close (with tolerance for floating point)
+        i1["close"] > i2["high"] and                # 2nd breakout
+        i2["close"] > i3["high"]                    # 1st breakout
     )
-    rejection = upper_wick(i) > candle_body(i)
-    return breakout and rejection
+
+    if conditions:
+        return True, i   # return the actual signal candle
+
+    return False, None
 
 
 # ================================================================
@@ -856,14 +847,6 @@ class DeltaREST:
         return None
 
     def get_usd_balance(self) -> float:
-        """
-        Fetch available trading balance.
-
-        NOTE (Problem 2 kept unfixed per user instruction):
-        Checks USDT and USD asset symbols only.
-        Delta India perps settle in INR — if live balance returns 0.0,
-        change the check below to "INR" to match your account.
-        """
         result = self.request_handler.request(
             "GET", "/v2/wallet/balances", endpoint_type="private"
         )
@@ -884,10 +867,6 @@ class DeltaREST:
         order_type:  str           = "market_order",
         limit_price: Optional[float] = None,
     ) -> dict:
-        """
-        Place a market or limit order.
-        Returns the full API response dict (never None — caller checks 'error' key).
-        """
         if side not in ("buy", "sell"):
             _log("error", "ORDER", f"Invalid side '{side}'. Must be 'buy' or 'sell'.")
             return {"error": "invalid_side"}
@@ -917,31 +896,9 @@ class DeltaREST:
         stop_price:   float,
     ) -> dict:
         """
-        Place an exchange-side stop-market order that survives bot crashes,
-        internet drops, and PC sleep.
-
-        BUG FIX #2a — Add reduce_only: True
-          Delta India deprecated bracket orders (May 2024). The modern
-          replacement is a reduce-only stop-market order. WITHOUT reduce_only,
-          if the short is already closed when this SL fires, it opens a brand
-          new LONG position — the exact opposite of what you want. With
-          reduce_only=True the exchange cancels the order instead of flipping.
-
-        BUG FIX #2b — Add stop_trigger_method: "last_traded_price"
-          Delta defaults to mark price as the trigger index. Mark price lags
-          last traded price (LTP) by design to prevent manipulation. On a fast
-          BTC move the gap can be $100-$300. Using LTP ensures the SL triggers
-          at the actual market price, not the smoothed mark price.
-
-        Correct modern body for a short position SL (closes via BUY):
-          product_id        : <id>
-          size              : <contracts>
-          side              : "buy"
-          order_type        : "market_order"
-          stop_order_type   : "stop_loss_order"
-          stop_price        : "<price>"  (string)
-          stop_trigger_method : "last_traded_price"   ← BUG FIX #2b
-          reduce_only       : true                    ← BUG FIX #2a
+        Place an exchange-side stop-market order.
+        reduce_only=True prevents flipping position if already closed.
+        stop_trigger_method=last_traded_price avoids mark-price lag.
         """
         if stop_price <= 0:
             _log("error", "SL-ORDER", f"Invalid stop_price {stop_price}")
@@ -957,8 +914,8 @@ class DeltaREST:
             "order_type":          "market_order",
             "stop_order_type":     "stop_loss_order",
             "stop_price":          str(round(stop_price, 2)),
-            "stop_trigger_method": "last_traded_price",  # BUG FIX #2b
-            "reduce_only":         True,                  # BUG FIX #2a
+            "stop_trigger_method": "last_traded_price",
+            "reduce_only":         True,
         }
         _log("info", "SL-ORDER",
              f"Placing exchange SL: side={side} size={size} "
@@ -1091,16 +1048,9 @@ class DeltaREST:
         return candles
 
     def set_leverage(self, product_id: int, leverage: int) -> bool:
-        """
-        BUG FIX #1 — correct Delta India leverage endpoint:
-          WRONG (old): POST /v2/products/{product_id}/leverage
-          RIGHT (new): POST /v2/products/{product_id}/orders/leverage
-        The old endpoint returns 404 silently, leaving leverage at account
-        default (1x), which makes the margin sizing formula wrong.
-        """
         body   = {"leverage": str(leverage)}
         result = self.request_handler.request(
-            "POST", f"/v2/products/{product_id}/orders/leverage",  # FIXED
+            "POST", f"/v2/products/{product_id}/orders/leverage",
             endpoint_type="private", body=body,
         )
         if result and "result" in result:
@@ -1111,7 +1061,6 @@ class DeltaREST:
         return False
 
     def close_position(self, product_id: int, size: int, side: str = "buy") -> dict:
-        """Close a position with a market order. side='buy' to close a short."""
         _log("info", "CLOSE",
              f"Closing position: product_id={product_id} size={size} side={side}")
         result = self.place_order(
@@ -1126,27 +1075,16 @@ class DeltaREST:
 
 
 # ================================================================
-#  16. POSITION SIZER  (risk-based, leverage-capped)
+#  16. POSITION SIZER
 # ================================================================
 
 def compute_position_size(
     entry_price:     float,
     stop_loss_price: float,
     account_balance: float,
-    risk_pct:        float,   # 0.0-1.0 fraction (e.g. 0.02 for 2 %)
+    risk_pct:        float,
     leverage:        int,
 ) -> Tuple[int, dict]:
-    """
-    Correct risk-based position sizing that considers stop-loss distance.
-
-    Step 1  risk_amount   = account_balance * risk_pct
-    Step 2  stop_distance = abs(entry_price - stop_loss_price)
-    Step 3  risk_size     = risk_amount / stop_distance
-    Step 4  max_by_margin = (account_balance * leverage) / entry_price
-    Step 5  final_size    = min(risk_size, max_by_margin)  rounded down to int >= 1
-
-    Returns (final_size, diagnostics_dict).
-    """
     risk_amount   = account_balance * risk_pct
     stop_distance = abs(entry_price - stop_loss_price)
 
@@ -1197,7 +1135,7 @@ class TradingBot:
         self.api_key         = config.get("api_key",    "")
         self.api_secret      = config.get("api_secret", "")
         self.trading_capital = float(config.get("trading_capital", 0.0))
-        self.risk_pct        = config["risk_pct"] / 100.0   # stored as fraction
+        self.risk_pct        = config["risk_pct"] / 100.0
 
         self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
         self.timeframe      = self._tf.key
@@ -1220,14 +1158,9 @@ class TradingBot:
         self.running    = False
         self.ws_manager: Optional[DeltaWebSocket] = None
 
-        # Optional UI callbacks
         self.on_signal_callback = None
         self.on_trade_callback  = None
         self.on_log_callback    = None
-
-    # ------------------------------------------------------------------ #
-    #  Internal log helper                                                 #
-    # ------------------------------------------------------------------ #
 
     def _log(self, level: str, tag: str, msg: str) -> None:
         _log(level, tag, msg)
@@ -1334,7 +1267,6 @@ class TradingBot:
         self.ws_manager.set_connected_callback(self._on_ws_connected)
         self.ws_manager.set_disconnected_callback(self._on_ws_disconnected)
         self.ws_manager.set_error_callback(self._on_ws_error)
-        # Backfill missed candles after every reconnect
         self.ws_manager.set_reconnect_callback(self._on_ws_reconnect)
 
         ws_symbols = [to_ws_symbol(sym) for sym in self.symbols]
@@ -1348,9 +1280,6 @@ class TradingBot:
     # ------------------------------------------------------------------ #
 
     def _on_ws_candle(self, symbol: str, candle: dict) -> None:
-        """
-        Called by WS manager with trading-format symbol (e.g. BTCUSD_PERP).
-        """
         self._log("debug", "WS-CANDLE",
                   f"{symbol} | t={candle.get('time')} "
                   f"O={candle.get('open')} H={candle.get('high')} "
@@ -1360,7 +1289,6 @@ class TradingBot:
             self.process_candle(symbol, candle)
             return
 
-        # Fuzzy match for edge cases
         for known in self.candle_store:
             if to_ws_symbol(known) == to_ws_symbol(symbol):
                 self.process_candle(known, candle)
@@ -1379,11 +1307,6 @@ class TradingBot:
         self._log("error", "WS", f"WebSocket error: {error}")
 
     def _on_ws_reconnect(self) -> None:
-        """
-        Called every time the WebSocket reconnects after a drop.
-        Backfills any candles that arrived while we were offline,
-        then re-evaluates signals on each symbol to avoid gaps.
-        """
         self._log("info", "BACKFILL",
                   "WebSocket reconnected — backfilling missed candles...")
         for sym in self.symbols:
@@ -1391,10 +1314,6 @@ class TradingBot:
         self._log("info", "BACKFILL", "Backfill complete.")
 
     def _backfill_symbol(self, symbol: str) -> None:
-        """
-        Fetch the latest REST candles and merge any new ones into the
-        in-memory store without creating duplicates.
-        """
         store = self.candle_store.get(symbol)
         if store is None:
             return
@@ -1404,7 +1323,6 @@ class TradingBot:
             self._log("warning", "BACKFILL", f"No fresh candles for {symbol}")
             return
 
-        # Build set of timestamps already in store
         existing_ts = {c["time"] for c in store}
         added       = 0
         for c in sorted(fresh, key=lambda x: x["time"]):
@@ -1420,15 +1338,13 @@ class TradingBot:
             self._log("info", "BACKFILL", f"{symbol}: no new candles needed")
 
     # ------------------------------------------------------------------ #
-    #  Candle processing — FIX: correctly indented inside TradingBot      #
+    #  Candle processing — using updated strategy                        #
     # ------------------------------------------------------------------ #
 
     def process_candle(self, symbol: str, candle: dict) -> None:
         """
-        Main candle dispatch:
-          - If timestamp == last stored  → update forming candle, check local SL
-          - If timestamp > last stored   → close previous candle, run strategy,
-                                           then append new forming candle
+        Main candle dispatch using UPDATED strategy (no wick rejection,
+        open equals previous close condition).
         """
         store = self.candle_store.get(symbol)
         if store is None:
@@ -1437,31 +1353,34 @@ class TradingBot:
         if not validate_candle(candle, symbol):
             return
 
-        # --- Forming candle update ---
+        # --- Forming candle update (same timestamp) ---
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
             if symbol in self.active_trades:
                 self._check_stop_loss(symbol, candle)
             return
 
-        # --- New candle: previous candle just closed ---
+        # --- New candle arrived: store[-1] is now the JUST-CLOSED candle ---
         if store:
             closed = store[-1]
+
             self._log("info", "CANDLE-CLOSED",
                       f"{symbol} | {self.timeframe} | CLOSED | "
                       f"O={closed['open']:.2f} H={closed['high']:.2f} "
                       f"L={closed['low']:.2f} C={closed['close']:.2f} "
                       f"V={closed.get('volume', 0):.2f}")
 
+            # Check for signal using UPDATED strategy
             if symbol not in self.active_trades:
-                if check_short_signal(list(store)):
-                    self._on_signal(symbol, closed)
+                triggered, signal_candle = check_short_signal(list(store))
+                if triggered and signal_candle is not None:
+                    self._on_signal(symbol, signal_candle)
 
-        # Append new forming candle
+        # Append new forming candle AFTER signal check
         store.append(candle)
 
     # ------------------------------------------------------------------ #
-    #  Stop-loss monitoring (local)                                        #
+    #  Stop-loss monitoring (local fallback)                              #
     # ------------------------------------------------------------------ #
 
     def _check_stop_loss(self, symbol: str, candle: dict) -> None:
@@ -1472,7 +1391,8 @@ class TradingBot:
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade:
             return
-        # For a short, SL triggers when HIGH crosses above stop_loss price
+
+        # For a short, SL triggers when high crosses above stop_loss price
         if candle["high"] < trade["stop_loss"]:
             return
 
@@ -1505,7 +1425,6 @@ class TradingBot:
         }
         self.sl_events.append(ev)
 
-        # Attempt to close via REST as belt-and-braces
         if not self.paper:
             pid  = trade.get("product_id")
             size = trade.get("size", 1)
@@ -1517,10 +1436,14 @@ class TradingBot:
         self._log("info", "SL", f"Trade record removed for {symbol}")
 
     # ------------------------------------------------------------------ #
-    #  Signal handler                                                      #
+    #  Signal handler — using updated strategy with open=previous close  #
     # ------------------------------------------------------------------ #
 
     def _on_signal(self, symbol: str, signal_candle: dict) -> None:
+        """
+        signal_candle is the candle that triggered the signal.
+        Entry is taken from signal_candle's close, stop loss is set 2% above high.
+        """
         entry = signal_candle["close"]
         sl    = signal_candle["high"]
         rpu   = abs(sl - entry)
@@ -1540,8 +1463,6 @@ class TradingBot:
                           f"Already in trade on {symbol} — skip duplicate")
                 return
 
-            wick     = round(upper_wick(signal_candle), 6)
-            body     = round(candle_body(signal_candle), 6)
             risk_usd = round(self.trading_capital * self.risk_pct, 2)
 
             signal = {
@@ -1550,8 +1471,6 @@ class TradingBot:
                 "direction":       "SHORT",
                 "entry":           entry,
                 "stop_loss":       sl,
-                "upper_wick":      wick,
-                "body":            body,
                 "timeframe":       self.timeframe,
                 "mode":            "PAPER" if self.paper else "LIVE",
                 "executed":        False,
@@ -1572,17 +1491,22 @@ class TradingBot:
 
         print()
         print(f"  [SIGNAL] {symbol}  SHORT  [{self.timeframe}]")
-        print(f"           Entry     : {entry:.4f}")
-        print(f"           Stop Loss : {sl:.4f}")
-        print(f"           Wick/Body : {wick:.6f}/{body:.6f}"
-              + (f"  ({wick/body:.2f}x)" if body > 0 else ""))
+        print(f"           Entry     : {entry:.4f}  (close of signal candle)")
+        print(f"           Open      : {signal_candle['open']:.4f}")
+        print(f"           Prev Close: {signal_candle['close']:.4f}")
+        print(f"           Condition : Open == Previous Close (gap up/down)")
+        print(f"           Stop Loss : {sl:.4f}  (2% above signal candle high={signal_candle['high']:.4f})")
         print(f"           Risk      : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
         print(f"           Mode      : {signal['mode']}")
         print()
 
         self._log("info", "SIGNAL",
                   f"{symbol} SHORT | tf={self.timeframe} | "
-                  f"entry={entry:.4f} | sl={sl:.4f} | risk=${risk_usd:.2f}")
+                  f"entry={entry:.4f} (signal candle close) | "
+                  f"open={signal_candle['open']:.4f} prev_close={signal_candle['close']:.4f} | "
+                  f"condition: open == prev_close | "
+                  f"sl={sl:.4f} (2% above high) | "
+                  f"risk=${risk_usd:.2f}")
 
         if not self.paper:
             self._execute_trade(symbol, signal)
@@ -1594,20 +1518,10 @@ class TradingBot:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Live trade execution  (patched: correct sizing + exchange SL)      #
+    #  Live trade execution                                                #
     # ------------------------------------------------------------------ #
 
     def _execute_trade(self, symbol: str, signal: dict) -> None:
-        """
-        Full live trade execution:
-          1. Guard against duplicates
-          2. Fetch live balance
-          3. Risk-based contract sizing (stop-distance formula)
-          4. Place entry market order
-          5. Confirm fill (check result structure)
-          6. Place exchange-side stop-loss order
-          7. Record trade
-        """
         try:
             # --- 1. Duplicate guard ---
             with self._trade_lock:
@@ -1666,7 +1580,6 @@ class TradingBot:
                     self.active_trades.pop(symbol, None)
                 return
 
-            # --- Print sizing summary ---
             print()
             print(f"  [TRADE] {symbol}  SHORT  @ {entry:.4f}")
             print(f"          product_id       : {pid}")
@@ -1688,20 +1601,18 @@ class TradingBot:
             )
 
             # --- 5. Confirm fill ---
-            order_ok   = False
+            order_ok    = False
             order_state = entry_result.get("result", {}).get("state", "") if entry_result else ""
             order_id    = entry_result.get("result", {}).get("id")        if entry_result else None
 
             if entry_result and "error" not in entry_result:
-                if order_state in ("open", "filled", ""):
-                    order_ok = True
-                elif order_state == "rejected":
+                if order_state == "rejected":
                     reject_reason = entry_result.get("result", {}).get("cancel_reason", "unknown")
                     self._log("error", "TRADE",
                               f"Order REJECTED by exchange: {reject_reason}")
                     order_ok = False
                 else:
-                    # Treat unknown state as ok (partial / queued)
+                    # open / filled / partial / queued / "" — treat as ok
                     order_ok = True
 
             if not order_ok:
@@ -1720,7 +1631,6 @@ class TradingBot:
             print()
 
             # --- 6. Exchange-side stop-loss ---
-            # For a short, closing order is a BUY at stop_price above entry
             sl_result   = self.rest.place_stop_market_order(
                 product_id=pid,
                 side="buy",
@@ -1785,15 +1695,16 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v9.0            |")
-        print("|   Strategy : SHORT Breakout + Wick Rejection           |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v9.1            |")
+        print("|   Strategy : SHORT Breakout + Open=PrevClose          |")
+        print("|   (No wick rejection, gap open equals previous close) |")
         print("|   Sizing   : Risk-based (stop-distance formula)        |")
-        print("|   SL       : Exchange-side + reduce_only + LTP trigger |")
+        print("|   SL       : 2% above signal candle high + exchange SL |")
         print("|   Fix #1   : Leverage  /orders/leverage endpoint       |")
         print("|   Fix #2   : SL reduce_only=True + stop_trigger=LTP    |")
         print("|   Fix #3   : No /v2/time — local time.time() only      |")
         print("|   Fix #4   : process_candle appends AFTER strategy     |")
-        print("|   Note     : Balance uses USDT/USD (Problem 2 open)    |")
+        print("|   Fix #5   : Signal candle == entry candle (corrected) |")
         print("|   Endpoint : wss://socket.india.delta.exchange         |")
         print("+========================================================+")
         print()
@@ -1809,6 +1720,9 @@ class TradingBot:
         print(f"  Risk / trade    : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
+        print(f"  Stop loss       : 2% above signal candle high")
+        print(f"  Strategy        : SHORT when open == previous close AND breakouts")
+        print(f"  Signal candle   : last CLOSED candle ([-1] of store, pre-append)")
         print(f"  Active symbols  : {len(self.symbols)}")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -1927,15 +1841,16 @@ def ask_risk_params() -> Tuple[float, int]:
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v9.0        |")
-    print("  |   Strategy : SHORT Breakout + Wick Rejection         |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v9.1        |")
+    print("  |   Strategy : SHORT Breakout + Open=PrevClose        |")
+    print("  |   (No wick rejection, gap open equals prev close)   |")
     print("  |   Sizing   : Risk-based (stop-distance formula)      |")
-    print("  |   SL       : reduce_only=True + last_traded_price    |")
+    print("  |   SL       : 2% above signal candle high + exchange SL |")
     print("  |   Fix #1   : Leverage  /orders/leverage endpoint     |")
     print("  |   Fix #2   : SL reduce_only=True + LTP trigger       |")
     print("  |   Fix #3   : No /v2/time — uses time.time() only     |")
     print("  |   Fix #4   : process_candle appends AFTER strategy   |")
-    print("  |   Note     : Balance uses USDT/USD (Problem 2 open)  |")
+    print("  |   Fix #5   : Signal candle == entry candle (fixed)   |")
     print("  |   Endpoint : wss://socket.india.delta.exchange       |")
     print("  +======================================================+")
 
@@ -1983,6 +1898,9 @@ def main() -> None:
     print(f"  Trading capital : ${trading_capital:,.2f}")
     print(f"  Risk / trade    : {risk_pct}%  =  ~${risk_usd:,.2f}  (exact varies by SL dist)")
     print(f"  Max open trades : {max_trades}")
+    print(f"  Stop loss       : 2% above signal candle high")
+    print(f"  Strategy        : SHORT when open == previous close AND breakouts")
+    print(f"  Signal candle   : last CLOSED candle at moment of detection")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
