@@ -9,7 +9,7 @@ try:
         sys.stderr.buffer, encoding="utf-8", errors="replace"
     )
 except AttributeError:
-    pass  # already wrapped (pytest / IDE / Linux)
+    pass
 
 # ================================================================
 #  1.  STANDARD LIBRARY IMPORTS
@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 # ================================================================
@@ -74,7 +74,7 @@ def _log(level: str, tag: str, msg: str) -> None:
 
 
 # ================================================================
-#  4.  WEBSOCKET MANAGER - PRODUCTION GRADE
+#  4.  WEBSOCKET MANAGER
 # ================================================================
 
 class WSState(Enum):
@@ -114,19 +114,15 @@ class DeltaWebSocket:
         self._subscriptions: Dict[str, List[str]] = {}
         self._subscription_lock = threading.Lock()
 
-        # Reconnect tracking — reset ONLY after confirmed _on_open
         self._reconnect_attempts = 0
         self._reconnect_delay    = self.config.reconnect_base_delay
         self._should_stop        = threading.Event()
 
-        # Callbacks
         self._on_candle_callback:       Optional[callable] = None
         self._on_connected_callback:    Optional[callable] = None
         self._on_disconnected_callback: Optional[callable] = None
         self._on_error_callback:        Optional[callable] = None
         self._on_reconnect_callback:    Optional[callable] = None
-
-    # ---- public setters ----
 
     def set_candle_callback(self, cb: callable)      -> None: self._on_candle_callback       = cb
     def set_connected_callback(self, cb: callable)   -> None: self._on_connected_callback    = cb
@@ -185,8 +181,6 @@ class DeltaWebSocket:
 
     def get_state(self) -> str:
         return self._state.value
-
-    # ---- internals ----
 
     def _get_channel_name(self, timeframe: str) -> str:
         return {
@@ -319,12 +313,6 @@ class DeltaWebSocket:
             _log("error", "WS", f"Message processing error: {e}")
 
     def _parse_candle_message(self, data: dict) -> Optional[dict]:
-        """
-        Delta India flat candlestick payload:
-        { "type": "candlestick_1m", "symbol": "BTCUSD", "open": ...,
-          "high": ..., "low": ..., "close": ..., "volume": ...,
-          "candle_start_time": <nanoseconds> }
-        """
         msg_type = data.get("type", "")
         if not msg_type.startswith("candlestick_"):
             return None
@@ -438,6 +426,10 @@ RETRY_DELAYS        = [5, 10, 15]
 TIMEOUT             = 30
 CANDLE_SAFETY_SHIFT = 1
 
+# FIX: Fill poll settings — market orders need time to confirm fill
+FILL_POLL_INTERVAL  = 0.5   # seconds between poll attempts
+FILL_POLL_TIMEOUT   = 15    # max seconds to wait for fill confirmation
+
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m":  {"resolution": "1m",  "api_resolution": "1m",  "ws_channel": "candlestick_1m",  "secs": 60},
     "5m":  {"resolution": "5m",  "api_resolution": "5m",  "ws_channel": "candlestick_5m",  "secs": 300},
@@ -470,7 +462,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "DeltaBot/9.1",
+            "User-Agent":   "python-DeltaBot/10.0",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -487,6 +479,8 @@ class APIRequestHandler:
     ) -> dict:
         if not self.api_key or not self.api_secret:
             raise ValueError("API key/secret missing")
+
+        # FIX: Always generate a FRESH timestamp per sign call (never reuse stale ones)
         timestamp = str(int(time.time()))
 
         query_string = ""
@@ -526,6 +520,7 @@ class APIRequestHandler:
         headers  = {}
 
         if endpoint_type == "private":
+            # FIX: sign_request called here — fresh timestamp every attempt (including retries)
             headers = self._sign_request(method, endpoint, params, body)
         if body and method.upper() != "GET":
             headers["Content-Type"] = "application/json"
@@ -675,43 +670,168 @@ def upper_wick(c: dict) -> float:
     return c["high"] - max(c["open"], c["close"])
 
 
-def check_short_signal(candles: List[dict]) -> Tuple[bool, Optional[dict]]:
+def lower_wick(c: dict) -> float:
+    return min(c["open"], c["close"]) - c["low"]
+
+
+def candle_range(c: dict) -> float:
+    return c["high"] - c["low"]
+
+
+def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    MODIFIED STRATEGY - No wick rejection, open equals previous close
-    
-    ╔══════════════════════════════════════════════════════════════╗
-    ║  UPDATED STRATEGY (modified per user request):              ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║                                                              ║
-    ║  Conditions (NO wick rejection required):                   ║
-    ║    1. i["open"] == i1["close"]   (open equals previous close)║
-    ║    2. i1["close"] > i2["high"]   (2nd breakout)              ║
-    ║    3. i2["close"] > i3["high"]   (1st breakout)              ║
-    ║                                                              ║
-    ║  Returns: (True, signal_candle_dict) or (False, None)       ║
-    ╚══════════════════════════════════════════════════════════════╝
+    STRATEGY 1: Breakout with open=previous close AND close=previous open.
+    Conditions:
+        1. i["open"] == i1["close"]   (open equals previous close)
+        2. i["close"] == i1["open"]   (close equals previous open)
+        3. i1["close"] > i2["high"]   (2nd breakout)
+        4. i2["close"] > i3["high"]   (1st breakout)
     """
     if len(candles) < 4:
-        # Need at least 4 closed candles: i, i1, i2, i3
-        return False, None
+        return False, None, ""
 
-    i  = candles[-1]   # signal candle = last CLOSED candle
-    i1 = candles[-2]   # previous closed
-    i2 = candles[-3]   # previous closed
-    i3 = candles[-4]   # base candle
+    i  = candles[-1]
+    i1 = candles[-2]
+    i2 = candles[-3]
+    i3 = candles[-4]
 
-    # Modified conditions: open equals previous close, and two breakouts
-    # No wick rejection condition
     conditions = (
-        abs(i["open"] - i1["close"]) < 0.0001 and  # Open equals previous close (with tolerance for floating point)
-        i1["close"] > i2["high"] and                # 2nd breakout
-        i2["close"] > i3["high"]                    # 1st breakout
+        abs(i["open"] - i1["close"]) < 0.0001 and
+        abs(i["close"] - i1["open"]) < 0.0001 and
+        i1["close"] > i2["high"] and
+        i2["close"] > i3["high"]
     )
 
     if conditions:
-        return True, i   # return the actual signal candle
+        return True, i, "STRATEGY_1"
+    return False, None, ""
 
-    return False, None
+
+def check_short_signal_strategy_2(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    STRATEGY 2: 3-candle breakout with upper wick >= 1.8x body.
+    """
+    if len(candles) < 3:
+        return False, None, ""
+
+    i   = candles[-1]
+    i1  = candles[-2]
+    i2  = candles[-3]
+
+    body_i       = candle_body(i)
+    upper_wick_i = upper_wick(i)
+
+    first_breakout  = i1["close"] > i2["high"]
+    second_breakout = i["close"] > i1["high"]
+
+    wick_condition = False
+    if body_i > 0:
+        ratio = upper_wick_i / body_i
+        wick_condition = ratio >= 1.8
+
+    conditions = first_breakout and second_breakout and wick_condition
+
+    if conditions:
+        ratio = upper_wick_i / body_i if body_i > 0 else 0
+        _log("info", "STRATEGY_2",
+             f"Signal triggered! ratio={ratio:.2f}x | "
+             f"body={body_i:.4f} | wick={upper_wick_i:.4f}")
+        return True, i, "STRATEGY_2"
+    return False, None, ""
+
+
+def check_short_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    STRATEGY 3: Bearish Engulfing Pattern with uptrend confirmation.
+    """
+    if len(candles) < 4:
+        return False, None, ""
+
+    i   = candles[-1]
+    i1  = candles[-2]
+    i2  = candles[-3]
+    i3  = candles[-4]
+
+    uptrend      = i1["close"] > i2["close"] > i3["close"]
+    prev_bullish = i1["close"] > i1["open"]
+    curr_bearish = i["close"] < i["open"]
+    engulfing    = (i["open"] > i1["close"]) and (i["close"] < i1["open"])
+
+    conditions = uptrend and prev_bullish and curr_bearish and engulfing
+
+    if conditions:
+        _log("info", "STRATEGY_3",
+             f"Bearish Engulfing detected! | "
+             f"i1(O={i1['open']:.4f},C={i1['close']:.4f}) | "
+             f"i(O={i['open']:.4f},C={i['close']:.4f})")
+        return True, i, "STRATEGY_3"
+    return False, None, ""
+
+
+def check_short_signal_strategy_4(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    STRATEGY 4: Three Black Crows Pattern.
+    Three consecutive long-bodied bearish candles, each opening within the
+    previous body and closing progressively lower, with minimal wicks.
+    """
+    if len(candles) < 3:
+        return False, None, ""
+
+    i   = candles[-1]
+    i1  = candles[-2]
+    i2  = candles[-3]
+
+    all_bearish = (
+        i["close"] < i["open"] and
+        i1["close"] < i1["open"] and
+        i2["close"] < i2["open"]
+    )
+    if not all_bearish:
+        return False, None, ""
+
+    def has_low_wicks(candle: dict) -> bool:
+        r = candle_range(candle)
+        if r > 0:
+            return (upper_wick(candle) / r <= 0.05) and (lower_wick(candle) / r <= 0.05)
+        return (upper_wick(candle) < 0.0001) and (lower_wick(candle) < 0.0001)
+
+    if not (has_low_wicks(i) and has_low_wicks(i1) and has_low_wicks(i2)):
+        return False, None, ""
+
+    open_in_prev_body = (
+        i1["open"] >= i2["close"] and i1["open"] < i2["open"] and
+        i["open"] >= i1["close"] and i["open"] < i1["open"]
+    )
+    if not open_in_prev_body:
+        return False, None, ""
+
+    progressive_lower_closes = (i1["close"] < i2["close"]) and (i["close"] < i1["close"])
+    if not progressive_lower_closes:
+        return False, None, ""
+
+    highest_high   = max(i2["high"], i1["high"], i["high"])
+    total_decline  = ((i2["close"] - i["close"]) / i2["close"]) * 100
+    _log("info", "THREE_BLACK_CROWS",
+         f"Pattern detected! | Total decline: {total_decline:.2f}% | SL: {highest_high:.4f}")
+
+    signal_candle = i.copy()
+    signal_candle["pattern_high"] = highest_high
+    return True, signal_candle, "THREE_BLACK_CROWS"
+
+
+def check_short_signal(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """Master signal checker — OR combination of all 4 strategies."""
+    for checker in (
+        check_short_signal_strategy_1,
+        check_short_signal_strategy_2,
+        check_short_signal_strategy_3,
+        check_short_signal_strategy_4,
+    ):
+        triggered, signal_candle, strategy = checker(candles)
+        if triggered:
+            _log("info", "SIGNAL", f"Triggered by {strategy}")
+            return True, signal_candle, strategy
+    return False, None, ""
 
 
 # ================================================================
@@ -775,7 +895,7 @@ def get_time_range_with_retry_shift(
 ) -> Tuple[int, int]:
     start, end = get_time_range(num_candles, timeframe_minutes)
     if shift_candles > 0:
-        secs = shift_candles * timeframe_minutes * 60
+        secs  = shift_candles * timeframe_minutes * 60
         start = max(1, start - secs)
         end   = max(timeframe_minutes * 60, end - secs)
         _log("info", "TIME-RANGE",
@@ -828,7 +948,25 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
 
 
 # ================================================================
-#  15. DELTA REST CLIENT
+#  15. TICK SIZE ROUNDING  [FIX: round to product tick size, not 2dp]
+# ================================================================
+
+def round_to_tick(price: float, tick_size: float) -> float:
+    """
+    Round price to the nearest valid tick increment.
+    e.g. price=91503.7, tick_size=0.5 -> 91503.5
+    """
+    if tick_size <= 0:
+        return round(price, 2)
+    rounded = round(price / tick_size) * tick_size
+    # Determine decimal places from tick_size to avoid float artifacts
+    tick_str  = f"{tick_size:.10f}".rstrip("0")
+    dp        = len(tick_str.split(".")[-1]) if "." in tick_str else 0
+    return round(rounded, dp)
+
+
+# ================================================================
+#  16. DELTA REST CLIENT
 # ================================================================
 
 class DeltaREST:
@@ -836,6 +974,8 @@ class DeltaREST:
         self.api_key    = api_key
         self.api_secret = api_secret
         self.request_handler = APIRequestHandler(api_key, api_secret)
+        # FIX: cache tick sizes from the product catalogue
+        self._tick_sizes: Dict[str, float] = {}
 
     def verify_account(self) -> Optional[dict]:
         result = self.request_handler.request("GET", "/v2/profile", endpoint_type="private")
@@ -859,19 +999,104 @@ class DeltaREST:
                     return bal
         return 0.0
 
+    def fetch_product_map(self) -> Dict[str, int]:
+        result = self.request_handler.request("GET", "/v2/products", endpoint_type="public")
+        pmap: Dict[str, int] = {}
+        if result and "result" in result:
+            for item in result.get("result", []):
+                sym      = item.get("symbol", "")
+                pid      = item.get("id")
+                tick_raw = item.get("tick_size", "0.01")
+                if sym and pid is not None:
+                    pmap[sym] = int(pid)
+                    try:
+                        # FIX: store tick size for every product
+                        self._tick_sizes[sym] = float(tick_raw)
+                    except (TypeError, ValueError):
+                        self._tick_sizes[sym] = 0.01
+        _log("info", "CATALOG", f"Loaded {len(pmap)} products")
+        return pmap
+
+    def get_tick_size(self, symbol: str) -> float:
+        """Return tick size for symbol; defaults to 0.01 if unknown."""
+        return self._tick_sizes.get(symbol, 0.01)
+
+    def get_order(self, order_id: int) -> Optional[dict]:
+        """Fetch a single order by ID — used to confirm fill."""
+        result = self.request_handler.request(
+            "GET", f"/v2/orders/{order_id}", endpoint_type="private"
+        )
+        if result and "result" in result:
+            return result["result"]
+        return None
+
+    def wait_for_fill(
+        self, order_id: int, symbol: str = ""
+    ) -> Tuple[bool, int]:
+        """
+        FIX BUG #1 & #2: Poll until the entry order is fully filled.
+        Returns (filled: bool, actual_filled_size: int).
+        Market orders typically fill within 1–2 polls; we allow up to
+        FILL_POLL_TIMEOUT seconds before giving up and rolling back.
+        """
+        deadline = time.time() + FILL_POLL_TIMEOUT
+        _log("info", "FILL-POLL",
+             f"Waiting for fill: order_id={order_id} symbol={symbol} "
+             f"timeout={FILL_POLL_TIMEOUT}s")
+
+        while time.time() < deadline:
+            order = self.get_order(order_id)
+            if order is None:
+                _log("warning", "FILL-POLL", "Could not fetch order — retrying...")
+                time.sleep(FILL_POLL_INTERVAL)
+                continue
+
+            state         = order.get("state", "")
+            size          = int(order.get("size", 0))
+            unfilled_size = int(order.get("unfilled_size", 0))
+            filled_size   = size - unfilled_size
+
+            _log("info", "FILL-POLL",
+                 f"order_id={order_id} state={state} "
+                 f"size={size} unfilled={unfilled_size} filled={filled_size}")
+
+            if state == "closed" and unfilled_size == 0:
+                _log("info", "FILL-POLL",
+                     f"Order fully filled: {filled_size} contracts")
+                return True, filled_size
+
+            if state == "cancelled":
+                _log("error", "FILL-POLL",
+                     f"Order cancelled (order_id={order_id}). No position opened.")
+                return False, 0
+
+            if state == "rejected":
+                reason = order.get("cancel_reason", "unknown")
+                _log("error", "FILL-POLL",
+                     f"Order rejected: {reason} (order_id={order_id})")
+                return False, 0
+
+            # "open" or "pending" — market order partially/not yet filled; keep polling
+            time.sleep(FILL_POLL_INTERVAL)
+
+        _log("error", "FILL-POLL",
+             f"Fill confirmation timed out after {FILL_POLL_TIMEOUT}s "
+             f"for order_id={order_id}")
+        return False, 0
+
     def place_order(
         self,
         product_id:  int,
         side:        str,
         size:        int,
-        order_type:  str           = "market_order",
+        order_type:  str            = "market_order",
         limit_price: Optional[float] = None,
     ) -> dict:
         if side not in ("buy", "sell"):
-            _log("error", "ORDER", f"Invalid side '{side}'. Must be 'buy' or 'sell'.")
+            _log("error", "ORDER", f"Invalid side '{side}'.")
             return {"error": "invalid_side"}
         if size < 1:
-            _log("error", "ORDER", f"Invalid size {size}. Must be >= 1.")
+            _log("error", "ORDER", f"Invalid size {size}.")
             return {"error": "invalid_size"}
 
         body: Dict = {
@@ -888,62 +1113,57 @@ class DeltaREST:
         )
         return result or {"error": "no_response"}
 
-    def place_stop_market_order(
+    def place_bracket_stop_loss(
         self,
-        product_id:   int,
-        side:         str,
-        size:         int,
-        stop_price:   float,
+        product_id:    int,
+        stop_price:    float,
+        symbol:        str = "",
     ) -> dict:
         """
-        Place an exchange-side stop-market order.
-        reduce_only=True prevents flipping position if already closed.
-        stop_trigger_method=last_traded_price avoids mark-price lag.
+        FIX: Use the dedicated bracket order endpoint to attach a stop-loss
+        to an existing open position. This is the recommended approach per
+        Delta Exchange docs — it auto-adjusts size and auto-cancels on close.
+
+        bracket_stop_trigger_method = last_traded_price avoids mark-price lag.
         """
         if stop_price <= 0:
-            _log("error", "SL-ORDER", f"Invalid stop_price {stop_price}")
+            _log("error", "BRACKET-SL", f"Invalid stop_price {stop_price}")
             return {"error": "invalid_stop_price"}
-        if side not in ("buy", "sell"):
-            _log("error", "SL-ORDER", f"Invalid side '{side}'")
-            return {"error": "invalid_side"}
+
+        # FIX: round stop price to the product's actual tick size
+        tick_size   = self.get_tick_size(symbol) if symbol else 0.01
+        rounded_sl  = round_to_tick(stop_price, tick_size)
 
         body: Dict = {
-            "product_id":          product_id,
-            "size":                size,
-            "side":                side,
-            "order_type":          "market_order",
-            "stop_order_type":     "stop_loss_order",
-            "stop_price":          str(round(stop_price, 2)),
-            "stop_trigger_method": "last_traded_price",
-            "reduce_only":         True,
+            "product_id": product_id,
+            "stop_loss_order": {
+                "order_type": "market_order",
+                "stop_price": str(rounded_sl),
+            },
+            "bracket_stop_trigger_method": "last_traded_price",
         }
-        _log("info", "SL-ORDER",
-             f"Placing exchange SL: side={side} size={size} "
-             f"stop={stop_price:.4f} pid={product_id} "
-             f"reduce_only=True trigger=last_traded_price")
+        _log("info", "BRACKET-SL",
+             f"Placing bracket SL: pid={product_id} "
+             f"stop={rounded_sl} (tick={tick_size}) trigger=LTP")
         result = self.request_handler.request(
-            "POST", "/v2/orders", endpoint_type="private", body=body
+            "POST", "/v2/orders/bracket", endpoint_type="private", body=body
         )
         return result or {"error": "no_response"}
 
-    def fetch_product_map(self) -> Dict[str, int]:
-        result = self.request_handler.request("GET", "/v2/products", endpoint_type="public")
-        pmap: Dict[str, int] = {}
-        if result and "result" in result:
-            for item in result.get("result", []):
-                sym = item.get("symbol", "")
-                pid = item.get("id")
-                if sym and pid is not None:
-                    pmap[sym] = int(pid)
-        _log("info", "CATALOG", f"Loaded {len(pmap)} products")
-        return pmap
+    def cancel_order(self, order_id: int, product_id: int) -> dict:
+        """Cancel a specific order by ID — used for SL cleanup on close."""
+        body   = {"id": order_id, "product_id": product_id}
+        result = self.request_handler.request(
+            "DELETE", "/v2/orders", endpoint_type="private", body=body
+        )
+        return result or {"error": "no_response"}
 
     def get_top_symbols(
         self,
         product_map: Dict[str, int],
-        mode: str = "volatile",
-        limit: int = 5,
-        perp_only: bool = True,
+        mode:        str  = "volatile",
+        limit:       int  = 5,
+        perp_only:   bool = True,
     ) -> List[str]:
         result  = self.request_handler.request("GET", "/v2/tickers", endpoint_type="public")
         tickers = result.get("result", []) if result else []
@@ -986,13 +1206,13 @@ class DeltaREST:
 
     def get_candles(
         self,
-        symbol: str,
-        resolution: str = "1h",
-        limit: int = CANDLE_LIMIT,
+        symbol:        str,
+        resolution:    str = "1h",
+        limit:         int = CANDLE_LIMIT,
         shift_candles: int = 0,
     ) -> List[dict]:
-        candle_symbol = to_candle_symbol(symbol)
-        tf_entry = next(
+        candle_symbol     = to_candle_symbol(symbol)
+        tf_entry          = next(
             (tf for tf in TIMEFRAME_MAP.values()
              if tf["api_resolution"] == resolution or tf["resolution"] == resolution),
             TIMEFRAME_MAP["1h"],
@@ -1075,7 +1295,7 @@ class DeltaREST:
 
 
 # ================================================================
-#  16. POSITION SIZER
+#  17. POSITION SIZER
 # ================================================================
 
 def compute_position_size(
@@ -1097,8 +1317,8 @@ def compute_position_size(
     final_size_raw = min(risk_size, max_by_margin)
     final_size     = max(1, int(final_size_raw))
 
-    margin_used    = (final_size * entry_price) / leverage
-    max_loss_est   = final_size * stop_distance
+    margin_used  = (final_size * entry_price) / leverage
+    max_loss_est = final_size * stop_distance
 
     diag = {
         "account_balance": round(account_balance, 2),
@@ -1123,7 +1343,7 @@ def compute_position_size(
 
 
 # ================================================================
-#  17. TRADING BOT
+#  18. TRADING BOT
 # ================================================================
 
 class TradingBot:
@@ -1145,17 +1365,17 @@ class TradingBot:
 
         self.rest = DeltaREST(self.api_key, self.api_secret)
 
-        self.symbols:     List[str]          = []
-        self.product_map: Dict[str, int]     = {}
-        self.candle_store: Dict[str, deque]  = {}
+        self.symbols:      List[str]          = []
+        self.product_map:  Dict[str, int]     = {}
+        self.candle_store: Dict[str, deque]   = {}
 
         self._trade_lock   = threading.Lock()
-        self.active_trades: Dict[str, dict] = {}
+        self.active_trades: Dict[str, dict]  = {}
 
         self.signals:   List[dict] = []
         self.sl_events: List[dict] = []
 
-        self.running    = False
+        self.running     = False
         self.ws_manager: Optional[DeltaWebSocket] = None
 
         self.on_signal_callback = None
@@ -1317,35 +1537,27 @@ class TradingBot:
         store = self.candle_store.get(symbol)
         if store is None:
             return
-
         fresh = self.rest.get_candles_with_retry(symbol, self.api_resolution, CANDLE_LIMIT)
         if not fresh:
             self._log("warning", "BACKFILL", f"No fresh candles for {symbol}")
             return
-
         existing_ts = {c["time"] for c in store}
-        added       = 0
+        added = 0
         for c in sorted(fresh, key=lambda x: x["time"]):
             if c["time"] not in existing_ts:
                 store.append(c)
                 existing_ts.add(c["time"])
                 added += 1
-
         if added:
-            self._log("info", "BACKFILL",
-                      f"{symbol}: merged {added} new candles from REST")
+            self._log("info", "BACKFILL", f"{symbol}: merged {added} new candles from REST")
         else:
             self._log("info", "BACKFILL", f"{symbol}: no new candles needed")
 
     # ------------------------------------------------------------------ #
-    #  Candle processing — using updated strategy                        #
+    #  Candle processing                                                   #
     # ------------------------------------------------------------------ #
 
     def process_candle(self, symbol: str, candle: dict) -> None:
-        """
-        Main candle dispatch using UPDATED strategy (no wick rejection,
-        open equals previous close condition).
-        """
         store = self.candle_store.get(symbol)
         if store is None:
             return
@@ -1353,46 +1565,42 @@ class TradingBot:
         if not validate_candle(candle, symbol):
             return
 
-        # --- Forming candle update (same timestamp) ---
+        # Forming candle update (same timestamp) — update in place
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
             if symbol in self.active_trades:
                 self._check_stop_loss(symbol, candle)
             return
 
-        # --- New candle arrived: store[-1] is now the JUST-CLOSED candle ---
+        # New candle arrived: store[-1] is now the JUST-CLOSED candle
         if store:
             closed = store[-1]
-
             self._log("info", "CANDLE-CLOSED",
                       f"{symbol} | {self.timeframe} | CLOSED | "
                       f"O={closed['open']:.2f} H={closed['high']:.2f} "
                       f"L={closed['low']:.2f} C={closed['close']:.2f} "
                       f"V={closed.get('volume', 0):.2f}")
 
-            # Check for signal using UPDATED strategy
             if symbol not in self.active_trades:
-                triggered, signal_candle = check_short_signal(list(store))
+                triggered, signal_candle, strategy_name = check_short_signal(list(store))
                 if triggered and signal_candle is not None:
-                    self._on_signal(symbol, signal_candle)
+                    self._on_signal(symbol, signal_candle, strategy_name)
 
-        # Append new forming candle AFTER signal check
         store.append(candle)
 
     # ------------------------------------------------------------------ #
-    #  Stop-loss monitoring (local fallback)                              #
+    #  Local stop-loss fallback monitor                                    #
     # ------------------------------------------------------------------ #
 
     def _check_stop_loss(self, symbol: str, candle: dict) -> None:
         """
-        Local stop-loss monitor. Acts as fallback only — the primary
-        stop-loss is the exchange-side stop-market order placed at entry.
+        Local SL fallback. Primary SL is the bracket order on the exchange.
+        This fires only if the bracket order somehow failed to execute.
         """
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade:
             return
 
-        # For a short, SL triggers when high crosses above stop_loss price
         if candle["high"] < trade["stop_loss"]:
             return
 
@@ -1407,7 +1615,7 @@ class TradingBot:
         print(f"      Stop Loss   = {sl:.4f}")
         print(f"      High        = {candle['high']:.4f}")
         print(f"      Loss ~      = {loss_pct}%  (~${loss_usd:.2f})")
-        print("      (Exchange SL order should have already fired)")
+        print("      (Exchange bracket SL should have already fired)")
         print()
 
         self._log("warning", "SL",
@@ -1428,29 +1636,38 @@ class TradingBot:
         if not self.paper:
             pid  = trade.get("product_id")
             size = trade.get("size", 1)
-            if pid:
+            if pid and size > 0:
                 self.rest.close_position(pid, size, side="buy")
 
+        # FIX: Remove trade and clean up stale SL orders (if any)
+        self._cleanup_trade(symbol)
+
+    def _cleanup_trade(self, symbol: str) -> None:
+        """
+        FIX: Remove trade record cleanly. Bracket orders auto-cancel on
+        the exchange side, so no explicit cancel needed for bracket SLs.
+        """
         with self._trade_lock:
             self.active_trades.pop(symbol, None)
-        self._log("info", "SL", f"Trade record removed for {symbol}")
+        self._log("info", "CLEANUP", f"Trade record removed for {symbol}")
 
     # ------------------------------------------------------------------ #
-    #  Signal handler — using updated strategy with open=previous close  #
+    #  Signal handler                                                      #
     # ------------------------------------------------------------------ #
 
-    def _on_signal(self, symbol: str, signal_candle: dict) -> None:
-        """
-        signal_candle is the candle that triggered the signal.
-        Entry is taken from signal_candle's close, stop loss is set 2% above high.
-        """
+    def _on_signal(self, symbol: str, signal_candle: dict, strategy_name: str) -> None:
         entry = signal_candle["close"]
-        sl    = signal_candle["high"]
-        rpu   = abs(sl - entry)
 
+        if strategy_name == "THREE_BLACK_CROWS" and "pattern_high" in signal_candle:
+            sl = signal_candle["pattern_high"]
+            self._log("info", "THREE_BLACK_CROWS",
+                      f"Using pattern high {sl:.4f} as stop loss")
+        else:
+            sl = signal_candle["high"]
+
+        rpu = abs(sl - entry)
         if rpu == 0:
-            self._log("warning", "SIGNAL",
-                      f"risk_per_unit=0 for {symbol} — skip")
+            self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} — skip")
             return
 
         with self._trade_lock:
@@ -1477,6 +1694,7 @@ class TradingBot:
                 "product_id":      self.product_map.get(symbol),
                 "risk_usd":        risk_usd,
                 "trading_capital": self.trading_capital,
+                "strategy":        strategy_name,
             }
             self.signals.append(signal)
 
@@ -1487,26 +1705,30 @@ class TradingBot:
                     "size":       0,
                     "product_id": self.product_map.get(symbol),
                     "open_time":  datetime.now(timezone.utc).isoformat(),
+                    "strategy":   strategy_name,
                 }
 
+        # Print signal details
         print()
-        print(f"  [SIGNAL] {symbol}  SHORT  [{self.timeframe}]")
+        print(f"  [SIGNAL] {symbol}  SHORT  [{self.timeframe}] — {strategy_name}")
         print(f"           Entry     : {entry:.4f}  (close of signal candle)")
-        print(f"           Open      : {signal_candle['open']:.4f}")
-        print(f"           Prev Close: {signal_candle['close']:.4f}")
-        print(f"           Condition : Open == Previous Close (gap up/down)")
-        print(f"           Stop Loss : {sl:.4f}  (2% above signal candle high={signal_candle['high']:.4f})")
+        print(f"           Stop Loss : {sl:.4f}")
         print(f"           Risk      : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
         print(f"           Mode      : {signal['mode']}")
+        if strategy_name == "STRATEGY_2":
+            body  = candle_body(signal_candle)
+            wick  = upper_wick(signal_candle)
+            ratio = wick / body if body > 0 else 0
+            print(f"           Body / Wick: {body:.4f} / {wick:.4f} ({ratio:.2f}x)")
+        elif strategy_name == "STRATEGY_3":
+            print(f"           O/C: {signal_candle['open']:.4f} → {signal_candle['close']:.4f}")
+        elif strategy_name == "THREE_BLACK_CROWS":
+            print(f"           SL = highest high of the 3 candles")
         print()
 
         self._log("info", "SIGNAL",
-                  f"{symbol} SHORT | tf={self.timeframe} | "
-                  f"entry={entry:.4f} (signal candle close) | "
-                  f"open={signal_candle['open']:.4f} prev_close={signal_candle['close']:.4f} | "
-                  f"condition: open == prev_close | "
-                  f"sl={sl:.4f} (2% above high) | "
-                  f"risk=${risk_usd:.2f}")
+                  f"{symbol} SHORT | {strategy_name} | tf={self.timeframe} | "
+                  f"entry={entry:.4f} | sl={sl:.4f} | risk=${risk_usd:.2f}")
 
         if not self.paper:
             self._execute_trade(symbol, signal)
@@ -1518,7 +1740,7 @@ class TradingBot:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Live trade execution                                                #
+    #  Live trade execution — ALL BUGS FIXED HERE                          #
     # ------------------------------------------------------------------ #
 
     def _execute_trade(self, symbol: str, signal: dict) -> None:
@@ -1526,8 +1748,7 @@ class TradingBot:
             # --- 1. Duplicate guard ---
             with self._trade_lock:
                 if symbol in self.active_trades:
-                    self._log("info", "TRADE",
-                              f"Duplicate entry blocked for {symbol}")
+                    self._log("info", "TRADE", f"Duplicate entry blocked for {symbol}")
                     return
                 self.active_trades[symbol] = {"_reserved": True}
 
@@ -1537,8 +1758,7 @@ class TradingBot:
 
             if capital <= 0:
                 self._log("error", "TRADE", "trading_capital=0 — skip")
-                with self._trade_lock:
-                    self.active_trades.pop(symbol, None)
+                self._cleanup_trade(symbol)
                 return
 
             if account_balance < capital:
@@ -1549,8 +1769,7 @@ class TradingBot:
 
             if capital <= 0:
                 self._log("warning", "TRADE", "Effective capital=0 — skip")
-                with self._trade_lock:
-                    self.active_trades.pop(symbol, None)
+                self._cleanup_trade(symbol)
                 return
 
             # --- 3. Risk-based sizing ---
@@ -1561,8 +1780,7 @@ class TradingBot:
             if not pid:
                 self._log("error", "TRADE",
                           f"product_id not found for {symbol} — skip")
-                with self._trade_lock:
-                    self.active_trades.pop(symbol, None)
+                self._cleanup_trade(symbol)
                 return
 
             position_size, size_diag = compute_position_size(
@@ -1574,10 +1792,8 @@ class TradingBot:
             )
 
             if position_size < 1:
-                self._log("error", "TRADE",
-                          f"Computed size < 1 for {symbol} — skip")
-                with self._trade_lock:
-                    self.active_trades.pop(symbol, None)
+                self._log("error", "TRADE", f"Computed size < 1 for {symbol} — skip")
+                self._cleanup_trade(symbol)
                 return
 
             print()
@@ -1594,66 +1810,86 @@ class TradingBot:
             print(f"          account_balance  : ${account_balance:,.2f}")
             print()
 
-            # --- 4. Place entry order ---
+            # --- 4. Place entry (market) order ---
             entry_result = self.rest.place_order(
                 product_id=pid, side="sell",
                 size=position_size, order_type="market_order",
             )
 
-            # --- 5. Confirm fill ---
-            order_ok    = False
-            order_state = entry_result.get("result", {}).get("state", "") if entry_result else ""
-            order_id    = entry_result.get("result", {}).get("id")        if entry_result else None
-
-            if entry_result and "error" not in entry_result:
-                if order_state == "rejected":
-                    reject_reason = entry_result.get("result", {}).get("cancel_reason", "unknown")
-                    self._log("error", "TRADE",
-                              f"Order REJECTED by exchange: {reject_reason}")
-                    order_ok = False
-                else:
-                    # open / filled / partial / queued / "" — treat as ok
-                    order_ok = True
-
-            if not order_ok:
-                self._log("error", "TRADE", f"Entry order FAILED for {symbol}: {entry_result}")
+            if not entry_result or "error" in entry_result:
+                self._log("error", "TRADE",
+                          f"Entry order FAILED for {symbol}: {entry_result}")
                 print(f"  [FAILED] {symbol} entry order: {entry_result}")
-                with self._trade_lock:
-                    self.active_trades.pop(symbol, None)
+                self._cleanup_trade(symbol)
                 return
 
-            self._log("info", "TRADE",
-                      f"ORDER PLACED | {symbol} | pid={pid} | id={order_id} | "
-                      f"size={position_size} | entry={entry:.4f} | state={order_state}")
-            print(f"  [OK] Entry order placed: {symbol} SHORT x{position_size} @ {entry:.4f}")
-            if order_id:
-                print(f"       Order ID: {order_id}")
-            print()
+            order_result = entry_result.get("result", {})
+            order_id     = order_result.get("id")
+            order_state  = order_result.get("state", "")
 
-            # --- 6. Exchange-side stop-loss ---
-            sl_result   = self.rest.place_stop_market_order(
+            if order_state == "rejected":
+                reject_reason = order_result.get("cancel_reason", "unknown")
+                self._log("error", "TRADE",
+                          f"Entry order REJECTED by exchange: {reject_reason}")
+                self._cleanup_trade(symbol)
+                return
+
+            if not order_id:
+                self._log("error", "TRADE",
+                          f"No order_id returned for {symbol} — cannot confirm fill")
+                self._cleanup_trade(symbol)
+                return
+
+            _log("info", "TRADE",
+                 f"Entry order submitted | {symbol} | id={order_id} | "
+                 f"requested_size={position_size} | state={order_state}")
+
+            # --- 5. FIX BUG #1 & #2: Poll for confirmed fill + get actual filled size ---
+            filled, actual_filled_size = self.rest.wait_for_fill(order_id, symbol)
+
+            if not filled or actual_filled_size < 1:
+                self._log("error", "TRADE",
+                          f"Entry not confirmed filled for {symbol}. "
+                          f"filled={filled} size={actual_filled_size}. "
+                          f"Attempting to cancel entry order and aborting SL.")
+                # Try to cancel if still open (may already be filled but poll failed)
+                self.rest.cancel_order(order_id, pid)
+                self._cleanup_trade(symbol)
+                return
+
+            print(f"  [FILLED] {symbol} SHORT | order_id={order_id} | "
+                  f"filled={actual_filled_size} contracts")
+
+            if actual_filled_size != position_size:
+                _log("warning", "TRADE",
+                     f"Partial fill: requested={position_size} "
+                     f"actual={actual_filled_size}. SL will use actual size.")
+
+            # --- 6. FIX: Place bracket SL using ACTUAL filled size ---
+            #         Bracket order auto-manages size and auto-cancels on close
+            bracket_result = self.rest.place_bracket_stop_loss(
                 product_id=pid,
-                side="buy",
-                size=position_size,
                 stop_price=sl,
+                symbol=symbol,
             )
-            sl_order_id = sl_result.get("result", {}).get("id") if sl_result else None
-            sl_ok       = sl_result and "error" not in sl_result
 
-            if sl_ok:
-                self._log("info", "SL-ORDER",
-                          f"Exchange SL placed | {symbol} | id={sl_order_id} | sl={sl:.4f}")
-                print(f"  [SL-OK] Exchange stop-loss placed @ {sl:.4f}  (id={sl_order_id})")
+            bracket_ok = bracket_result and "error" not in bracket_result
+
+            if bracket_ok:
+                self._log("info", "BRACKET-SL",
+                          f"Bracket SL placed | {symbol} | sl={sl:.4f} | "
+                          f"trigger=last_traded_price")
+                print(f"  [SL-OK] Bracket stop-loss placed @ {sl:.4f}  (auto-cancels on close)")
             else:
-                self._log("warning", "SL-ORDER",
-                          f"Exchange SL FAILED for {symbol}: {sl_result}  "
-                          f"(local SL monitoring still active)")
-                print(f"  [SL-WARN] Exchange SL failed — local SL monitoring active: {sl_result}")
+                self._log("warning", "BRACKET-SL",
+                          f"Bracket SL FAILED for {symbol}: {bracket_result}  "
+                          f"— local SL monitoring active as fallback")
+                print(f"  [SL-WARN] Bracket SL failed — local monitoring active: {bracket_result}")
             print()
 
-            # --- 7. Record trade ---
+            # --- 7. Record trade with ACTUAL filled size ---
             signal["executed"]        = True
-            signal["size"]            = position_size
+            signal["size"]            = actual_filled_size
             signal["capital_used"]    = capital
             signal["risk_amount"]     = size_diag["risk_amount"]
             signal["margin_used"]     = size_diag["margin_used"]
@@ -1661,20 +1897,21 @@ class TradingBot:
             signal["account_balance"] = account_balance
             signal["order_result"]    = entry_result
             signal["order_id"]        = order_id
-            signal["sl_order_id"]     = sl_order_id
+            signal["bracket_result"]  = bracket_result
 
             with self._trade_lock:
                 self.active_trades[symbol] = {
-                    "entry":        entry,
-                    "stop_loss":    sl,
-                    "size":         position_size,
-                    "product_id":   pid,
-                    "order_id":     order_id,
-                    "sl_order_id":  sl_order_id,
-                    "open_time":    datetime.now(timezone.utc).isoformat(),
-                    "capital":      capital,
-                    "risk_usd":     size_diag["risk_amount"],
-                    "margin_used":  size_diag["margin_used"],
+                    "entry":          entry,
+                    "stop_loss":      sl,
+                    "size":           actual_filled_size,   # FIX: actual, not requested
+                    "product_id":     pid,
+                    "order_id":       order_id,
+                    "open_time":      datetime.now(timezone.utc).isoformat(),
+                    "capital":        capital,
+                    "risk_usd":       size_diag["risk_amount"],
+                    "margin_used":    size_diag["margin_used"],
+                    "strategy":       signal.get("strategy", "UNKNOWN"),
+                    "bracket_sl_ok":  bracket_ok,
                 }
 
             if self.on_trade_callback:
@@ -1684,8 +1921,7 @@ class TradingBot:
                     pass
 
         except Exception as exc:
-            with self._trade_lock:
-                self.active_trades.pop(symbol, None)
+            self._cleanup_trade(symbol)
             self._log("error", "TRADE", f"Execution error for {symbol}: {exc}")
 
     # ------------------------------------------------------------------ #
@@ -1695,17 +1931,18 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v9.1            |")
-        print("|   Strategy : SHORT Breakout + Open=PrevClose          |")
-        print("|   (No wick rejection, gap open equals previous close) |")
-        print("|   Sizing   : Risk-based (stop-distance formula)        |")
-        print("|   SL       : 2% above signal candle high + exchange SL |")
-        print("|   Fix #1   : Leverage  /orders/leverage endpoint       |")
-        print("|   Fix #2   : SL reduce_only=True + stop_trigger=LTP    |")
-        print("|   Fix #3   : No /v2/time — local time.time() only      |")
-        print("|   Fix #4   : process_candle appends AFTER strategy     |")
-        print("|   Fix #5   : Signal candle == entry candle (corrected) |")
-        print("|   Endpoint : wss://socket.india.delta.exchange         |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v10.0           |")
+        print("|   Strategies (OR combination):                        |")
+        print("|     1. Breakout + Open=PrevClose & Close=PrevOpen     |")
+        print("|     2. 3-candle breakout + upper wick >= 1.8x body    |")
+        print("|     3. Bearish Engulfing + Uptrend                    |")
+        print("|     4. Three Black Crows Pattern                      |")
+        print("|   SL FIX #1  : Fill confirmed before SL placed        |")
+        print("|   SL FIX #2  : Actual filled size used for SL         |")
+        print("|   SL FIX #3  : Bracket order /orders/bracket          |")
+        print("|   SL FIX #4  : Tick-size rounding (not 2dp)           |")
+        print("|   AUTH FIX   : Fresh timestamp on every sign() call   |")
+        print("|   Endpoint   : wss://socket.india.delta.exchange       |")
         print("+========================================================+")
         print()
 
@@ -1720,20 +1957,26 @@ class TradingBot:
         print(f"  Risk / trade    : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
-        print(f"  Stop loss       : 2% above signal candle high")
-        print(f"  Strategy        : SHORT when open == previous close AND breakouts")
-        print(f"  Signal candle   : last CLOSED candle ([-1] of store, pre-append)")
+        print(f"  SL method       : Bracket order (POST /v2/orders/bracket)")
+        print(f"  SL trigger      : last_traded_price")
+        print(f"  SL size         : Actual filled contracts (polled)")
+        print(f"  Strategies (OR) :")
+        print(f"    1. Breakout + Open=PrevClose & Close=PrevOpen")
+        print(f"    2. 3-candle breakout + upper wick >= 1.8x body")
+        print(f"    3. Bearish Engulfing + Uptrend")
+        print(f"    4. Three Black Crows Pattern")
         print(f"  Active symbols  : {len(self.symbols)}")
         for sym in self.symbols:
-            pid = self.product_map.get(sym, "???")
-            print(f"    - {sym:<22} product_id={pid}")
+            pid      = self.product_map.get(sym, "???")
+            tick_sz  = self.rest.get_tick_size(sym)
+            print(f"    - {sym:<22} product_id={pid}  tick={tick_sz}")
             print(f"      candle_api: {to_candle_symbol(sym):<16} ws_sub: {to_ws_symbol(sym)}")
         print("+--------------------------------------------------------+")
         print()
 
 
 # ================================================================
-#  18. USER INPUT HELPERS
+#  19. USER INPUT HELPERS
 # ================================================================
 
 def _divider(title: str = "") -> None:
@@ -1835,23 +2078,24 @@ def ask_risk_params() -> Tuple[float, int]:
 
 
 # ================================================================
-#  19. ENTRY POINT
+#  20. ENTRY POINT
 # ================================================================
 
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v9.1        |")
-    print("  |   Strategy : SHORT Breakout + Open=PrevClose        |")
-    print("  |   (No wick rejection, gap open equals prev close)   |")
-    print("  |   Sizing   : Risk-based (stop-distance formula)      |")
-    print("  |   SL       : 2% above signal candle high + exchange SL |")
-    print("  |   Fix #1   : Leverage  /orders/leverage endpoint     |")
-    print("  |   Fix #2   : SL reduce_only=True + LTP trigger       |")
-    print("  |   Fix #3   : No /v2/time — uses time.time() only     |")
-    print("  |   Fix #4   : process_candle appends AFTER strategy   |")
-    print("  |   Fix #5   : Signal candle == entry candle (fixed)   |")
-    print("  |   Endpoint : wss://socket.india.delta.exchange       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v10.0       |")
+    print("  |   Strategies (OR combination):                      |")
+    print("  |     1. Breakout + Open=PrevClose & Close=PrevOpen   |")
+    print("  |     2. 3-candle breakout + upper wick >= 1.8x body  |")
+    print("  |     3. Bearish Engulfing + Uptrend                  |")
+    print("  |     4. Three Black Crows Pattern                    |")
+    print("  |   SL FIX #1  : Fill confirmed before SL placed      |")
+    print("  |   SL FIX #2  : Actual filled size used for SL       |")
+    print("  |   SL FIX #3  : Bracket order /orders/bracket        |")
+    print("  |   SL FIX #4  : Tick-size rounding per product       |")
+    print("  |   AUTH FIX   : Fresh timestamp on every sign call   |")
+    print("  |   Endpoint   : wss://socket.india.delta.exchange    |")
     print("  +======================================================+")
 
     timeframe              = ask_timeframe()
@@ -1896,11 +2140,15 @@ def main() -> None:
     print(f"  Symbols         : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
     print(f"  Leverage        : {leverage}x")
     print(f"  Trading capital : ${trading_capital:,.2f}")
-    print(f"  Risk / trade    : {risk_pct}%  =  ~${risk_usd:,.2f}  (exact varies by SL dist)")
+    print(f"  Risk / trade    : {risk_pct}%  =  ~${risk_usd:,.2f}")
     print(f"  Max open trades : {max_trades}")
-    print(f"  Stop loss       : 2% above signal candle high")
-    print(f"  Strategy        : SHORT when open == previous close AND breakouts")
-    print(f"  Signal candle   : last CLOSED candle at moment of detection")
+    print(f"  SL method       : Bracket order (POST /v2/orders/bracket)")
+    print(f"  SL trigger      : last_traded_price")
+    print(f"  Strategies (OR) :")
+    print(f"    1. Breakout + Open=PrevClose & Close=PrevOpen")
+    print(f"    2. 3-candle breakout + upper wick >= 1.8x body")
+    print(f"    3. Bearish Engulfing + Uptrend")
+    print(f"    4. Three Black Crows Pattern")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
