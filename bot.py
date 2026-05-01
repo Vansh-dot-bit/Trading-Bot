@@ -325,8 +325,8 @@ TP_RR_RATIO         = 2.0   # 2:1 Risk:Reward (TP = 2x the risk distance)
 # Optional: also limit TP to a fixed max % move
 TP_MAX_PCT          = 0.05  # Never more than 5% move as TP (safety cap)
 
-# ── FIX GAP #5: Daily loss limit ──
-DAILY_LOSS_LIMIT_PCT = 0.05  # Stop trading if daily loss exceeds 5% of trading capital
+# ── FIX GAP #5: Daily loss limit (will be set by user input) ──
+DAILY_LOSS_LIMIT_PCT = 0.05  # Default 5%, will be updated by user input
 
 # ── FIX GAP #2: Strategy 1 realistic tolerance ──
 # Replaces the strict 0.0001 open=prev_close check with a % tolerance
@@ -1233,16 +1233,16 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
 
 
 # ================================================================
-#  FIX GAP #5: DAILY LOSS TRACKER
+#  FIX GAP #5: DAILY LOSS TRACKER (Updated to use user-defined limit)
 # ================================================================
 
 class DailyLossTracker:
     """
     Tracks realised losses within the current trading day (UTC).
-    Blocks new trades if cumulative loss exceeds DAILY_LOSS_LIMIT_PCT of capital.
+    Blocks new trades if cumulative loss exceeds daily_loss_limit_pct of capital.
     """
 
-    def __init__(self, trading_capital: float, limit_pct: float = DAILY_LOSS_LIMIT_PCT):
+    def __init__(self, trading_capital: float, limit_pct: float):
         self.trading_capital = trading_capital
         self.limit_pct       = limit_pct
         self.daily_loss_usd  = 0.0
@@ -1305,6 +1305,7 @@ class TradingBot:
         self.api_secret      = config.get("api_secret", "")
         self.trading_capital = float(config.get("trading_capital", 0.0))
         self.risk_pct        = config["risk_pct"] / 100.0
+        self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
 
         self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
         self.timeframe      = self._tf.key
@@ -1325,10 +1326,10 @@ class TradingBot:
         self.sl_events: List[dict] = []
         self.tp_events: List[dict] = []
 
-        # FIX GAP #5: Daily loss tracker
+        # FIX GAP #5: Daily loss tracker with user-defined limit
         self.daily_loss_tracker = DailyLossTracker(
             trading_capital=self.trading_capital,
-            limit_pct=DAILY_LOSS_LIMIT_PCT,
+            limit_pct=self.daily_loss_limit_pct,
         )
 
         self.running     = False
@@ -1788,14 +1789,14 @@ class TradingBot:
     def _print_startup_summary(self) -> None:
         mode_str = "PAPER (signals only)" if self.paper else "LIVE TRADING"
         risk_usd = self.trading_capital * self.risk_pct
-        daily_limit_usd = self.trading_capital * DAILY_LOSS_LIMIT_PCT
+        daily_limit_usd = self.trading_capital * self.daily_loss_limit_pct
         print("+--------------------------------------------------------+")
         print(f"  Mode            : {mode_str}")
         print(f"  Timeframe       : {self.timeframe}")
         print(f"  Trading capital : ${self.trading_capital:,.2f} USD")
         print(f"  Risk / trade    : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
         print(f"  Take-Profit     : {TP_RR_RATIO:.1f}:1 Risk:Reward  (max {TP_MAX_PCT*100:.0f}% move)")
-        print(f"  Daily loss cap  : {DAILY_LOSS_LIMIT_PCT*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
+        print(f"  Daily loss cap  : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
         print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")
@@ -1899,6 +1900,22 @@ def ask_risk_params() -> Tuple[float, int]:
     return risk, mx
 
 
+def ask_daily_loss_limit() -> float:
+    """
+    NEW FUNCTION: Ask user for daily loss limit percentage.
+    """
+    _divider("DAILY LOSS LIMIT")
+    print("  Daily loss limit stops trading if cumulative losses exceed this % of capital.")
+    print("  Recommended: 3% to 10%")
+    try:
+        daily_loss = float(input("  Daily loss limit % (default = 5) : ").strip() or 5)
+        daily_loss = max(0.1, min(daily_loss, 50.0))  # Between 0.1% and 50%
+    except ValueError:
+        daily_loss = 5.0
+    print(f"  Daily loss limit : {daily_loss}% of trading capital")
+    return daily_loss
+
+
 # ================================================================
 #  21. ENTRY POINT
 # ================================================================
@@ -1941,10 +1958,11 @@ def main() -> None:
 
     trading_capital      = ask_trading_capital(account_balance)
     risk_pct, max_trades = ask_risk_params()
+    daily_loss_limit_pct = ask_daily_loss_limit()  # NEW: Ask for daily loss limit percentage
 
     _divider("CONFIRM")
     risk_usd       = trading_capital * risk_pct / 100
-    daily_loss_usd = trading_capital * DAILY_LOSS_LIMIT_PCT
+    daily_loss_usd = trading_capital * (daily_loss_limit_pct / 100)
     print(f"  Mode            : {'PAPER' if paper else 'LIVE TRADING'}")
     print(f"  Timeframe       : {timeframe}")
     print(f"  Symbols         : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
@@ -1952,7 +1970,7 @@ def main() -> None:
     print(f"  Trading capital : ${trading_capital:,.2f}")
     print(f"  Risk / trade    : {risk_pct}%  =  ~${risk_usd:,.2f}")
     print(f"  Take-Profit     : {TP_RR_RATIO:.1f}:1 R:R (max {TP_MAX_PCT*100:.0f}% move)")
-    print(f"  Daily loss cap  : {DAILY_LOSS_LIMIT_PCT*100:.0f}%  =  ~${daily_loss_usd:,.2f}")
+    print(f"  Daily loss cap  : {daily_loss_limit_pct}%  =  ~${daily_loss_usd:,.2f}")
     print(f"  Max open trades : {max_trades}")
     print(f"  SHORT strategies: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)  RSI>70")
     print(f"  LONG  strategies: 7(BullEngulf)  RSI<30")
@@ -1967,6 +1985,7 @@ def main() -> None:
         "leverage": leverage, "trading_capital": trading_capital,
         "max_concurrent_trades": max_trades, "timeframe": timeframe,
         "api_key": api_key, "api_secret": api_secret,
+        "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,  # Convert % to decimal
     }
 
     bot = TradingBot(cfg)
