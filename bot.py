@@ -309,7 +309,7 @@ CANDLE_SAFETY_SHIFT = 1
 
 # RSI settings
 RSI_PERIOD          = 14
-RSI_OVERBOUGHT      = 70.0
+RSI_OVERBOUGHT      = 60.0   # CHANGED: from 70 to 60 for earlier short entries
 RSI_MIN_CANDLES     = RSI_PERIOD + 1
 
 # Fill poll settings
@@ -810,7 +810,7 @@ def check_short_signal(
     candles: List[dict], symbol: str = "",
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    OR combination of all short strategies + RSI(14) > 70 gate.
+    OR combination of all short strategies + RSI(14) > 60 gate.
     RSI computed on closed candles only (candles[:-1]).
     """
     closed_candles = candles[:-1]
@@ -1781,7 +1781,7 @@ class TradingBot:
         print("|   Strategies SHORT : 1 Breakout | 3 Engulf | 5 Doji   |")
         print("|                    | 6 Harami                          |")
         print("|   Strategies LONG  : 7 Bullish Engulfing               |")
-        print("|   RSI SHORT filter : RSI(14) > 70                      |")
+        print("|   RSI SHORT filter : RSI(14) > 60                      |")  # CHANGED: from 70 to 60
         print("|   RSI LONG  filter : RSI(14) < 30                      |")
         print("+========================================================+")
         print()
@@ -1799,7 +1799,7 @@ class TradingBot:
         print(f"  Daily loss cap  : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
-        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")
+        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")  # Will show 60.0
         print(f"  RSI LONG  filter: RSI(14) < {RSI_OVERSOLD}")
         print(f"  Candle history  : {CANDLE_LIMIT} candles (RSI fully settled)")
         print(f"  Engulf body min : {MIN_ENGULF_BODY_PCT*100:.0f}% of candle range")
@@ -1972,7 +1972,7 @@ def main() -> None:
     print(f"  Take-Profit     : {TP_RR_RATIO:.1f}:1 R:R (max {TP_MAX_PCT*100:.0f}% move)")
     print(f"  Daily loss cap  : {daily_loss_limit_pct}%  =  ~${daily_loss_usd:,.2f}")
     print(f"  Max open trades : {max_trades}")
-    print(f"  SHORT strategies: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)  RSI>70")
+    print(f"  SHORT strategies: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)  RSI>60")  # CHANGED: from 70 to 60
     print(f"  LONG  strategies: 7(BullEngulf)  RSI<30")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
