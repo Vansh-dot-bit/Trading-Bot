@@ -307,9 +307,10 @@ RETRY_DELAYS        = [5, 10, 15]
 TIMEOUT             = 30
 CANDLE_SAFETY_SHIFT = 1
 
-# RSI settings
+# RSI settings - UPDATED for more aggressive entries
 RSI_PERIOD          = 14
-RSI_OVERBOUGHT      = 60.0   # CHANGED: from 70 to 60 for earlier short entries
+RSI_OVERBOUGHT      = 65.0   # CHANGED: from 60 to 65 for short entries (less frequent but stronger signals)
+RSI_OVERSOLD        = 35.0   # CHANGED: from 30 to 35 for long entries (less frequent but stronger signals)
 RSI_MIN_CANDLES     = RSI_PERIOD + 1
 
 # Fill poll settings
@@ -768,7 +769,7 @@ def check_long_signal_strategy_7(candles: List[dict]) -> Tuple[bool, Optional[di
         candles[-3] = i2      (bearish, engulfed)
         candles[-4] = i3      (context, downtrend: close < i3 prev close)
 
-    RSI filter for LONG: RSI < 30 (oversold) — checked in check_long_signal()
+    RSI filter for LONG: RSI < 35 (oversold) — UPDATED from 30 to 35
     SL = lowest low of i1 and signal candle
     """
     if len(candles) < 4:
@@ -810,7 +811,7 @@ def check_short_signal(
     candles: List[dict], symbol: str = "",
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    OR combination of all short strategies + RSI(14) > 60 gate.
+    OR combination of all short strategies + RSI(14) > 65 gate (UPDATED from 60 to 65).
     RSI computed on closed candles only (candles[:-1]).
     """
     closed_candles = candles[:-1]
@@ -835,16 +836,14 @@ def check_short_signal(
 
 
 # ================================================================
-#  NEW: MASTER LONG SIGNAL CHECKER — FIX GAP #9
+#  UPDATED: MASTER LONG SIGNAL CHECKER — RSI < 35 gate
 # ================================================================
-
-RSI_OVERSOLD = 30.0   # RSI must be BELOW this to allow long entry
 
 def check_long_signal(
     candles: List[dict], symbol: str = "",
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    Long signal master checker — RSI(14) < 30 gate + Bullish Engulfing.
+    Long signal master checker — RSI(14) < 35 gate (UPDATED from 30 to 35) + Bullish Engulfing.
     RSI computed on closed candles only.
     """
     closed_candles = candles[:-1]
@@ -1781,8 +1780,8 @@ class TradingBot:
         print("|   Strategies SHORT : 1 Breakout | 3 Engulf | 5 Doji   |")
         print("|                    | 6 Harami                          |")
         print("|   Strategies LONG  : 7 Bullish Engulfing               |")
-        print("|   RSI SHORT filter : RSI(14) > 60                      |")  # CHANGED: from 70 to 60
-        print("|   RSI LONG  filter : RSI(14) < 30                      |")
+        print("|   RSI SHORT filter : RSI(14) > 65                      |")  # UPDATED: from 60 to 65
+        print("|   RSI LONG  filter : RSI(14) < 35                      |")  # UPDATED: from 30 to 35
         print("+========================================================+")
         print()
 
@@ -1799,8 +1798,8 @@ class TradingBot:
         print(f"  Daily loss cap  : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
-        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")  # Will show 60.0
-        print(f"  RSI LONG  filter: RSI(14) < {RSI_OVERSOLD}")
+        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")  # Will show 65.0
+        print(f"  RSI LONG  filter: RSI(14) < {RSI_OVERSOLD}")     # Will show 35.0
         print(f"  Candle history  : {CANDLE_LIMIT} candles (RSI fully settled)")
         print(f"  Engulf body min : {MIN_ENGULF_BODY_PCT*100:.0f}% of candle range")
         print(f"  Breakout overlap: {BREAKOUT_BODY_OVERLAP_MIN_PCT*100:.0f}% body overlap (Strategy 1)")
@@ -1927,6 +1926,7 @@ def main() -> None:
     print("  |   All v10.4 analysis gaps FIXED                     |")
     print("  |   Short + Long strategies  |  TP 2:1 R:R            |")
     print("  |   RSI(14) filter | Daily loss limit | 100 candles   |")
+    print("  |   RSI SHORT > 65  |  RSI LONG < 35                  |")
     print("  +======================================================+")
 
     timeframe              = ask_timeframe()
@@ -1972,8 +1972,8 @@ def main() -> None:
     print(f"  Take-Profit     : {TP_RR_RATIO:.1f}:1 R:R (max {TP_MAX_PCT*100:.0f}% move)")
     print(f"  Daily loss cap  : {daily_loss_limit_pct}%  =  ~${daily_loss_usd:,.2f}")
     print(f"  Max open trades : {max_trades}")
-    print(f"  SHORT strategies: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)  RSI>60")  # CHANGED: from 70 to 60
-    print(f"  LONG  strategies: 7(BullEngulf)  RSI<30")
+    print(f"  SHORT strategies: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)  RSI>65")
+    print(f"  LONG  strategies: 7(BullEngulf)  RSI<35")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
