@@ -73,7 +73,48 @@ def _log(level: str, tag: str, msg: str) -> None:
 
 
 # ================================================================
-#  4.  GMAIL NOTIFIER
+#  4.  ENTRY TIMING STRATEGY ENUM
+# ================================================================
+
+class EntryTiming(Enum):
+    WAIT_SIGNAL_CANDLE = "wait_signal_candle"  # Wait for confirmation candle
+    IMMEDIATE_I1 = "immediate_i1"              # Enter on i1 candle (pattern candle)
+    IMMEDIATE_DOJI = "immediate_doji"          # Enter on doji candle (for doji patterns only)
+
+
+@dataclass
+class StrategyEntryConfig:
+    """Configuration for when to enter each strategy type"""
+    # Breakout strategies (Strategy 1 for SHORT/LONG)
+    breakout_entry: EntryTiming = EntryTiming.WAIT_SIGNAL_CANDLE
+    
+    # Engulfing strategies (Strategy 3 for SHORT/LONG)
+    engulfing_entry: EntryTiming = EntryTiming.WAIT_SIGNAL_CANDLE
+    
+    # Doji strategies (Strategy 5 for SHORT/LONG)
+    doji_entry: EntryTiming = EntryTiming.WAIT_SIGNAL_CANDLE
+    
+    # Harami strategies (Strategy 6 for SHORT/LONG)
+    harami_entry: EntryTiming = EntryTiming.WAIT_SIGNAL_CANDLE
+    
+    def get_entry_type(self, strategy_name: str) -> EntryTiming:
+        """Get entry timing based on strategy name"""
+        strategy_lower = strategy_name.lower()
+        
+        if "strategy_1" in strategy_lower or "breakout" in strategy_lower:
+            return self.breakout_entry
+        elif "strategy_3" in strategy_lower or "engulf" in strategy_lower:
+            return self.engulfing_entry
+        elif "doji" in strategy_lower:
+            return self.doji_entry
+        elif "harami" in strategy_lower:
+            return self.harami_entry
+        
+        return EntryTiming.WAIT_SIGNAL_CANDLE
+
+
+# ================================================================
+#  5.  GMAIL NOTIFIER
 # ================================================================
 
 class GmailNotifier:
@@ -127,31 +168,40 @@ class GmailNotifier:
         mode = signal.get("mode", "PAPER")
         risk_usd = signal.get("risk_usd", 0)
         trading_capital = signal.get("trading_capital", 0)
+        entry_timing = signal.get("entry_timing", "wait_signal_candle")
         signal_time = signal.get("time", datetime.now(timezone.utc).isoformat())
         direction_emoji = "🔴 SHORT" if direction == "SHORT" else "🟢 LONG"
-        subject = f"[{mode}] {direction_emoji} {symbol} - {strategy}"
+        
+        timing_display = {
+            "wait_signal_candle": "Wait for Signal Candle",
+            "immediate_i1": "IMMEDIATE on Pattern Candle",
+            "immediate_doji": "IMMEDIATE on Doji Candle",
+        }.get(entry_timing, entry_timing)
+        
+        subject = f"[{mode}] {direction_emoji} {symbol} - {strategy} [{timing_display}]"
         body = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                    TRADING SIGNAL ALERT                      ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Time       : {signal_time}
-║  Mode       : {mode}
-║  Symbol     : {symbol}
-║  Direction  : {direction_emoji}
-║  Strategy   : {strategy}
-║  Timeframe  : {timeframe}
+║  Time         : {signal_time}
+║  Mode         : {mode}
+║  Symbol       : {symbol}
+║  Direction    : {direction_emoji}
+║  Strategy     : {strategy}
+║  Timeframe    : {timeframe}
+║  Entry Timing : {timing_display}
 ╠══════════════════════════════════════════════════════════════╣
-║  Entry      : {entry:.4f}
-║  Stop Loss  : {stop_loss:.4f}
-║  Take Profit: {take_profit:.4f}
-║  Risk Dist  : {abs(entry - stop_loss):.4f}
-║  Reward Dist: {abs(take_profit - entry):.4f}
-║  Risk:Reward: {abs(take_profit - entry) / abs(entry - stop_loss):.2f}:1
+║  Entry        : {entry:.4f}
+║  Stop Loss    : {stop_loss:.4f}
+║  Take Profit  : {take_profit:.4f}
+║  Risk Dist    : {abs(entry - stop_loss):.4f}
+║  Reward Dist  : {abs(take_profit - entry):.4f}
+║  Risk:Reward  : {abs(take_profit - entry) / abs(entry - stop_loss):.2f}:1
 ╠══════════════════════════════════════════════════════════════╣
-║  RSI(14)    : {rsi}
-║  Risk $     : ${risk_usd:.2f}
-║  Capital    : ${trading_capital:,.2f}
-║  Risk %     : {(risk_usd / trading_capital * 100) if trading_capital > 0 else 0:.2f}%
+║  RSI(14)      : {rsi}
+║  Risk $       : ${risk_usd:.2f}
+║  Capital      : ${trading_capital:,.2f}
+║  Risk %       : {(risk_usd / trading_capital * 100) if trading_capital > 0 else 0:.2f}%
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
@@ -240,7 +290,7 @@ class GmailNotifier:
         """
         return self._send_email(subject, body)
     
-    def send_startup_report(self, config: dict, symbols: List[str]) -> bool:
+    def send_startup_report(self, config: dict, symbols: List[str], entry_config: dict) -> bool:
         if not self.enabled:
             return False
         mode = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
@@ -248,6 +298,13 @@ class GmailNotifier:
         symbols_list = "\n".join([f"  • {sym}" for sym in symbols[:10]])
         if len(symbols) > 10:
             symbols_list += f"\n  • ... and {len(symbols) - 10} more"
+        
+        timing_display = {
+            "wait_signal_candle": "Wait for Signal Candle",
+            "immediate_i1": "Immediate on Pattern Candle",
+            "immediate_doji": "Immediate on Doji Candle",
+        }
+        
         body = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                   TRADING BOT STARTED                        ║
@@ -260,8 +317,18 @@ class GmailNotifier:
 ║  Daily Loss Cap : {config.get('daily_loss_limit_pct', 0.05) * 100:.0f}%
 ║  Capital        : ${config.get('trading_capital', 0):,.2f}
 ╠══════════════════════════════════════════════════════════════╣
-║  SHORT RSI     : > 55
-║  LONG RSI      : < 35
+║  RSI CONDITIONS:                                             ║
+║  SHORT (Global) : RSI(14) > 55                               ║
+║  LONG (Global)  : RSI(14) < 35                               ║
+║  SHORT DOJI     : RSI(14) > 60 (separate threshold)          ║
+║  LONG DOJI      : RSI(14) < 30 (separate threshold)          ║
+╠══════════════════════════════════════════════════════════════╣
+║  ENTRY TIMING CONFIGURATION:                                 ║
+║  • Breakout (Strategy 1) : {timing_display.get(entry_config.get('breakout', 'wait_signal_candle'), entry_config.get('breakout', 'wait_signal_candle'))}
+║  • Engulfing (Strategy 3): {timing_display.get(entry_config.get('engulfing', 'wait_signal_candle'), entry_config.get('engulfing', 'wait_signal_candle'))}
+║  • Doji (Strategy 5)     : {timing_display.get(entry_config.get('doji', 'wait_signal_candle'), entry_config.get('doji', 'wait_signal_candle'))}
+║  • Harami (Strategy 6)   : {timing_display.get(entry_config.get('harami', 'wait_signal_candle'), entry_config.get('harami', 'wait_signal_candle'))}
+╠══════════════════════════════════════════════════════════════╣
 ║  Take Profit   : 2:1 R:R (triggers on PRICE TOUCH)
 ║  Stop Loss     : Triggers on CANDLE CLOSE (not intraday)
 ╠══════════════════════════════════════════════════════════════╣
@@ -273,7 +340,7 @@ class GmailNotifier:
 
 
 # ================================================================
-#  5.  WEBSOCKET MANAGER
+#  6.  WEBSOCKET MANAGER
 # ================================================================
 
 class WSState(Enum):
@@ -476,7 +543,7 @@ class DeltaWebSocket:
 
 
 # ================================================================
-#  6.  SYMBOL HANDLING
+#  7.  SYMBOL HANDLING
 # ================================================================
 
 def to_trading_symbol(symbol: str) -> str:
@@ -499,7 +566,7 @@ def to_candle_symbol(symbol: str) -> str:
 
 
 # ================================================================
-#  7.  CONSTANTS
+#  8.  CONSTANTS
 # ================================================================
 REST_BASE_INDIA  = "https://api.india.delta.exchange"
 REST_BASE_GLOBAL = "https://api.delta.exchange"
@@ -511,8 +578,10 @@ TIMEOUT             = 30
 CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD          = 14
-RSI_OVERBOUGHT      = 55.0
-RSI_OVERSOLD        = 35.0
+RSI_OVERBOUGHT      = 55.0    # Global SHORT threshold (non-doji)
+RSI_OVERSOLD        = 35.0    # Global LONG threshold (non-doji)
+RSI_DOJI_OVERBOUGHT = 60.0    # Separate SHORT threshold for Doji patterns
+RSI_DOJI_OVERSOLD   = 30.0    # Separate LONG threshold for Doji patterns
 RSI_MIN_CANDLES     = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL  = 0.5
@@ -535,7 +604,7 @@ TIMEFRAME_MAP: Dict[str, Dict] = {
 
 
 # ================================================================
-#  8.  CONNECTION WARM-UP
+#  9.  CONNECTION WARM-UP
 # ================================================================
 
 def warm_up_connection() -> None:
@@ -547,7 +616,7 @@ def warm_up_connection() -> None:
 
 
 # ================================================================
-#  9.  API REQUEST HANDLER
+#  10.  API REQUEST HANDLER
 # ================================================================
 
 class APIRequestHandler:
@@ -557,7 +626,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/11.2",
+            "User-Agent":   "python-DeltaBot/12.0",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -605,8 +674,10 @@ class APIRequestHandler:
                 response = self.session.delete(url, headers=headers, json=body, timeout=TIMEOUT)
             else:
                 raise ValueError(f"Unsupported method: {method}")
-            try: response_data = response.json()
-            except Exception: response_data = {"error": response.text}
+            try: 
+                response_data = response.json()
+            except Exception: 
+                response_data = {"error": response.text}
             if response.status_code == 401:
                 _log("error", "AUTH", f"Authentication failed (401). Response: {response_data}")
                 return None
@@ -630,7 +701,7 @@ class APIRequestHandler:
 
 
 # ================================================================
-#  10. TIMEFRAME SAFETY
+#  11. TIMEFRAME SAFETY
 # ================================================================
 
 class TimeframeSafe:
@@ -658,7 +729,7 @@ class TimeframeSafe:
 
 
 # ================================================================
-#  11. CANDLE VALIDATOR
+#  12. CANDLE VALIDATOR
 # ================================================================
 
 _CANDLE_FIELDS = ("time", "open", "high", "low", "close", "volume")
@@ -680,7 +751,7 @@ def validate_candle(candle: dict, symbol: str = "") -> bool:
 
 
 # ================================================================
-#  12. RSI CALCULATION
+#  13. RSI CALCULATION
 # ================================================================
 
 def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optional[float]:
@@ -701,21 +772,56 @@ def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optiona
     return round(rsi, 2)
 
 
-def check_rsi_filter(closed_candles: List[dict], symbol: str = "",
-                     period: int = RSI_PERIOD, threshold: float = RSI_OVERBOUGHT) -> Tuple[bool, Optional[float]]:
+def check_rsi_filter_for_signal(
+    closed_candles: List[dict], 
+    symbol: str = "",
+    period: int = RSI_PERIOD,
+    is_doji_signal: bool = False,
+    direction: str = "SHORT"
+) -> Tuple[bool, Optional[float]]:
+    """
+    Check RSI filter for a signal.
+    For doji patterns, uses separate thresholds: 
+        SHORT doji: RSI > RSI_DOJI_OVERBOUGHT (60)
+        LONG doji: RSI < RSI_DOJI_OVERSOLD (30)
+    For non-doji patterns, uses global thresholds:
+        SHORT: RSI > RSI_OVERBOUGHT (55)
+        LONG: RSI < RSI_OVERSOLD (35)
+    """
     rsi = compute_rsi(closed_candles, period)
     if rsi is None:
         _log("warning", f"RSI [{symbol}]",
              f"Insufficient candles for RSI({period}): have {len(closed_candles)}, need {period + 1} — BLOCKING")
         return False, None
-    _log("info", f"RSI [{symbol}]", f"RSI({period}) = {rsi:.2f}  (threshold > {threshold})")
-    if rsi > threshold:
-        return True, rsi
-    return False, rsi
+    
+    if is_doji_signal:
+        if direction == "SHORT":
+            passes = rsi > RSI_DOJI_OVERBOUGHT
+            threshold = RSI_DOJI_OVERBOUGHT
+            _log("info", f"RSI-DOJI [{symbol}]", 
+                 f"RSI({period}) = {rsi:.2f}  (DOJI SHORT threshold > {threshold}) → {'PASS' if passes else 'FAIL'}")
+        else:  # LONG
+            passes = rsi < RSI_DOJI_OVERSOLD
+            threshold = RSI_DOJI_OVERSOLD
+            _log("info", f"RSI-DOJI [{symbol}]", 
+                 f"RSI({period}) = {rsi:.2f}  (DOJI LONG threshold < {threshold}) → {'PASS' if passes else 'FAIL'}")
+    else:
+        if direction == "SHORT":
+            passes = rsi > RSI_OVERBOUGHT
+            threshold = RSI_OVERBOUGHT
+            _log("info", f"RSI [{symbol}]", 
+                 f"RSI({period}) = {rsi:.2f}  (SHORT threshold > {threshold}) → {'PASS' if passes else 'FAIL'}")
+        else:  # LONG
+            passes = rsi < RSI_OVERSOLD
+            threshold = RSI_OVERSOLD
+            _log("info", f"RSI [{symbol}]", 
+                 f"RSI({period}) = {rsi:.2f}  (LONG threshold < {threshold}) → {'PASS' if passes else 'FAIL'}")
+    
+    return passes, rsi
 
 
 # ================================================================
-#  13. STRATEGY HELPERS
+#  14. STRATEGY HELPERS
 # ================================================================
 
 def candle_body(c: dict) -> float: return abs(c["close"] - c["open"])
@@ -737,7 +843,7 @@ def body_pct_of_range(c: dict) -> float:
 
 
 # ================================================================
-#  13a. SHORT STRATEGIES
+#  14a. SHORT STRATEGIES
 # ================================================================
 
 def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
@@ -774,6 +880,8 @@ def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[d
 
     sc = signal.copy()
     sc["pattern_high"] = max(i2["high"], i1["high"], signal["high"])
+    sc["i1_candle"] = i1.copy()
+    sc["i2_candle"] = i2.copy()
     _log("info", "STRATEGY_1_SHORT",
          f"Double Breakout + reversal | i3-i4 breakout | i2-i3 breakout")
     return True, sc, "STRATEGY_1_SHORT"
@@ -802,6 +910,8 @@ def check_short_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[d
 
     sc = signal.copy()
     sc["pattern_high"] = max(i1["high"], signal["high"])
+    sc["i1_candle"] = i1.copy()
+    sc["i2_candle"] = i2.copy()
     _log("info", "STRATEGY_3_SHORT", f"Bearish Engulfing confirmed")
     return True, sc, "STRATEGY_3_SHORT"
 
@@ -823,6 +933,8 @@ def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[d
 
     result = signal_c.copy()
     result["doji_high"] = doji_c["high"]
+    result["doji_candle"] = doji_c.copy()
+    result["i1_candle"] = i1.copy()
     return True, result, "BEARISH_DOJI"
 
 
@@ -853,12 +965,14 @@ def check_short_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[d
     pattern_high = max(i2["high"], i1["high"])
     sc = signal.copy()
     sc["pattern_high"] = pattern_high
+    sc["i1_candle"] = i1.copy()
+    sc["i2_candle"] = i2.copy()
     _log("info", "BEARISH_HARAMI", f"Harami pattern detected")
     return True, sc, "BEARISH_HARAMI"
 
 
 # ================================================================
-#  13b. LONG STRATEGIES (MIRRORED FROM SHORT STRATEGIES)
+#  14b. LONG STRATEGIES (MIRRORED FROM SHORT STRATEGIES)
 # ================================================================
 
 def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
@@ -895,6 +1009,8 @@ def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[di
 
     sc = signal.copy()
     sc["pattern_low"] = min(i2["low"], i1["low"], signal["low"])
+    sc["i1_candle"] = i1.copy()
+    sc["i2_candle"] = i2.copy()
     _log("info", "STRATEGY_1_LONG",
          f"Double Downward Breakout + bullish reversal | i3-i4 breakdown | i2-i3 breakdown")
     return True, sc, "STRATEGY_1_LONG"
@@ -923,6 +1039,8 @@ def check_long_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[di
 
     sc = signal.copy()
     sc["pattern_low"] = min(i1["low"], signal["low"])
+    sc["i1_candle"] = i1.copy()
+    sc["i2_candle"] = i2.copy()
     _log("info", "STRATEGY_3_LONG", f"Bullish Engulfing confirmed")
     return True, sc, "BULLISH_ENGULFING"
 
@@ -944,6 +1062,8 @@ def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[di
 
     result = signal_c.copy()
     result["doji_low"] = doji_c["low"]
+    result["doji_candle"] = doji_c.copy()
+    result["i1_candle"] = i1.copy()
     return True, result, "BULLISH_DOJI"
 
 
@@ -974,68 +1094,116 @@ def check_long_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[di
     pattern_low = min(i2["low"], i1["low"])
     sc = signal.copy()
     sc["pattern_low"] = pattern_low
+    sc["i1_candle"] = i1.copy()
+    sc["i2_candle"] = i2.copy()
     _log("info", "BULLISH_HARAMI", f"Bullish Harami pattern detected")
     return True, sc, "BULLISH_HARAMI"
 
 
 # ================================================================
-#  13c. SIGNAL CHECKERS
+#  14c. SIGNAL CHECKERS WITH ENTRY TIMING AND SEPARATE DOJI RSI
 # ================================================================
 
 def check_short_signal(
     candles: List[dict], symbol: str = "",
-) -> Tuple[bool, Optional[dict], str, Optional[float]]:
+) -> Tuple[bool, Optional[dict], str, Optional[float], Optional[dict], str]:
+    """
+    Returns: (triggered, signal_candle, strategy, rsi_value, entry_candle, entry_timing_type)
+    """
     closed_candles = candles[:-1]
-    rsi_passes, rsi_value = check_rsi_filter(closed_candles, symbol=symbol,
-                                              period=RSI_PERIOD, threshold=RSI_OVERBOUGHT)
-    if not rsi_passes:
-        return False, None, "", rsi_value
-
-    for checker in (
-        check_short_signal_strategy_1,
-        check_short_signal_strategy_3,
-        check_short_signal_strategy_5,
-        check_short_signal_strategy_6,
-    ):
+    
+    # Check for doji signal first (with its own RSI thresholds)
+    for checker, is_doji in [
+        (check_short_signal_strategy_5, True),   # Doji pattern
+        (check_short_signal_strategy_1, False),  # Breakout
+        (check_short_signal_strategy_3, False),  # Engulfing
+        (check_short_signal_strategy_6, False),  # Harami
+    ]:
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
-            return True, signal_candle, strategy, rsi_value
+            # Determine if this is a doji signal
+            is_doji_signal = "DOJI" in strategy
+            
+            # Use appropriate RSI check based on signal type
+            rsi_passes, rsi_value = check_rsi_filter_for_signal(
+                closed_candles, symbol=symbol, 
+                is_doji_signal=is_doji_signal, 
+                direction="SHORT"
+            )
+            
+            if rsi_passes:
+                # Determine entry candle based on strategy type
+                entry_candle = None
+                entry_timing = "wait_signal_candle"
+                
+                if is_doji_signal:
+                    entry_candle = signal_candle.get("doji_candle")
+                    entry_timing = "immediate_doji"
+                else:
+                    entry_candle = signal_candle.get("i1_candle")
+                    entry_timing = "immediate_i1"
+                
+                _log("info", "SIGNAL",
+                     f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} — CONFIRMED")
+                return True, signal_candle, strategy, rsi_value, entry_candle, entry_timing
+            else:
+                _log("info", "SIGNAL",
+                     f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} — REJECTED (RSI filter failed)")
 
-    return False, None, "", rsi_value
+    return False, None, "", None, None, ""
 
 
 def check_long_signal(
     candles: List[dict], symbol: str = "",
-) -> Tuple[bool, Optional[dict], str, Optional[float]]:
+) -> Tuple[bool, Optional[dict], str, Optional[float], Optional[dict], str]:
+    """
+    Returns: (triggered, signal_candle, strategy, rsi_value, entry_candle, entry_timing_type)
+    """
     closed_candles = candles[:-1]
-    rsi = compute_rsi(closed_candles, RSI_PERIOD)
-    if rsi is None:
-        return False, None, "", None
-
-    if rsi >= RSI_OVERSOLD:
-        return False, None, "", rsi
-
-    _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
-
-    for checker in (
-        check_long_signal_strategy_1,
-        check_long_signal_strategy_3,
-        check_long_signal_strategy_5,
-        check_long_signal_strategy_6,
-    ):
+    
+    # Check for doji signal first (with its own RSI thresholds)
+    for checker, is_doji in [
+        (check_long_signal_strategy_5, True),   # Doji pattern
+        (check_long_signal_strategy_1, False),  # Breakout
+        (check_long_signal_strategy_3, False),  # Engulfing
+        (check_long_signal_strategy_6, False),  # Harami
+    ]:
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
-            return True, signal_candle, strategy, rsi
+            # Determine if this is a doji signal
+            is_doji_signal = "DOJI" in strategy
+            
+            # Use appropriate RSI check based on signal type
+            rsi_passes, rsi_value = check_rsi_filter_for_signal(
+                closed_candles, symbol=symbol,
+                is_doji_signal=is_doji_signal,
+                direction="LONG"
+            )
+            
+            if rsi_passes:
+                # Determine entry candle based on strategy type
+                entry_candle = None
+                entry_timing = "wait_signal_candle"
+                
+                if is_doji_signal:
+                    entry_candle = signal_candle.get("doji_candle")
+                    entry_timing = "immediate_doji"
+                else:
+                    entry_candle = signal_candle.get("i1_candle")
+                    entry_timing = "immediate_i1"
+                
+                _log("info", "SIGNAL",
+                     f"[{symbol}] LONG {strategy} | RSI={rsi_value:.2f} — CONFIRMED")
+                return True, signal_candle, strategy, rsi_value, entry_candle, entry_timing
+            else:
+                _log("info", "SIGNAL",
+                     f"[{symbol}] LONG {strategy} | RSI={rsi_value:.2f} — REJECTED (RSI filter failed)")
 
-    return False, None, "", rsi
+    return False, None, "", None, None, ""
 
 
 # ================================================================
-#  14. SYMBOL VALIDATOR
+#  15. SYMBOL VALIDATOR
 # ================================================================
 
 class SymbolValidator:
@@ -1069,7 +1237,7 @@ class SymbolValidator:
 
 
 # ================================================================
-#  15. TIME-RANGE HELPER
+#  16. TIME-RANGE HELPER
 # ================================================================
 
 def get_time_range(num_candles: int, timeframe_minutes: int) -> Tuple[int, int]:
@@ -1097,7 +1265,7 @@ def get_time_range_with_retry_shift(
 
 
 # ================================================================
-#  16. CANDLE PARSING HELPERS
+#  17. CANDLE PARSING HELPERS
 # ================================================================
 
 def _extract_timestamp(src: dict) -> int:
@@ -1133,7 +1301,7 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
 
 
 # ================================================================
-#  17. TICK SIZE ROUNDING
+#  18. TICK SIZE ROUNDING
 # ================================================================
 
 def round_to_tick(price: float, tick_size: float) -> float:
@@ -1145,7 +1313,7 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 
 # ================================================================
-#  18. DELTA REST CLIENT
+#  19. DELTA REST CLIENT
 # ================================================================
 
 class DeltaREST:
@@ -1323,7 +1491,7 @@ class DeltaREST:
 
 
 # ================================================================
-#  19. POSITION SIZER
+#  20. POSITION SIZER
 # ================================================================
 
 def compute_position_size(entry_price: float, stop_loss_price: float,
@@ -1364,7 +1532,7 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
 
 
 # ================================================================
-#  20. DAILY LOSS TRACKER
+#  21. DAILY LOSS TRACKER
 # ================================================================
 
 class DailyLossTracker:
@@ -1422,13 +1590,15 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT
+#  22. TRADING BOT WITH ENTRY TIMING CONFIG
 # ================================================================
 
 class TradingBot:
-    def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
+    def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None, 
+                 entry_config: Optional[StrategyEntryConfig] = None):
         self.config          = config
         self.notifier        = notifier
+        self.entry_config    = entry_config or StrategyEntryConfig()
         self.paper           = config["paper_mode"]
         self.leverage        = config["leverage"]
         self.max_trades      = config.get("max_concurrent_trades", 2)
@@ -1558,8 +1728,16 @@ class TradingBot:
 
         self._print_startup_summary()
         
+        # Prepare entry config dict for email
+        entry_config_dict = {
+            "breakout": self.entry_config.breakout_entry.value,
+            "engulfing": self.entry_config.engulfing_entry.value,
+            "doji": self.entry_config.doji_entry.value,
+            "harami": self.entry_config.harami_entry.value,
+        }
+        
         if self.notifier:
-            self.notifier.send_startup_report(self.config, self.symbols)
+            self.notifier.send_startup_report(self.config, self.symbols, entry_config_dict)
         
         self._fetch_all_historical()
         self._start_ws()
@@ -1624,7 +1802,7 @@ class TradingBot:
                 store.append(c)
                 existing_ts.add(c["time"])
 
-    # ─────────────────── Candle processing (UPDATED with separated TP/SL) ───────────────────
+    # ─────────────────── Candle processing with entry timing ───────────────────
 
     def process_candle(self, symbol: str, candle: dict) -> None:
         store = self.candle_store.get(symbol)
@@ -1656,17 +1834,19 @@ class TradingBot:
                     self._log("warning", "DAILY-LOSS",
                               f"[{symbol}] Skipping signal check — daily loss limit hit")
                 else:
-                    triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
+                    # Check SHORT signals
+                    triggered, signal_candle, strategy_name, rsi_value, entry_candle, entry_timing_type = check_short_signal(
                         list(store), symbol=symbol
                     )
                     if triggered and signal_candle is not None:
-                        self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "SHORT")
+                        self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "SHORT", entry_candle, entry_timing_type)
                     else:
-                        triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
+                        # Check LONG signals
+                        triggered, signal_candle, strategy_name, rsi_value, entry_candle, entry_timing_type = check_long_signal(
                             list(store), symbol=symbol
                         )
                         if triggered and signal_candle is not None:
-                            self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "LONG")
+                            self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "LONG", entry_candle, entry_timing_type)
 
         # Add the new candle to store
         store.append(candle)
@@ -1720,14 +1900,57 @@ class TradingBot:
             self.active_trades.pop(symbol, None)
         self._log("info", "CLEANUP", f"Trade record removed for {symbol}")
 
-    # ─────────────────── Signal handler ───────────────────
+    # ─────────────────── Signal handler with entry timing ───────────────────
 
     def _on_signal(self, symbol: str, signal_candle: dict, strategy_name: str,
-                   rsi_value: Optional[float], direction: str = "SHORT") -> None:
-        entry = signal_candle["close"]
+                   rsi_value: Optional[float], direction: str = "SHORT",
+                   entry_candle: Optional[dict] = None, entry_timing_type: str = "wait_signal_candle") -> None:
+        
+        # Determine which entry timing to use based on strategy type and user config
+        strategy_lower = strategy_name.lower()
+        strategy_category = None
+        
+        if "strategy_1" in strategy_lower or "breakout" in strategy_lower:
+            strategy_category = "breakout"
+        elif "strategy_3" in strategy_lower or "engulf" in strategy_lower:
+            strategy_category = "engulfing"
+        elif "doji" in strategy_lower:
+            strategy_category = "doji"
+        elif "harami" in strategy_lower:
+            strategy_category = "harami"
+        
+        # Get user preference for this strategy type
+        if strategy_category == "breakout":
+            user_preference = self.entry_config.breakout_entry
+        elif strategy_category == "engulfing":
+            user_preference = self.entry_config.engulfing_entry
+        elif strategy_category == "doji":
+            user_preference = self.entry_config.doji_entry
+        elif strategy_category == "harami":
+            user_preference = self.entry_config.harami_entry
+        else:
+            user_preference = EntryTiming.WAIT_SIGNAL_CANDLE
+        
+        # Determine actual entry price based on user preference
+        if user_preference == EntryTiming.IMMEDIATE_I1 and entry_candle is not None:
+            entry_price = entry_candle["close"]
+            actual_entry_timing = "immediate_i1"
+            self._log("info", "ENTRY-TIMING", 
+                      f"{symbol} {direction} {strategy_name}: IMMEDIATE entry on pattern candle at {entry_price:.4f}")
+        elif user_preference == EntryTiming.IMMEDIATE_DOJI and entry_candle is not None and "doji" in strategy_lower:
+            entry_price = entry_candle["close"]
+            actual_entry_timing = "immediate_doji"
+            self._log("info", "ENTRY-TIMING", 
+                      f"{symbol} {direction} {strategy_name}: IMMEDIATE entry on doji candle at {entry_price:.4f}")
+        else:
+            entry_price = signal_candle["close"]
+            actual_entry_timing = "wait_signal_candle"
+            self._log("info", "ENTRY-TIMING", 
+                      f"{symbol} {direction} {strategy_name}: WAITING for signal candle confirmation at {entry_price:.4f}")
 
+        # Calculate stop loss
         if direction == "SHORT":
-            if strategy_name == "BEARISH_DOJI" and "doji_high" in signal_candle:
+            if "BEARISH_DOJI" in strategy_name and "doji_high" in signal_candle:
                 sl = signal_candle["doji_high"]
             elif strategy_name in ("STRATEGY_1_SHORT", "STRATEGY_3_SHORT", "BEARISH_HARAMI") and "pattern_high" in signal_candle:
                 sl = signal_candle["pattern_high"]
@@ -1739,7 +1962,7 @@ class TradingBot:
                 else:
                     sl = signal_candle["high"]
         else:
-            if strategy_name == "BULLISH_DOJI" and "doji_low" in signal_candle:
+            if "BULLISH_DOJI" in strategy_name and "doji_low" in signal_candle:
                 sl = signal_candle["doji_low"]
             elif strategy_name in ("STRATEGY_1_LONG", "BULLISH_ENGULFING", "BULLISH_HARAMI") and "pattern_low" in signal_candle:
                 sl = signal_candle["pattern_low"]
@@ -1751,11 +1974,11 @@ class TradingBot:
                 else:
                     sl = signal_candle["low"]
 
-        if abs(sl - entry) == 0:
+        if abs(sl - entry_price) == 0:
             self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} — skip")
             return
 
-        tp = compute_take_profit(entry, sl, direction)
+        tp = compute_take_profit(entry_price, sl, direction)
 
         with self._trade_lock:
             if len(self.active_trades) >= self.max_trades:
@@ -1767,7 +1990,7 @@ class TradingBot:
                 "time":            datetime.now(timezone.utc).isoformat(),
                 "symbol":          symbol,
                 "direction":       direction,
-                "entry":           entry,
+                "entry":           entry_price,
                 "stop_loss":       sl,
                 "take_profit":     tp,
                 "timeframe":       self.timeframe,
@@ -1778,12 +2001,13 @@ class TradingBot:
                 "trading_capital": self.trading_capital,
                 "strategy":        strategy_name,
                 "rsi":             rsi_value,
+                "entry_timing":    actual_entry_timing,
             }
             self.signals.append(signal)
 
             if self.paper:
                 self.active_trades[symbol] = {
-                    "entry": entry, "stop_loss": sl, "take_profit": tp,
+                    "entry": entry_price, "stop_loss": sl, "take_profit": tp,
                     "direction": direction, "size": 0,
                     "product_id": self.product_map.get(symbol),
                     "open_time": datetime.now(timezone.utc).isoformat(),
@@ -1791,17 +2015,25 @@ class TradingBot:
                 }
 
         rsi_str   = f"{rsi_value:.2f}" if rsi_value is not None else "N/A"
-        stop_dist = abs(entry - sl)
-        rr_actual = abs(entry - tp) / stop_dist if stop_dist > 0 else 0
+        stop_dist = abs(entry_price - sl)
+        rr_actual = abs(entry_price - tp) / stop_dist if stop_dist > 0 else 0
         direction_arrow = "↓ SHORT" if direction == "SHORT" else "↑ LONG"
+        
+        timing_display = {
+            "wait_signal_candle": "Wait for Signal Candle",
+            "immediate_i1": "Immediate on Pattern Candle",
+            "immediate_doji": "Immediate on Doji Candle",
+        }.get(actual_entry_timing, actual_entry_timing)
+        
         print()
         print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] — {strategy_name}")
-        print(f"           Entry       : {entry:.4f}")
-        print(f"           Stop Loss   : {sl:.4f}  (distance={stop_dist:.4f}) [triggers on CANDLE CLOSE]")
-        print(f"           Take Profit : {tp:.4f}  (R:R = 1:{rr_actual:.2f}) [triggers on PRICE TOUCH]")
-        print(f"           Risk        : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
-        print(f"           RSI(14)     : {rsi_str}")
-        print(f"           Mode        : {signal['mode']}")
+        print(f"           Entry Timing : {timing_display}")
+        print(f"           Entry        : {entry_price:.4f}")
+        print(f"           Stop Loss    : {sl:.4f}  (distance={stop_dist:.4f}) [triggers on CANDLE CLOSE]")
+        print(f"           Take Profit  : {tp:.4f}  (R:R = 1:{rr_actual:.2f}) [triggers on PRICE TOUCH]")
+        print(f"           Risk         : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
+        print(f"           RSI(14)      : {rsi_str}")
+        print(f"           Mode         : {signal['mode']}")
         print()
 
         if self.notifier:
@@ -1917,7 +2149,8 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v11.2           |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.0           |")
+        print("|   WITH STRATEGY-WISE ENTRY TIMING CONTROL             |")
         print("|   FULLY INTEGRATED WITH GMAIL NOTIFICATIONS           |")
         print("|   ALL SHORT STRATEGIES MIRRORED TO LONG               |")
         print("|   COMPLETE LONG STRATEGY SET (1,3,5,6)                |")
@@ -1925,10 +2158,13 @@ class TradingBot:
         print("|   KEY FEATURES:                                       |")
         print("|   ✓ STOP LOSS: Triggers ONLY on CANDLE CLOSE          |")
         print("|   ✓ TAKE PROFIT: Triggers IMMEDIATELY on price touch  |")
-        print("|   ✓ RSI SHORT filter: RSI(14) > 55                    |")
-        print("|   ✓ RSI LONG filter: RSI(14) < 35                     |")
+        print("|   ✓ RSI SHORT (non-doji): RSI(14) > 55                |")
+        print("|   ✓ RSI LONG (non-doji): RSI(14) < 35                 |")
+        print("|   ✓ RSI SHORT DOJI: RSI(14) > 60 (separate)           |")
+        print("|   ✓ RSI LONG DOJI: RSI(14) < 30 (separate)            |")
         print("|   ✓ Daily loss limit circuit breaker                  |")
         print("|   ✓ Gmail notifications for signals & trades          |")
+        print("|   ✓ STRATEGY-WISE ENTRY TIMING CONTROL                |")
         print("|                                                       |")
         print("|   Strategies SHORT: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)")
         print("|   Strategies LONG:  1(Breakout) 3(Engulf) 5(Doji) 6(Harami)")
@@ -1939,6 +2175,13 @@ class TradingBot:
         mode_str = "PAPER (signals only)" if self.paper else "LIVE TRADING"
         risk_usd = self.trading_capital * self.risk_pct
         daily_limit_usd = self.trading_capital * self.daily_loss_limit_pct
+        
+        timing_display = {
+            "wait_signal_candle": "Wait for Signal Candle",
+            "immediate_i1": "Immediate on Pattern Candle",
+            "immediate_doji": "Immediate on Doji Candle",
+        }
+        
         print("+--------------------------------------------------------+")
         print(f"  Mode            : {mode_str}")
         print(f"  Timeframe       : {self.timeframe}")
@@ -1949,9 +2192,18 @@ class TradingBot:
         print(f"  Daily loss cap  : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
-        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")
-        print(f"  RSI LONG  filter: RSI(14) < {RSI_OVERSOLD}")
+        print(f"  RSI SHORT (non-doji): RSI(14) > {RSI_OVERBOUGHT}")
+        print(f"  RSI LONG (non-doji): RSI(14) < {RSI_OVERSOLD}")
+        print(f"  RSI SHORT DOJI: RSI(14) > {RSI_DOJI_OVERBOUGHT} (separate)")
+        print(f"  RSI LONG DOJI: RSI(14) < {RSI_DOJI_OVERSOLD} (separate)")
         print(f"  GMAIL NOTIFICATIONS: {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
+        print(f"")
+        print(f"  ENTRY TIMING CONFIGURATION:")
+        print(f"  • Breakout (Strategy 1): {timing_display.get(self.entry_config.breakout_entry.value, self.entry_config.breakout_entry.value)}")
+        print(f"  • Engulfing (Strategy 3): {timing_display.get(self.entry_config.engulfing_entry.value, self.entry_config.engulfing_entry.value)}")
+        print(f"  • Doji (Strategy 5): {timing_display.get(self.entry_config.doji_entry.value, self.entry_config.doji_entry.value)}")
+        print(f"  • Harami (Strategy 6): {timing_display.get(self.entry_config.harami_entry.value, self.entry_config.harami_entry.value)}")
+        print(f"")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid     = self.product_map.get(sym, "???")
@@ -1962,7 +2214,7 @@ class TradingBot:
 
 
 # ================================================================
-#  22. USER INPUT HELPERS
+#  23. USER INPUT HELPERS
 # ================================================================
 
 def _divider(title: str = "") -> None:
@@ -1994,6 +2246,74 @@ def ask_mode() -> Tuple[bool, str, str]:
             return True, "", ""
         return False, api_key, api_secret
     return True, "", ""
+
+
+def ask_entry_timing_config() -> StrategyEntryConfig:
+    """Ask user for entry timing preferences per strategy type."""
+    _divider("ENTRY TIMING CONFIGURATION")
+    print("  For each strategy type, choose when to enter the trade:")
+    print("")
+    print("  1. WAIT FOR SIGNAL CANDLE - Enter at signal candle close (confirmation)")
+    print("  2. IMMEDIATE ON PATTERN CANDLE - Enter immediately on i1/pattern candle")
+    print("  3. IMMEDIATE ON DOJI CANDLE - Enter immediately on doji candle (doji only)")
+    print("")
+    
+    config = StrategyEntryConfig()
+    
+    # Breakout (Strategy 1)
+    print("  " + "-" * 50)
+    print("  STRATEGY 1 - BREAKOUT PATTERNS (Double Breakout + Reversal)")
+    print("  Options: [1] Wait for Signal Candle  [2] Immediate on i1 Candle")
+    choice = input("  Your choice (default = 1): ").strip()
+    if choice == "2":
+        config.breakout_entry = EntryTiming.IMMEDIATE_I1
+        print("  → Will enter IMMEDIATELY on the i1 (pattern) candle")
+    else:
+        config.breakout_entry = EntryTiming.WAIT_SIGNAL_CANDLE
+        print("  → Will WAIT for signal candle confirmation")
+    
+    # Engulfing (Strategy 3)
+    print("")
+    print("  STRATEGY 3 - ENGULFING PATTERNS")
+    print("  Options: [1] Wait for Signal Candle  [2] Immediate on i1 Candle")
+    choice = input("  Your choice (default = 1): ").strip()
+    if choice == "2":
+        config.engulfing_entry = EntryTiming.IMMEDIATE_I1
+        print("  → Will enter IMMEDIATELY on the i1 (pattern) candle")
+    else:
+        config.engulfing_entry = EntryTiming.WAIT_SIGNAL_CANDLE
+        print("  → Will WAIT for signal candle confirmation")
+    
+    # Doji (Strategy 5)
+    print("")
+    print("  STRATEGY 5 - DOJI PATTERNS")
+    print("  Options: [1] Wait for Signal Candle  [2] Immediate on Doji Candle  [3] Immediate on i1 Candle")
+    choice = input("  Your choice (default = 1): ").strip()
+    if choice == "2":
+        config.doji_entry = EntryTiming.IMMEDIATE_DOJI
+        print("  → Will enter IMMEDIATELY on the DOJI candle (before confirmation)")
+    elif choice == "3":
+        config.doji_entry = EntryTiming.IMMEDIATE_I1
+        print("  → Will enter IMMEDIATELY on the i1 candle")
+    else:
+        config.doji_entry = EntryTiming.WAIT_SIGNAL_CANDLE
+        print("  → Will WAIT for signal candle confirmation")
+    
+    # Harami (Strategy 6)
+    print("")
+    print("  STRATEGY 6 - HARAMI PATTERNS")
+    print("  Options: [1] Wait for Signal Candle  [2] Immediate on i1 Candle")
+    choice = input("  Your choice (default = 1): ").strip()
+    if choice == "2":
+        config.harami_entry = EntryTiming.IMMEDIATE_I1
+        print("  → Will enter IMMEDIATELY on the i1 (pattern) candle")
+    else:
+        config.harami_entry = EntryTiming.WAIT_SIGNAL_CANDLE
+        print("  → Will WAIT for signal candle confirmation")
+    
+    print("")
+    print("  ENTRY TIMING CONFIGURATION COMPLETE!")
+    return config
 
 
 def ask_gmail_config() -> Optional[GmailNotifier]:
@@ -2095,7 +2415,7 @@ def ask_daily_loss_limit() -> float:
 
 
 # ================================================================
-#  23. TEST FUNCTION
+#  24. TEST FUNCTION
 # ================================================================
 
 def test_gmail():
@@ -2132,6 +2452,7 @@ def test_gmail():
         "mode": "PAPER",
         "risk_usd": 20.0,
         "trading_capital": 1000.0,
+        "entry_timing": "immediate_i1",
         "time": datetime.now(timezone.utc).isoformat(),
     })
     
@@ -2142,16 +2463,18 @@ def test_gmail():
 
 
 # ================================================================
-#  24. ENTRY POINT
+#  25. ENTRY POINT
 # ================================================================
 
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v11.2       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.0       |")
+    print("  |   STRATEGY-WISE ENTRY TIMING CONTROL                |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   Short + Long strategies  |  TP 2:1 R:R            |")
     print("  |   RSI(14) filter | Daily loss limit | 100 candles   |")
+    print("  |   SEPARATE RSI THRESHOLDS FOR DOJI PATTERNS!        |")
     print("  |   GMAIL NOTIFICATIONS INTEGRATED                    |")
     print("  +======================================================+")
 
@@ -2163,6 +2486,7 @@ def main() -> None:
 
     timeframe = ask_timeframe()
     paper, api_key, api_secret = ask_mode()
+    entry_config = ask_entry_timing_config()
     notifier = ask_gmail_config()
 
     _divider("CONNECTING TO DELTA EXCHANGE INDIA")
@@ -2196,6 +2520,13 @@ def main() -> None:
     _divider("CONFIRM")
     risk_usd       = trading_capital * risk_pct / 100
     daily_limit_usd = trading_capital * (daily_loss_limit_pct / 100)
+    
+    timing_display = {
+        "wait_signal_candle": "Wait for Signal Candle",
+        "immediate_i1": "Immediate on Pattern Candle",
+        "immediate_doji": "Immediate on Doji Candle",
+    }
+    
     print(f"  Mode            : {'PAPER' if paper else 'LIVE TRADING'}")
     print(f"  Timeframe       : {timeframe}")
     print(f"  Symbols         : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
@@ -2206,7 +2537,17 @@ def main() -> None:
     print(f"  Stop Loss       : Triggers on CANDLE CLOSE only")
     print(f"  Daily loss cap  : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f}")
     print(f"  Max open trades : {max_trades}")
+    print(f"  RSI SHORT (non-doji): RSI(14) > {RSI_OVERBOUGHT}")
+    print(f"  RSI LONG (non-doji): RSI(14) < {RSI_OVERSOLD}")
+    print(f"  RSI SHORT DOJI: RSI(14) > {RSI_DOJI_OVERBOUGHT} (separate)")
+    print(f"  RSI LONG DOJI: RSI(14) < {RSI_DOJI_OVERSOLD} (separate)")
     print(f"  GMAIL NOTIFICATIONS: {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
+    print(f"")
+    print(f"  ENTRY TIMING CONFIGURATION:")
+    print(f"  • Breakout (Strategy 1): {timing_display.get(entry_config.breakout_entry.value, entry_config.breakout_entry.value)}")
+    print(f"  • Engulfing (Strategy 3): {timing_display.get(entry_config.engulfing_entry.value, entry_config.engulfing_entry.value)}")
+    print(f"  • Doji (Strategy 5): {timing_display.get(entry_config.doji_entry.value, entry_config.doji_entry.value)}")
+    print(f"  • Harami (Strategy 6): {timing_display.get(entry_config.harami_entry.value, entry_config.harami_entry.value)}")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
@@ -2221,7 +2562,7 @@ def main() -> None:
         "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
     }
 
-    bot = TradingBot(cfg, notifier=notifier)
+    bot = TradingBot(cfg, notifier=notifier, entry_config=entry_config)
     bot.start()
 
     if not bot.running or not bot.symbols:
