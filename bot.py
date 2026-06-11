@@ -240,7 +240,7 @@ class GmailNotifier:
         """
         return self._send_email(subject, body)
     
-    def send_startup_report(self, config: dict, symbols: List[str], trade_types: str) -> bool:
+    def send_startup_report(self, config: dict, symbols: List[str]) -> bool:
         if not self.enabled:
             return False
         mode = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
@@ -248,13 +248,6 @@ class GmailNotifier:
         symbols_list = "\n".join([f"  • {sym}" for sym in symbols[:10]])
         if len(symbols) > 10:
             symbols_list += f"\n  • ... and {len(symbols) - 10} more"
-        
-        trade_type_display = {
-            "SHORT_ONLY": "🔴 SHORT TRADES ONLY",
-            "LONG_ONLY": "🟢 LONG TRADES ONLY",
-            "BOTH": "🔴 SHORT + 🟢 LONG (BOTH)"
-        }.get(trade_types, trade_types)
-        
         body = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                   TRADING BOT STARTED                        ║
@@ -266,12 +259,13 @@ class GmailNotifier:
 ║  Max Trades     : {config.get('max_concurrent_trades', 2)}
 ║  Daily Loss Cap : {config.get('daily_loss_limit_pct', 0.05) * 100:.0f}%
 ║  Capital        : ${config.get('trading_capital', 0):,.2f}
-║  Trade Types    : {trade_type_display}
 ╠══════════════════════════════════════════════════════════════╣
-║  SHORT RSI     : > 55 (Global) | > 60 (Doji only)
-║  LONG RSI      : < 35 (Global) | < 30 (Doji only)
-║  Take Profit   : 2:1 R:R (triggers on PRICE TOUCH)
-║  Stop Loss     : Triggers on CANDLE CLOSE (not intraday)
+║  SHORT TRADES   : {"ENABLED" if config.get('enable_short', True) else "DISABLED"}
+║  LONG TRADES    : {"ENABLED" if config.get('enable_long', True) else "DISABLED"}
+║  SHORT RSI      : > 55
+║  LONG RSI       : < 35
+║  Take Profit    : 2:1 R:R (triggers on PRICE TOUCH)
+║  Stop Loss      : Triggers on CANDLE CLOSE (not intraday)
 ╠══════════════════════════════════════════════════════════════╣
 ║  Symbols ({len(symbols)}):
 {symbols_list}
@@ -519,10 +513,8 @@ TIMEOUT             = 30
 CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD          = 14
-RSI_OVERBOUGHT      = 55.0      # Global SHORT threshold
-RSI_OVERSOLD        = 35.0      # Global LONG threshold
-RSI_DOJI_OVERBOUGHT = 60.0      # Doji-specific SHORT threshold (higher)
-RSI_DOJI_OVERSOLD   = 30.0      # Doji-specific LONG threshold (lower)
+RSI_OVERBOUGHT      = 55.0
+RSI_OVERSOLD        = 35.0
 RSI_MIN_CANDLES     = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL  = 0.5
@@ -567,7 +559,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/11.5",
+            "User-Agent":   "python-DeltaBot/11.3",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -709,6 +701,19 @@ def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optiona
     rs  = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return round(rsi, 2)
+
+
+def check_rsi_filter(closed_candles: List[dict], symbol: str = "",
+                     period: int = RSI_PERIOD, threshold: float = RSI_OVERBOUGHT) -> Tuple[bool, Optional[float]]:
+    rsi = compute_rsi(closed_candles, period)
+    if rsi is None:
+        _log("warning", f"RSI [{symbol}]",
+             f"Insufficient candles for RSI({period}): have {len(closed_candles)}, need {period + 1} — BLOCKING")
+        return False, None
+    _log("info", f"RSI [{symbol}]", f"RSI({period}) = {rsi:.2f}  (threshold > {threshold})")
+    if rsi > threshold:
+        return True, rsi
+    return False, rsi
 
 
 # ================================================================
@@ -976,46 +981,31 @@ def check_long_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[di
 
 
 # ================================================================
-#  13c. SIGNAL CHECKERS WITH DOJI-SPECIFIC RSI FILTERS
+#  13c. SIGNAL CHECKERS
 # ================================================================
 
 def check_short_signal(
     candles: List[dict], symbol: str = "",
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     closed_candles = candles[:-1]
-    rsi = compute_rsi(closed_candles, RSI_PERIOD)
-    if rsi is None:
-        return False, None, "", None
+    rsi_passes, rsi_value = check_rsi_filter(closed_candles, symbol=symbol,
+                                              period=RSI_PERIOD, threshold=RSI_OVERBOUGHT)
+    if not rsi_passes:
+        return False, None, "", rsi_value
 
-    # First, check for Doji pattern with its own RSI threshold (RSI > 60)
-    triggered, signal_candle, strategy = check_short_signal_strategy_5(candles)
-    if triggered and strategy == "BEARISH_DOJI":
-        if rsi > RSI_DOJI_OVERBOUGHT:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] SHORT {strategy} | RSI={rsi:.2f} > {RSI_DOJI_OVERBOUGHT} (Doji threshold) — CONFIRMED")
-            return True, signal_candle, strategy, rsi
-        else:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] SHORT {strategy} REJECTED | RSI={rsi:.2f} <= {RSI_DOJI_OVERBOUGHT} (Doji threshold)")
-            return False, None, "", rsi
-
-    # Global RSI check for non-Doji short strategies
-    if rsi <= RSI_OVERBOUGHT:
-        return False, None, "", rsi
-
-    # Check other short strategies (1, 3, 6)
     for checker in (
         check_short_signal_strategy_1,
         check_short_signal_strategy_3,
+        check_short_signal_strategy_5,
         check_short_signal_strategy_6,
     ):
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
             _log("info", "SIGNAL",
-                 f"[{symbol}] SHORT {strategy} | RSI={rsi:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
-            return True, signal_candle, strategy, rsi
+                 f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+            return True, signal_candle, strategy, rsi_value
 
-    return False, None, "", rsi
+    return False, None, "", rsi_value
 
 
 def check_long_signal(
@@ -1026,26 +1016,15 @@ def check_long_signal(
     if rsi is None:
         return False, None, "", None
 
-    # First, check for Doji pattern with its own RSI threshold (RSI < 30)
-    triggered, signal_candle, strategy = check_long_signal_strategy_5(candles)
-    if triggered and strategy == "BULLISH_DOJI":
-        if rsi < RSI_DOJI_OVERSOLD:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_DOJI_OVERSOLD} (Doji threshold) — CONFIRMED")
-            return True, signal_candle, strategy, rsi
-        else:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] LONG {strategy} REJECTED | RSI={rsi:.2f} >= {RSI_DOJI_OVERSOLD} (Doji threshold)")
-            return False, None, "", rsi
-
-    # Global RSI check for non-Doji long strategies
     if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
 
-    # Check other long strategies (1, 3, 6)
+    _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
+
     for checker in (
         check_long_signal_strategy_1,
         check_long_signal_strategy_3,
+        check_long_signal_strategy_5,
         check_long_signal_strategy_6,
     ):
         triggered, signal_candle, strategy = checker(candles)
@@ -1168,7 +1147,7 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 
 # ================================================================
-#  18. DELTA REST CLIENT
+#  18. DELTA REST CLIENT (UPDATED WITH RETRY LOGIC)
 # ================================================================
 
 class DeltaREST:
@@ -1428,7 +1407,7 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
 
 
 # ================================================================
-#  20. DAILY LOSS TRACKER
+#  20. DAILY LOSS TRACKER (UPDATED WITH RETRY LOGIC FOR REALIZED PNL)
 # ================================================================
 
 class DailyLossTracker:
@@ -1457,6 +1436,8 @@ class DailyLossTracker:
         with self._lock:
             self._check_day_rollover()
             limit = self.trading_capital * self.limit_pct
+            
+            old_loss = self.daily_loss_usd
             
             if realized_pnl < 0:
                 # Loss: add to daily loss total
@@ -1503,7 +1484,7 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT (UPDATED WITH DOJI RSI < 30)
+#  21. TRADING BOT (UPDATED WITH ORDER-FIRST PNL AND RETRY LOOP)
 # ================================================================
 
 class TradingBot:
@@ -1518,7 +1499,10 @@ class TradingBot:
         self.trading_capital = float(config.get("trading_capital", 0.0))
         self.risk_pct        = config["risk_pct"] / 100.0
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
-        self.trade_types     = config.get("trade_types", "BOTH")  # SHORT_ONLY, LONG_ONLY, BOTH
+        
+        # NEW: Direction filters
+        self.enable_short = config.get("enable_short", True)
+        self.enable_long = config.get("enable_long", True)
 
         self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
         self.timeframe      = self._tf.key
@@ -1557,16 +1541,6 @@ class TradingBot:
         if self.on_log_callback:
             try: self.on_log_callback(f"[{tag}] {msg}", level)
             except Exception: pass
-
-    def _is_trade_type_allowed(self, direction: str) -> bool:
-        """Check if the given trade direction is allowed based on config."""
-        if self.trade_types == "BOTH":
-            return True
-        elif self.trade_types == "SHORT_ONLY":
-            return direction == "SHORT"
-        elif self.trade_types == "LONG_ONLY":
-            return direction == "LONG"
-        return False
 
     def _get_realized_pnl_for_trade(self, trade: dict, max_retries: int = 5, retry_delay: float = 1.0) -> float:
         """
@@ -1736,7 +1710,7 @@ class TradingBot:
         self._print_startup_summary()
         
         if self.notifier:
-            self.notifier.send_startup_report(self.config, self.symbols, self.trade_types)
+            self.notifier.send_startup_report(self.config, self.symbols)
         
         self._fetch_all_historical()
         self._start_ws()
@@ -1833,16 +1807,16 @@ class TradingBot:
                     self._log("warning", "DAILY-LOSS",
                               f"[{symbol}] Skipping signal check — daily loss limit hit")
                 else:
-                    # Check SHORT signals if allowed
-                    if self._is_trade_type_allowed("SHORT"):
+                    # Check SHORT signals only if enabled
+                    if self.enable_short:
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
                             list(store), symbol=symbol
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "SHORT")
                     
-                    # Check LONG signals if allowed (and no short signal was taken)
-                    if self._is_trade_type_allowed("LONG") and symbol not in self.active_trades:
+                    # Check LONG signals only if enabled (and only if no short signal was taken)
+                    if self.enable_long and symbol not in self.active_trades:
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
                             list(store), symbol=symbol
                         )
@@ -2098,7 +2072,7 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v11.5           |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v11.3           |")
         print("|   FULLY INTEGRATED WITH GMAIL NOTIFICATIONS           |")
         print("|   ALL SHORT STRATEGIES MIRRORED TO LONG               |")
         print("|   COMPLETE LONG STRATEGY SET (1,3,5,6)                |")
@@ -2106,12 +2080,11 @@ class TradingBot:
         print("|   KEY FEATURES:                                       |")
         print("|   ✓ STOP LOSS: Triggers ONLY on CANDLE CLOSE          |")
         print("|   ✓ TAKE PROFIT: Triggers IMMEDIATELY on price touch  |")
-        print("|   ✓ RSI SHORT: Global > 55 | Doji > 60                |")
-        print("|   ✓ RSI LONG:  Global < 35 | Doji < 30                |")
+        print("|   ✓ RSI SHORT filter: RSI(14) > 55                    |")
+        print("|   ✓ RSI LONG filter: RSI(14) < 35                     |")
         print("|   ✓ Daily loss limit based on REALIZED PnL            |")
         print("|   ✓ Order-first PnL fetching (safer for concurrent trades)")
         print("|   ✓ Retry loop for PnL updates (5 attempts, 1s delay)")
-        print("|   ✓ Selectable trade types: SHORT only / LONG only / BOTH")
         print("|   ✓ Gmail notifications for signals & trades          |")
         print("|                                                       |")
         print("|   Strategies SHORT: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)")
@@ -2123,13 +2096,6 @@ class TradingBot:
         mode_str = "PAPER (signals only)" if self.paper else "LIVE TRADING"
         risk_usd = self.trading_capital * self.risk_pct
         daily_limit_usd = self.trading_capital * self.daily_loss_limit_pct
-        
-        trade_type_display = {
-            "SHORT_ONLY": "🔴 SHORT TRADES ONLY",
-            "LONG_ONLY": "🟢 LONG TRADES ONLY",
-            "BOTH": "🔴 SHORT + 🟢 LONG (BOTH)"
-        }.get(self.trade_types, self.trade_types)
-        
         print("+--------------------------------------------------------+")
         print(f"  Mode            : {mode_str}")
         print(f"  Timeframe       : {self.timeframe}")
@@ -2140,9 +2106,10 @@ class TradingBot:
         print(f"  Daily loss cap  : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
         print(f"  Leverage        : {self.leverage}x")
         print(f"  Max open trades : {self.max_trades}")
-        print(f"  Trade Types     : {trade_type_display}")
-        print(f"  RSI SHORT filter: Global > {RSI_OVERBOUGHT} | Doji > {RSI_DOJI_OVERBOUGHT}")
-        print(f"  RSI LONG  filter: Global < {RSI_OVERSOLD} | Doji < {RSI_DOJI_OVERSOLD}")
+        print(f"  SHORT TRADES    : {'ENABLED' if self.enable_short else 'DISABLED'}")
+        print(f"  LONG TRADES     : {'ENABLED' if self.enable_long else 'DISABLED'}")
+        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")
+        print(f"  RSI LONG  filter: RSI(14) < {RSI_OVERSOLD}")
         print(f"  GMAIL NOTIFICATIONS: {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch Priority: order_id → product_id (with retry)")
         print(f"  Symbols ({len(self.symbols)}):")
@@ -2155,7 +2122,7 @@ class TradingBot:
 
 
 # ================================================================
-#  22. USER INPUT HELPERS (UPDATED WITH TRADE TYPE SELECTION)
+#  22. USER INPUT HELPERS
 # ================================================================
 
 def _divider(title: str = "") -> None:
@@ -2173,25 +2140,6 @@ def ask_timeframe() -> str:
     return raw if raw in TIMEFRAME_MAP else "1h"
 
 
-def ask_trade_types() -> str:
-    _divider("TRADE TYPES")
-    print("  Select which types of trades you want to execute:")
-    print("  [1]  SHORT TRADES ONLY - Only short strategies will be executed")
-    print("  [2]  LONG TRADES ONLY  - Only long strategies will be executed")
-    print("  [3]  BOTH (Default)    - Both short and long strategies will be executed")
-    
-    raw = input("  Enter 1, 2, or 3 (default = 3) : ").strip()
-    if raw == "1":
-        print("  🔴 SHORT TRADES ONLY - Only short signals will be traded")
-        return "SHORT_ONLY"
-    elif raw == "2":
-        print("  🟢 LONG TRADES ONLY - Only long signals will be traded")
-        return "LONG_ONLY"
-    else:
-        print("  🔴 SHORT + 🟢 LONG (BOTH) - Both short and long signals will be traded")
-        return "BOTH"
-
-
 def ask_mode() -> Tuple[bool, str, str]:
     _divider("MODE")
     print("  [1]  Paper Mode   — signals only, no real orders")
@@ -2206,6 +2154,35 @@ def ask_mode() -> Tuple[bool, str, str]:
             return True, "", ""
         return False, api_key, api_secret
     return True, "", ""
+
+
+def ask_trade_directions() -> Tuple[bool, bool]:
+    """Ask user which trade directions to enable."""
+    _divider("TRADE DIRECTIONS")
+    print("  Select which types of trades the bot should execute:")
+    print()
+    
+    enable_short = input("  Enable SHORT trades? (Y/n) : ").strip().lower()
+    enable_short = enable_short != 'n'  # Default to Yes
+    
+    enable_long = input("  Enable LONG trades? (Y/n) : ").strip().lower()
+    enable_long = enable_long != 'n'  # Default to Yes
+    
+    if not enable_short and not enable_long:
+        print("\n  ⚠️  WARNING: Both short and long trades are disabled!")
+        print("  The bot will monitor markets but will NOT execute any trades.")
+        print()
+        proceed = input("  Do you want to continue anyway? (y/N) : ").strip().lower()
+        if proceed != 'y':
+            print("  Restart and select at least one direction.")
+            exit(0)
+    
+    print()
+    print(f"  Short trades: {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
+    print(f"  Long trades:  {'ENABLED ✅' if enable_long else 'DISABLED ❌'}")
+    print()
+    
+    return enable_short, enable_long
 
 
 def ask_gmail_config() -> Optional[GmailNotifier]:
@@ -2355,18 +2332,17 @@ def test_gmail():
 
 
 # ================================================================
-#  24. ENTRY POINT (UPDATED WITH DOJI RSI < 30)
+#  24. ENTRY POINT
 # ================================================================
 
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v11.5       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v11.3       |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   Short + Long strategies  |  TP 2:1 R:R            |")
-    print("  |   RSI(14) filter: Global or Doji-specific           |")
-    print("  |   Order-first PnL | Retry loop | Selectable trade   |")
-    print("  |   GMAIL NOTIFICATIONS INTEGRATED                    |")
+    print("  |   RSI(14) filter | Daily loss limit (REALIZED PnL)  |")
+    print("  |   Order-first PnL | Retry loop | GMAIL NOTIFICATIONS|")
     print("  +======================================================+")
 
     _divider("SETUP")
@@ -2376,8 +2352,11 @@ def main() -> None:
         print("\n  Continuing with bot setup...")
 
     timeframe = ask_timeframe()
-    trade_types = ask_trade_types()
     paper, api_key, api_secret = ask_mode()
+    
+    # NEW: Ask user which trade directions to enable
+    enable_short, enable_long = ask_trade_directions()
+    
     notifier = ask_gmail_config()
 
     _divider("CONNECTING TO DELTA EXCHANGE INDIA")
@@ -2411,16 +2390,10 @@ def main() -> None:
     _divider("CONFIRM")
     risk_usd       = trading_capital * risk_pct / 100
     daily_limit_usd = trading_capital * (daily_loss_limit_pct / 100)
-    
-    trade_type_display = {
-        "SHORT_ONLY": "🔴 SHORT TRADES ONLY",
-        "LONG_ONLY": "🟢 LONG TRADES ONLY",
-        "BOTH": "🔴 SHORT + 🟢 LONG (BOTH)"
-    }.get(trade_types, trade_types)
-    
     print(f"  Mode            : {'PAPER' if paper else 'LIVE TRADING'}")
     print(f"  Timeframe       : {timeframe}")
-    print(f"  Trade Types     : {trade_type_display}")
+    print(f"  Short Trades    : {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
+    print(f"  Long Trades     : {'ENABLED ✅' if enable_long else 'DISABLED ❌'}")
     print(f"  Symbols         : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
     print(f"  Leverage        : {leverage}x")
     print(f"  Trading capital : ${trading_capital:,.2f}")
@@ -2429,9 +2402,8 @@ def main() -> None:
     print(f"  Stop Loss       : Triggers on CANDLE CLOSE only")
     print(f"  Daily loss cap  : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f} (based on REALIZED PnL)")
     print(f"  Max open trades : {max_trades}")
-    print(f"  RSI SHORT filter: Global > {RSI_OVERBOUGHT} | Doji > {RSI_DOJI_OVERBOUGHT}")
-    print(f"  RSI LONG  filter: Global < {RSI_OVERSOLD} | Doji < {RSI_DOJI_OVERSOLD}")
     print(f"  GMAIL NOTIFICATIONS: {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
+    print(f"  PnL Fetch Priority: order_id → product_id (with retry)")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
@@ -2439,12 +2411,18 @@ def main() -> None:
         return
 
     cfg = {
-        "paper_mode": paper, "symbols": raw_symbols, "risk_pct": risk_pct,
-        "leverage": leverage, "trading_capital": trading_capital,
-        "max_concurrent_trades": max_trades, "timeframe": timeframe,
-        "api_key": api_key, "api_secret": api_secret,
+        "paper_mode": paper, 
+        "symbols": raw_symbols, 
+        "risk_pct": risk_pct,
+        "leverage": leverage, 
+        "trading_capital": trading_capital,
+        "max_concurrent_trades": max_trades, 
+        "timeframe": timeframe,
+        "api_key": api_key, 
+        "api_secret": api_secret,
         "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
-        "trade_types": trade_types,
+        "enable_short": enable_short,
+        "enable_long": enable_long,
     }
 
     bot = TradingBot(cfg, notifier=notifier)
