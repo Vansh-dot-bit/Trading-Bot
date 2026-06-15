@@ -263,7 +263,7 @@ class GmailNotifier:
 ║  SHORT TRADES   : {"ENABLED" if config.get('enable_short', True) else "DISABLED"}
 ║  LONG TRADES    : {"ENABLED" if config.get('enable_long', True) else "DISABLED"}
 ║  SHORT RSI      : > 55
-║  LONG RSI       : < 35
+║  LONG RSI       : < 37
 ║  Take Profit    : 2:1 R:R (triggers on PRICE TOUCH)
 ║  Stop Loss      : Triggers on CANDLE CLOSE (not intraday)
 ╠══════════════════════════════════════════════════════════════╣
@@ -514,7 +514,7 @@ CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD          = 14
 RSI_OVERBOUGHT      = 55.0
-RSI_OVERSOLD        = 35.0
+RSI_OVERSOLD        = 37.0  # UPDATED: Changed from 35 to 37
 RSI_MIN_CANDLES     = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL  = 0.5
@@ -2081,7 +2081,7 @@ class TradingBot:
         print("|   ✓ STOP LOSS: Triggers ONLY on CANDLE CLOSE          |")
         print("|   ✓ TAKE PROFIT: Triggers IMMEDIATELY on price touch  |")
         print("|   ✓ RSI SHORT filter: RSI(14) > 55                    |")
-        print("|   ✓ RSI LONG filter: RSI(14) < 35                     |")
+        print("|   ✓ RSI LONG filter: RSI(14) < 37                     |")
         print("|   ✓ Daily loss limit based on REALIZED PnL            |")
         print("|   ✓ Order-first PnL fetching (safer for concurrent trades)")
         print("|   ✓ Retry loop for PnL updates (5 attempts, 1s delay)")
@@ -2341,7 +2341,7 @@ def main() -> None:
     print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v11.3       |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   Short + Long strategies  |  TP 2:1 R:R            |")
-    print("  |   RSI(14) filter | Daily loss limit (REALIZED PnL)  |")
+    print("  |   RSI(14) filter (LONG: <37) | Daily loss limit     |")
     print("  |   Order-first PnL | Retry loop | GMAIL NOTIFICATIONS|")
     print("  +======================================================+")
 
