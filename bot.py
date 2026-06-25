@@ -335,6 +335,7 @@ class GmailNotifier:
 ║  LONG TRADES    : {"ENABLED" if config.get('enable_long', True) else "DISABLED"}
 ║  SHORT RSI      : > 55
 ║  LONG RSI       : < 37
+║  RSI LONG BLOCK : < 22 (extreme oversold)
 ║  Take Profit    : 2:1 R:R (or SuperTrend exit if both ST confirm)
 ║  Stop Loss      : Triggers on CANDLE CLOSE (not intraday)
 ║  SuperTrend 1   : Length=14, Factor=2.0
@@ -1209,6 +1210,11 @@ def check_long_signal(
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
     if rsi is None:
         return False, None, "", None
+    # BLOCK LONG TRADES WHEN RSI IS BELOW 22 (EXTREME OVERSOLD - POTENTIAL BOTTOM FISHING)
+    if rsi < 22.0:
+        _log("warning", f"RSI [{symbol}]", 
+             f"RSI={rsi:.2f} < 22 — BLOCKING LONG TRADE (extreme oversold)")
+        return False, None, "", rsi
     if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
     _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
@@ -2407,6 +2413,7 @@ class TradingBot:
         print("|                                                        |")
         print("|   RSI SHORT filter : RSI(14) > 55                      |")
         print("|   RSI LONG  filter : RSI(14) < 37                      |")
+        print("|   RSI LONG  BLOCK   : RSI(14) < 22 (extreme oversold)  |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
         print("|   Order-first PnL  : order_id → product_id (5 retries) |")
         print("|   Gmail alerts     : signal, ST confirm, ST exit        |")
@@ -2432,6 +2439,7 @@ class TradingBot:
         print(f"  LONG TRADES       : {'ENABLED' if self.enable_long else 'DISABLED'}")
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
+        print(f"  RSI LONG  BLOCK   : RSI(14) < 22 (extreme oversold — no trades)")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
@@ -2651,6 +2659,7 @@ def main() -> None:
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
     print("  |   Short + Long  |  RSI(14) filter  |  GMAIL         |")
+    print("  |   RSI LONG BLOCK: < 22 (extreme oversold)           |")
     print("  +======================================================+")
 
     _divider("SETUP")
@@ -2713,6 +2722,7 @@ def main() -> None:
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
+    print(f"  RSI LONG BLOCK    : RSI(14) < 22 (prevents trades in extreme oversold)")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
