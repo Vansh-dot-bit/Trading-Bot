@@ -81,7 +81,7 @@ class GmailNotifier:
     Gmail notification handler for trading signals and events.
     Uses Gmail App Password (not regular password) for security.
     """
-    
+
     def __init__(
         self,
         sender_email: str,
@@ -89,18 +89,18 @@ class GmailNotifier:
         recipient_emails: List[str],
         enabled: bool = True,
     ):
-        self.sender_email = sender_email
+        self.sender_email       = sender_email
         self.gmail_app_password = gmail_app_password
-        self.recipient_emails = recipient_emails
-        self.enabled = enabled
-        
+        self.recipient_emails   = recipient_emails
+        self.enabled            = enabled
+
     def _send_email(self, subject: str, body: str) -> bool:
         if not self.enabled:
             return False
         try:
             msg = MIMEMultipart()
-            msg["From"] = self.sender_email
-            msg["To"] = ", ".join(self.recipient_emails)
+            msg["From"]    = self.sender_email
+            msg["To"]      = ", ".join(self.recipient_emails)
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain", "utf-8"))
             context = ssl.create_default_context()
@@ -112,22 +112,22 @@ class GmailNotifier:
         except Exception as e:
             _log("error", "GMAIL", f"Failed to send email: {e}")
             return False
-    
+
     def send_signal(self, signal: dict) -> bool:
         if not self.enabled:
             return False
-        direction = signal.get("direction", "UNKNOWN")
-        symbol = signal.get("symbol", "UNKNOWN")
-        strategy = signal.get("strategy", "UNKNOWN")
-        timeframe = signal.get("timeframe", "UNKNOWN")
-        entry = signal.get("entry", 0)
-        stop_loss = signal.get("stop_loss", 0)
-        take_profit = signal.get("take_profit", 0)
-        rsi = signal.get("rsi", "N/A")
-        mode = signal.get("mode", "PAPER")
-        risk_usd = signal.get("risk_usd", 0)
+        direction      = signal.get("direction", "UNKNOWN")
+        symbol         = signal.get("symbol", "UNKNOWN")
+        strategy       = signal.get("strategy", "UNKNOWN")
+        timeframe      = signal.get("timeframe", "UNKNOWN")
+        entry          = signal.get("entry", 0)
+        stop_loss      = signal.get("stop_loss", 0)
+        take_profit    = signal.get("take_profit", 0)
+        rsi            = signal.get("rsi", "N/A")
+        mode           = signal.get("mode", "PAPER")
+        risk_usd       = signal.get("risk_usd", 0)
         trading_capital = signal.get("trading_capital", 0)
-        signal_time = signal.get("time", datetime.now(timezone.utc).isoformat())
+        signal_time    = signal.get("time", datetime.now(timezone.utc).isoformat())
         direction_emoji = "🔴 SHORT" if direction == "SHORT" else "🟢 LONG"
         subject = f"[{mode}] {direction_emoji} {symbol} - {strategy}"
         body = f"""
@@ -155,17 +155,88 @@ class GmailNotifier:
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
-    
+
+    def send_supertrend_strong(self, symbol: str, direction: str, entry: float,
+                                new_tp: float, st1: float, st2: float,
+                                timeframe: str, mode: str) -> bool:
+        """Send notification when both SuperTrends confirm the trade direction."""
+        if not self.enabled:
+            return False
+        if direction == "SHORT":
+            trend_emoji = "🔴📉 STRONG DOWN TREND"
+            trend_desc  = "Both SuperTrends turned RED — strong bearish confirmation"
+            tp_note     = "TP changed: will exit when BOTH SuperTrends flip GREEN"
+        else:
+            trend_emoji = "🟢📈 STRONG UP TREND"
+            trend_desc  = "Both SuperTrends turned GREEN — strong bullish confirmation"
+            tp_note     = "TP changed: will exit when BOTH SuperTrends flip RED"
+
+        subject = f"[{mode}] {trend_emoji} {symbol} — SuperTrend Confirmed"
+        body = f"""
+╔══════════════════════════════════════════════════════════════╗
+║              SUPERTREND STRONG TREND ALERT                   ║
+╠══════════════════════════════════════════════════════════════╣
+║  Symbol     : {symbol}
+║  Direction  : {trend_emoji}
+║  Timeframe  : {timeframe}
+║  Mode       : {mode}
+╠══════════════════════════════════════════════════════════════╣
+║  {trend_desc}
+╠══════════════════════════════════════════════════════════════╣
+║  Entry Price     : {entry:.4f}
+║  New Take Profit : {new_tp:.4f}  (SuperTrend-based EXIT)
+║  SuperTrend(14,2): {st1:.4f}
+║  SuperTrend(21,1): {st2:.4f}
+╠══════════════════════════════════════════════════════════════╣
+║  {tp_note}
+╚══════════════════════════════════════════════════════════════╝
+        """
+        return self._send_email(subject, body)
+
+    def send_supertrend_exit(self, symbol: str, direction: str, entry: float,
+                              exit_price: float, realized_pnl: float,
+                              timeframe: str, mode: str) -> bool:
+        """Send notification when SuperTrend-based TP is triggered (trend reversal)."""
+        if not self.enabled:
+            return False
+        is_profit   = realized_pnl > 0
+        emoji       = "✅" if is_profit else "❌"
+        pnl_text    = f"+${realized_pnl:.2f}" if is_profit else f"-${abs(realized_pnl):.2f}"
+        result_text = "PROFIT 🎉" if is_profit else "LOSS 😢"
+        if direction == "SHORT":
+            flip_desc = "Both SuperTrends flipped GREEN — bearish trend ended"
+        else:
+            flip_desc = "Both SuperTrends flipped RED — bullish trend ended"
+
+        subject = f"[ST-EXIT] {emoji} {symbol} SuperTrend Exit — {pnl_text}"
+        body = f"""
+╔══════════════════════════════════════════════════════════════╗
+║             SUPERTREND EXIT — TREND REVERSAL                 ║
+╠══════════════════════════════════════════════════════════════╣
+║  Symbol      : {symbol}
+║  Direction   : {direction}
+║  Timeframe   : {timeframe}
+║  Mode        : {mode}
+╠══════════════════════════════════════════════════════════════╣
+║  Exit Reason : {flip_desc}
+║  Entry       : {entry:.4f}
+║  Exit Price  : {exit_price:.4f}
+║  Realized PnL: {pnl_text}
+║  Result      : {result_text}
+╚══════════════════════════════════════════════════════════════╝
+        """
+        return self._send_email(subject, body)
+
     def send_trade_executed(self, trade: dict) -> bool:
         if not self.enabled:
             return False
-        direction = trade.get("direction", "UNKNOWN")
-        symbol = trade.get("symbol", "UNKNOWN")
-        entry = trade.get("entry", 0)
-        stop_loss = trade.get("stop_loss", 0)
+        direction   = trade.get("direction", "UNKNOWN")
+        symbol      = trade.get("symbol", "UNKNOWN")
+        entry       = trade.get("entry", 0)
+        stop_loss   = trade.get("stop_loss", 0)
         take_profit = trade.get("take_profit", 0)
-        size = trade.get("size", 0)
-        strategy = trade.get("strategy", "UNKNOWN")
+        size        = trade.get("size", 0)
+        strategy    = trade.get("strategy", "UNKNOWN")
         direction_emoji = "🔴 SHORT" if direction == "SHORT" else "🟢 LONG"
         subject = f"[EXECUTED] {direction_emoji} {symbol} - Size: {size}"
         body = f"""
@@ -182,17 +253,17 @@ class GmailNotifier:
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
-    
+
     def send_trade_closed(self, trade: dict, close_reason: str, pnl_usd: float) -> bool:
         if not self.enabled:
             return False
-        direction = trade.get("direction", "UNKNOWN")
-        symbol = trade.get("symbol", "UNKNOWN")
-        entry = trade.get("entry", 0)
-        is_profit = pnl_usd > 0
-        emoji = "✅" if is_profit else "❌"
-        pnl_text = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
-        subject = f"[CLOSED] {emoji} {symbol} - {pnl_text} - {close_reason}"
+        direction  = trade.get("direction", "UNKNOWN")
+        symbol     = trade.get("symbol", "UNKNOWN")
+        entry      = trade.get("entry", 0)
+        is_profit  = pnl_usd > 0
+        emoji      = "✅" if is_profit else "❌"
+        pnl_text   = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
+        subject    = f"[CLOSED] {emoji} {symbol} - {pnl_text} - {close_reason}"
         body = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                    TRADE CLOSED NOTIFICATION                 ║
@@ -206,7 +277,7 @@ class GmailNotifier:
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
-    
+
     def send_daily_loss_warning(self, daily_loss_usd: float, daily_limit_usd: float) -> bool:
         if not self.enabled:
             return False
@@ -223,7 +294,7 @@ class GmailNotifier:
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
-    
+
     def send_daily_limit_hit(self, daily_loss_usd: float, daily_limit_usd: float) -> bool:
         if not self.enabled:
             return False
@@ -239,12 +310,12 @@ class GmailNotifier:
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
-    
+
     def send_startup_report(self, config: dict, symbols: List[str]) -> bool:
         if not self.enabled:
             return False
-        mode = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
-        subject = f"🤖 TRADING BOT STARTED - {mode}"
+        mode        = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
+        subject     = f"🤖 TRADING BOT STARTED - {mode}"
         symbols_list = "\n".join([f"  • {sym}" for sym in symbols[:10]])
         if len(symbols) > 10:
             symbols_list += f"\n  • ... and {len(symbols) - 10} more"
@@ -264,8 +335,10 @@ class GmailNotifier:
 ║  LONG TRADES    : {"ENABLED" if config.get('enable_long', True) else "DISABLED"}
 ║  SHORT RSI      : > 55
 ║  LONG RSI       : < 37
-║  Take Profit    : 2:1 R:R (triggers on PRICE TOUCH)
+║  Take Profit    : 2:1 R:R (or SuperTrend exit if both ST confirm)
 ║  Stop Loss      : Triggers on CANDLE CLOSE (not intraday)
+║  SuperTrend 1   : Length=14, Factor=2.0
+║  SuperTrend 2   : Length=21, Factor=1.0
 ╠══════════════════════════════════════════════════════════════╣
 ║  Symbols ({len(symbols)}):
 {symbols_list}
@@ -290,17 +363,17 @@ class WSState(Enum):
 class WSConfig:
     url: str = "wss://socket.india.delta.exchange"
     ping_interval: int = 20
-    ping_timeout: int = 10
-    max_reconnect_attempts: int = 10
-    reconnect_base_delay: int = 5
-    reconnect_max_delay: int = 30
+    ping_timeout: int  = 10
+    max_reconnect_attempts: int    = 10
+    reconnect_base_delay: int      = 5
+    reconnect_max_delay: int       = 30
     reconnect_backoff_multiplier: int = 2
 
 
 class DeltaWebSocket:
     def __init__(self, config: Optional[WSConfig] = None):
-        self.config = config or WSConfig()
-        self._state             = WSState.DISCONNECTED
+        self.config   = config or WSConfig()
+        self._state   = WSState.DISCONNECTED
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread]   = None
         self._thread_lock       = threading.Lock()
@@ -315,11 +388,11 @@ class DeltaWebSocket:
         self._on_error_callback:        Optional[callable] = None
         self._on_reconnect_callback:    Optional[callable] = None
 
-    def set_candle_callback(self, cb: callable)      -> None: self._on_candle_callback       = cb
-    def set_connected_callback(self, cb: callable)   -> None: self._on_connected_callback    = cb
-    def set_disconnected_callback(self, cb: callable)-> None: self._on_disconnected_callback = cb
-    def set_error_callback(self, cb: callable)       -> None: self._on_error_callback        = cb
-    def set_reconnect_callback(self, cb: callable)   -> None: self._on_reconnect_callback    = cb
+    def set_candle_callback(self, cb: callable)       -> None: self._on_candle_callback       = cb
+    def set_connected_callback(self, cb: callable)    -> None: self._on_connected_callback    = cb
+    def set_disconnected_callback(self, cb: callable) -> None: self._on_disconnected_callback = cb
+    def set_error_callback(self, cb: callable)        -> None: self._on_error_callback        = cb
+    def set_reconnect_callback(self, cb: callable)    -> None: self._on_reconnect_callback    = cb
 
     def subscribe(self, timeframe: str, symbols: List[str]) -> None:
         channel = self._get_channel_name(timeframe)
@@ -342,8 +415,10 @@ class DeltaWebSocket:
             if self._thread and self._thread.is_alive():
                 return
             self._should_stop.clear()
-            self._state = WSState.CONNECTING
-            self._thread = threading.Thread(target=self._run_forever, daemon=True, name="DeltaWebSocket")
+            self._state  = WSState.CONNECTING
+            self._thread = threading.Thread(
+                target=self._run_forever, daemon=True, name="DeltaWebSocket"
+            )
             self._thread.start()
 
     def stop(self) -> None:
@@ -357,11 +432,13 @@ class DeltaWebSocket:
                 self._thread.join(timeout=5.0)
 
     def is_connected(self) -> bool: return self._state == WSState.CONNECTED
-    def get_state(self) -> str: return self._state.value
+    def get_state(self) -> str:     return self._state.value
 
     def _get_channel_name(self, timeframe: str) -> str:
-        return {"1m": "candlestick_1m", "5m": "candlestick_5m",
-                "15m": "candlestick_15m", "1h": "candlestick_1h"}.get(timeframe, f"candlestick_{timeframe}")
+        return {
+            "1m": "candlestick_1m", "5m": "candlestick_5m",
+            "15m": "candlestick_15m", "1h": "candlestick_1h",
+        }.get(timeframe, f"candlestick_{timeframe}")
 
     def _run_forever(self) -> None:
         first_connect = True
@@ -387,8 +464,11 @@ class DeltaWebSocket:
             on_open=self._on_open, on_message=self._on_message,
             on_error=self._on_error, on_close=self._on_close,
         )
-        self._ws.run_forever(ping_interval=self.config.ping_interval,
-                             ping_timeout=self.config.ping_timeout, reconnect=0)
+        self._ws.run_forever(
+            ping_interval=self.config.ping_interval,
+            ping_timeout=self.config.ping_timeout,
+            reconnect=0,
+        )
 
     def _reconnect(self) -> None:
         if self._reconnect_attempts >= self.config.max_reconnect_attempts:
@@ -404,10 +484,11 @@ class DeltaWebSocket:
             time.sleep(1)
         self._reconnect_delay = min(
             self._reconnect_delay * self.config.reconnect_backoff_multiplier,
-            self.config.reconnect_max_delay)
+            self.config.reconnect_max_delay,
+        )
 
     def _on_open(self, ws) -> None:
-        self._state = WSState.CONNECTED
+        self._state              = WSState.CONNECTED
         self._reconnect_attempts = 0
         self._reconnect_delay    = self.config.reconnect_base_delay
         with self._subscription_lock:
@@ -425,7 +506,7 @@ class DeltaWebSocket:
 
     def _on_message(self, ws, message: str) -> None:
         try:
-            data = json.loads(message)
+            data     = json.loads(message)
             msg_type = data.get("type", "")
             if msg_type in ("subscribe", "error"): return
             candle_data = self._parse_candle_message(data)
@@ -453,7 +534,7 @@ class DeltaWebSocket:
             if ts_raw is not None:
                 ts = int(ts_raw)
                 if ts > 1_000_000_000_000_000: ts = ts // 1_000_000_000
-                elif ts > 10_000_000_000: ts = ts // 1_000
+                elif ts > 10_000_000_000:      ts = ts // 1_000
             else:
                 for key in ("time", "start", "t"):
                     v = data.get(key)
@@ -463,9 +544,11 @@ class DeltaWebSocket:
                         break
                 else: return None
             if ts <= 0: return None
-            return {"time": ts, "open": float(data.get("open", 0)), "high": float(data.get("high", 0)),
-                    "low": float(data.get("low", 0)), "close": float(data.get("close", 0)),
-                    "volume": float(data.get("volume", 0))}
+            return {
+                "time": ts, "open": float(data.get("open", 0)),
+                "high": float(data.get("high", 0)), "low": float(data.get("low", 0)),
+                "close": float(data.get("close", 0)), "volume": float(data.get("volume", 0)),
+            }
         except (TypeError, ValueError): return None
 
     def _on_error(self, ws, error) -> None:
@@ -484,19 +567,19 @@ class DeltaWebSocket:
 def to_trading_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
     if s.endswith("_PERP"): s = s[:-5]
-    if s.endswith("USDT"): s = s[:-4] + "USD"
+    if s.endswith("USDT"):  s = s[:-4] + "USD"
     return s + "_PERP"
 
 def to_ws_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
     if s.endswith("_PERP"): s = s[:-5]
-    if s.endswith("USDT"): s = s[:-4] + "USD"
+    if s.endswith("USDT"):  s = s[:-4] + "USD"
     return s
 
 def to_candle_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
     if s.endswith("_PERP"): s = s[:-5]
-    if s.endswith("USDT"): s = s[:-4] + "USD"
+    if s.endswith("USDT"):  s = s[:-4] + "USD"
     return s
 
 
@@ -506,19 +589,19 @@ def to_candle_symbol(symbol: str) -> str:
 REST_BASE_INDIA  = "https://api.india.delta.exchange"
 REST_BASE_GLOBAL = "https://api.delta.exchange"
 
-CANDLE_LIMIT        = 100
+CANDLE_LIMIT        = 200          # increased to ensure enough data for ST(21)
 MAX_RETRIES         = 3
 RETRY_DELAYS        = [5, 10, 15]
 TIMEOUT             = 30
 CANDLE_SAFETY_SHIFT = 1
 
-RSI_PERIOD          = 14
-RSI_OVERBOUGHT      = 55.0
-RSI_OVERSOLD        = 37.0  # UPDATED: Changed from 35 to 37
-RSI_MIN_CANDLES     = RSI_PERIOD + 1
+RSI_PERIOD      = 14
+RSI_OVERBOUGHT  = 55.0
+RSI_OVERSOLD    = 37.0
+RSI_MIN_CANDLES = RSI_PERIOD + 1
 
-FILL_POLL_INTERVAL  = 0.5
-FILL_POLL_TIMEOUT   = 15
+FILL_POLL_INTERVAL = 0.5
+FILL_POLL_TIMEOUT  = 15
 
 DOJI_BODY_RATIO_MAX = 0.10
 TP_RR_RATIO         = 2.0
@@ -526,7 +609,14 @@ TP_MAX_PCT          = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
 
 BREAKOUT_BODY_OVERLAP_MIN_PCT = 0.50
-MIN_ENGULF_BODY_PCT = 0.30
+MIN_ENGULF_BODY_PCT           = 0.30
+
+# ── SuperTrend parameters ─────────────────────────────────────
+ST1_LENGTH = 14    # Accurate SuperTrend
+ST1_FACTOR = 2.0
+ST2_LENGTH = 21    # Trend SuperTrend
+ST2_FACTOR = 1.0
+# ─────────────────────────────────────────────────────────────
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m":  {"resolution": "1m",  "api_resolution": "1m",  "ws_channel": "candlestick_1m",  "secs": 60},
@@ -559,7 +649,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/11.3",
+            "User-Agent":   "python-DeltaBot/12.0",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -570,7 +660,8 @@ class APIRequestHandler:
     def _get_base_url(self, endpoint_type: str) -> str:
         return REST_BASE_INDIA
 
-    def _sign_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
+    def _sign_request(self, method: str, path: str,
+                      params: dict = None, body: dict = None) -> dict:
         if not self.api_key or not self.api_secret:
             raise ValueError("API key/secret missing")
         timestamp    = str(int(time.time()))
@@ -581,14 +672,17 @@ class APIRequestHandler:
         body_string = ""
         if body and method.upper() != "GET":
             body_string = json.dumps(body)
-        message   = method.upper() + timestamp + path + query_string + body_string
+        message = method.upper() + timestamp + path + query_string + body_string
         signature = hmac.new(
-            self.api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256,
+            self.api_secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
         ).hexdigest()
         return {"api-key": self.api_key, "timestamp": timestamp, "signature": signature}
 
     def request(self, method: str, endpoint: str, endpoint_type: str = "public",
-                params: dict = None, body: dict = None, retry_count: int = 0) -> Optional[Dict]:
+                params: dict = None, body: dict = None,
+                retry_count: int = 0) -> Optional[Dict]:
         base_url = self._get_base_url(endpoint_type)
         url      = base_url + endpoint
         headers  = {}
@@ -614,10 +708,9 @@ class APIRequestHandler:
                 return None
             response.raise_for_status()
             return response_data
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             if retry_count < MAX_RETRIES - 1:
-                delay = RETRY_DELAYS[retry_count]
-                time.sleep(delay)
+                time.sleep(RETRY_DELAYS[retry_count])
                 return self.request(method, endpoint, endpoint_type, params, body, retry_count + 1)
             return None
         except requests.HTTPError as exc:
@@ -640,12 +733,12 @@ class TimeframeSafe:
         k = key.strip().lower()
         if k not in TIMEFRAME_MAP:
             raise ValueError(f"[TIMEFRAME] '{k}' not valid. Choose from: {list(TIMEFRAME_MAP)}")
-        entry = TIMEFRAME_MAP[k]
-        self._key            = k
-        self._resolution     = entry["resolution"]
+        entry            = TIMEFRAME_MAP[k]
+        self._key        = k
+        self._resolution = entry["resolution"]
         self._api_resolution = entry["api_resolution"]
-        self._ws_channel     = entry["ws_channel"]
-        self._secs           = entry["secs"]
+        self._ws_channel = entry["ws_channel"]
+        self._secs       = entry["secs"]
 
     @property
     def key(self)            -> str: return self._key
@@ -674,7 +767,7 @@ def validate_candle(candle: dict, symbol: str = "") -> bool:
             v = float(candle[f])
         except (TypeError, ValueError): return False
         if math.isnan(v) or math.isinf(v): return False
-    if candle["time"] <= 0: return False
+    if candle["time"] <= 0:      return False
     if candle["high"] < candle["low"]: return False
     for f in ("open", "high", "low", "close"):
         if candle[f] <= 0: return False
@@ -690,9 +783,9 @@ def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optiona
         return None
     closes  = [float(c["close"]) for c in closed_candles]
     changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    seed_changes = changes[:period]
-    avg_gain = sum(max(ch, 0.0) for ch in seed_changes) / period
-    avg_loss = sum(abs(min(ch, 0.0)) for ch in seed_changes) / period
+    seed    = changes[:period]
+    avg_gain = sum(max(ch, 0.0) for ch in seed) / period
+    avg_loss = sum(abs(min(ch, 0.0)) for ch in seed) / period
     for ch in changes[period:]:
         avg_gain = (avg_gain * (period - 1) + max(ch, 0.0)) / period
         avg_loss = (avg_loss * (period - 1) + abs(min(ch, 0.0))) / period
@@ -704,28 +797,220 @@ def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optiona
 
 
 def check_rsi_filter(closed_candles: List[dict], symbol: str = "",
-                     period: int = RSI_PERIOD, threshold: float = RSI_OVERBOUGHT) -> Tuple[bool, Optional[float]]:
+                     period: int = RSI_PERIOD,
+                     threshold: float = RSI_OVERBOUGHT) -> Tuple[bool, Optional[float]]:
     rsi = compute_rsi(closed_candles, period)
     if rsi is None:
         _log("warning", f"RSI [{symbol}]",
-             f"Insufficient candles for RSI({period}): have {len(closed_candles)}, need {period + 1} — BLOCKING")
+             f"Insufficient candles for RSI({period}): have {len(closed_candles)}, "
+             f"need {period + 1} — BLOCKING")
         return False, None
     _log("info", f"RSI [{symbol}]", f"RSI({period}) = {rsi:.2f}  (threshold > {threshold})")
-    if rsi > threshold:
-        return True, rsi
-    return False, rsi
+    return (rsi > threshold), rsi
+
+
+# ================================================================
+#  12b. SUPERTREND CALCULATION
+# ================================================================
+
+def compute_atr(candles: List[dict], period: int) -> List[float]:
+    """
+    Compute ATR using Wilder's smoothing (RMA).
+    Returns a list of ATR values aligned to candles (index 0..N-1).
+    Values before index `period` are None placeholders → stored as 0.0.
+    """
+    n = len(candles)
+    if n < 2:
+        return [0.0] * n
+
+    # True Range for each bar
+    trs = [0.0]  # first bar has no previous close
+    for i in range(1, n):
+        h   = candles[i]["high"]
+        l   = candles[i]["low"]
+        pc  = candles[i - 1]["close"]
+        tr  = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+
+    # Wilder RMA seed = simple average of first `period` TRs
+    atrs = [0.0] * n
+    if n < period + 1:
+        return atrs
+
+    seed = sum(trs[1 : period + 1]) / period
+    atrs[period] = seed
+    alpha = 1.0 / period
+    for i in range(period + 1, n):
+        atrs[i] = atrs[i - 1] * (1 - alpha) + trs[i] * alpha
+
+    return atrs
+
+
+def compute_supertrend(candles: List[dict],
+                        length: int, factor: float) -> List[Optional[bool]]:
+    """
+    Compute SuperTrend for a list of closed candles.
+
+    Returns a list of booleans (same length as `candles`):
+        True  → price is ABOVE SuperTrend → bullish / GREEN
+        False → price is BELOW SuperTrend → bearish / RED
+        None  → insufficient data
+
+    Algorithm mirrors Pine Script's SuperTrend indicator exactly:
+        hl2        = (high + low) / 2
+        upperBand  = hl2 + factor * ATR
+        lowerBand  = hl2 - factor * ATR
+        Bands are only tightened, never widened between bars.
+        Direction flips when close crosses the active band.
+    """
+    n    = len(candles)
+    atrs = compute_atr(candles, length)
+
+    directions: List[Optional[bool]] = [None] * n
+    upper_bands  = [0.0] * n
+    lower_bands  = [0.0] * n
+
+    # Seed the first valid index
+    start = length  # first bar with a valid ATR
+
+    for i in range(start, n):
+        hl2 = (candles[i]["high"] + candles[i]["low"]) / 2.0
+        atr = atrs[i]
+
+        raw_upper = hl2 + factor * atr
+        raw_lower = hl2 - factor * atr
+
+        if i == start:
+            upper_bands[i] = raw_upper
+            lower_bands[i] = raw_lower
+            # Initial direction: close vs mid-band
+            directions[i] = candles[i]["close"] >= hl2
+        else:
+            prev_upper = upper_bands[i - 1]
+            prev_lower = lower_bands[i - 1]
+            prev_close = candles[i - 1]["close"]
+
+            # Lower band: only raise it (tighten from below)
+            lower_bands[i] = (
+                raw_lower if raw_lower > prev_lower or prev_close < prev_lower
+                else prev_lower
+            )
+            # Upper band: only lower it (tighten from above)
+            upper_bands[i] = (
+                raw_upper if raw_upper < prev_upper or prev_close > prev_upper
+                else prev_upper
+            )
+
+            # Direction
+            prev_dir = directions[i - 1]
+            close    = candles[i]["close"]
+
+            if prev_dir is False:           # was bearish
+                directions[i] = close > upper_bands[i]   # flip to bullish if price breaks above
+            elif prev_dir is True:          # was bullish
+                directions[i] = close >= lower_bands[i]  # stay bullish if price stays above lower
+            else:
+                directions[i] = close >= hl2
+
+    return directions
+
+
+def get_supertrend_state(candles: List[dict],
+                          length: int, factor: float) -> Optional[bool]:
+    """
+    Return the CURRENT SuperTrend direction for the most recent CLOSED candle.
+    True  = bullish (GREEN), False = bearish (RED), None = not enough data.
+    """
+    if len(candles) < length + 2:   # need at least length+1 for ATR + 1 for direction
+        return None
+    dirs = compute_supertrend(candles, length, factor)
+    # Return the last direction (most recent closed candle)
+    for d in reversed(dirs):
+        if d is not None:
+            return d
+    return None
+
+
+def both_supertrends_bullish(candles: List[dict]) -> bool:
+    """Returns True when BOTH ST(14,2) and ST(21,1) are GREEN (bullish)."""
+    st1 = get_supertrend_state(candles, ST1_LENGTH, ST1_FACTOR)
+    st2 = get_supertrend_state(candles, ST2_LENGTH, ST2_FACTOR)
+    return st1 is True and st2 is True
+
+
+def both_supertrends_bearish(candles: List[dict]) -> bool:
+    """Returns True when BOTH ST(14,2) and ST(21,1) are RED (bearish)."""
+    st1 = get_supertrend_state(candles, ST1_LENGTH, ST1_FACTOR)
+    st2 = get_supertrend_state(candles, ST2_LENGTH, ST2_FACTOR)
+    return st1 is False and st2 is False
+
+
+def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Return the numeric SuperTrend line values for the last closed candle:
+    (ST1_value, ST2_value).
+    These are the band levels (upper or lower) that act as the active line.
+    """
+    def _get_last_band(cndls, length, factor):
+        n    = len(cndls)
+        atrs = compute_atr(cndls, length)
+        if n < length + 1:
+            return None
+        upper_bands = [0.0] * n
+        lower_bands = [0.0] * n
+        dirs: List[Optional[bool]] = [None] * n
+        start = length
+        for i in range(start, n):
+            hl2       = (cndls[i]["high"] + cndls[i]["low"]) / 2.0
+            atr       = atrs[i]
+            raw_upper = hl2 + factor * atr
+            raw_lower = hl2 - factor * atr
+            if i == start:
+                upper_bands[i] = raw_upper
+                lower_bands[i] = raw_lower
+                dirs[i]        = cndls[i]["close"] >= hl2
+            else:
+                prev_upper = upper_bands[i - 1]
+                prev_lower = lower_bands[i - 1]
+                prev_close = cndls[i - 1]["close"]
+                lower_bands[i] = (
+                    raw_lower if raw_lower > prev_lower or prev_close < prev_lower
+                    else prev_lower
+                )
+                upper_bands[i] = (
+                    raw_upper if raw_upper < prev_upper or prev_close > prev_upper
+                    else prev_upper
+                )
+                prev_dir   = dirs[i - 1]
+                close      = cndls[i]["close"]
+                if prev_dir is False:
+                    dirs[i] = close > upper_bands[i]
+                elif prev_dir is True:
+                    dirs[i] = close >= lower_bands[i]
+                else:
+                    dirs[i] = close >= hl2
+        # The active line is lower_band when bullish, upper_band when bearish
+        if dirs[n - 1] is True:
+            return lower_bands[n - 1]
+        elif dirs[n - 1] is False:
+            return upper_bands[n - 1]
+        return None
+
+    v1 = _get_last_band(candles, ST1_LENGTH, ST1_FACTOR)
+    v2 = _get_last_band(candles, ST2_LENGTH, ST2_FACTOR)
+    return v1, v2
 
 
 # ================================================================
 #  13. STRATEGY HELPERS
 # ================================================================
 
-def candle_body(c: dict) -> float: return abs(c["close"] - c["open"])
-def upper_wick(c: dict) -> float: return c["high"] - max(c["open"], c["close"])
-def lower_wick(c: dict) -> float: return min(c["open"], c["close"]) - c["low"]
+def candle_body(c: dict)  -> float: return abs(c["close"] - c["open"])
+def upper_wick(c: dict)   -> float: return c["high"] - max(c["open"], c["close"])
+def lower_wick(c: dict)   -> float: return min(c["open"], c["close"]) - c["low"]
 def candle_range(c: dict) -> float: return c["high"] - c["low"]
-def is_bullish(c: dict) -> bool: return c["close"] > c["open"]
-def is_bearish(c: dict) -> bool: return c["close"] < c["open"]
+def is_bullish(c: dict)   -> bool:  return c["close"] > c["open"]
+def is_bearish(c: dict)   -> bool:  return c["close"] < c["open"]
 
 def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
     r = candle_range(c)
@@ -743,240 +1028,150 @@ def body_pct_of_range(c: dict) -> float:
 # ================================================================
 
 def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 5:
-        return False, None, ""
-
-    signal = candles[-1]
-    i1     = candles[-2]
-    i2     = candles[-3]
-    i3     = candles[-4]
-    i4     = candles[-5]
-
-    if not (i3["close"] > i4["high"] and i2["close"] > i3["high"]):
-        return False, None, ""
-
+    if len(candles) < 5: return False, None, ""
+    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]
+    i3     = candles[-4]; i4 = candles[-5]
+    if not (i3["close"] > i4["high"] and i2["close"] > i3["high"]): return False, None, ""
     i1_body_top    = max(i1["open"], i1["close"])
     i1_body_bottom = min(i1["open"], i1["close"])
     i2_body_top    = max(i2["open"], i2["close"])
     i2_body_bottom = min(i2["open"], i2["close"])
-    overlap_top    = min(i1_body_top, i2_body_top)
-    overlap_bottom = max(i1_body_bottom, i2_body_bottom)
-    overlap        = max(0.0, overlap_top - overlap_bottom)
+    overlap        = max(0.0, min(i1_body_top, i2_body_top) - max(i1_body_bottom, i2_body_bottom))
     i1_body_size   = candle_body(i1)
     if i1_body_size <= 0 or (overlap / i1_body_size) < BREAKOUT_BODY_OVERLAP_MIN_PCT:
         return False, None, ""
-
-    if not is_bearish(i1):
-        return False, None, ""
-
-    if not is_bearish(signal):
-        return False, None, ""
-    if signal["close"] >= i1["close"]:
-        return False, None, ""
-
+    if not is_bearish(i1):     return False, None, ""
+    if not is_bearish(signal): return False, None, ""
+    if signal["close"] >= i1["close"]: return False, None, ""
     sc = signal.copy()
     sc["pattern_high"] = max(i2["high"], i1["high"], signal["high"])
-    _log("info", "STRATEGY_1_SHORT",
-         f"Double Breakout + reversal | i3-i4 breakout | i2-i3 breakout")
+    _log("info", "STRATEGY_1_SHORT", "Double Breakout + reversal")
     return True, sc, "STRATEGY_1_SHORT"
 
 
 def check_short_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    signal = candles[-1]
-    i1     = candles[-2]
-    i2     = candles[-3]
-    i3     = candles[-4]
-
+    if len(candles) < 4: return False, None, ""
+    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
     if i2["close"] <= i3["close"]: return False, None, ""
-    if not is_bullish(i2): return False, None, ""
-    if not is_bearish(i1): return False, None, ""
-
-    if body_pct_of_range(i1) < MIN_ENGULF_BODY_PCT:
-        return False, None, ""
-
-    if not (i1["open"] > i2["close"] and i1["close"] < i2["open"]):
-        return False, None, ""
-    if not is_bearish(signal): return False, None, ""
-    if signal["close"] >= i1["close"]: return False, None, ""
-
+    if not is_bullish(i2):         return False, None, ""
+    if not is_bearish(i1):         return False, None, ""
+    if body_pct_of_range(i1) < MIN_ENGULF_BODY_PCT: return False, None, ""
+    if not (i1["open"] > i2["close"] and i1["close"] < i2["open"]): return False, None, ""
+    if not is_bearish(signal):              return False, None, ""
+    if signal["close"] >= i1["close"]:     return False, None, ""
     sc = signal.copy()
     sc["pattern_high"] = max(i1["high"], signal["high"])
-    _log("info", "STRATEGY_3_SHORT", f"Bearish Engulfing confirmed")
+    _log("info", "STRATEGY_3_SHORT", "Bearish Engulfing confirmed")
     return True, sc, "STRATEGY_3_SHORT"
 
 
 def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    signal_c = candles[-1]
-    doji_c   = candles[-2]
-    i1       = candles[-3]
-    i2       = candles[-4]
-
-    if not is_bullish(i2): return False, None, ""
-    if not is_bullish(i1): return False, None, ""
-    if not is_doji(doji_c): return False, None, ""
-    if doji_c["high"] <= i1["high"]: return False, None, ""
-    if not is_bearish(signal_c): return False, None, ""
-
+    if len(candles) < 4: return False, None, ""
+    signal_c = candles[-1]; doji_c = candles[-2]; i1 = candles[-3]; i2 = candles[-4]
+    if not is_bullish(i2):             return False, None, ""
+    if not is_bullish(i1):             return False, None, ""
+    if not is_doji(doji_c):            return False, None, ""
+    if doji_c["high"] <= i1["high"]:   return False, None, ""
+    if not is_bearish(signal_c):       return False, None, ""
     result = signal_c.copy()
     result["doji_high"] = doji_c["high"]
     return True, result, "BEARISH_DOJI"
 
 
 def check_short_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    signal = candles[-1]
-    i1     = candles[-2]
-    i2     = candles[-3]
-    i3     = candles[-4]
-
-    if not is_bullish(i3): return False, None, ""
-    if not is_bullish(i2): return False, None, ""
-    if i2["close"] <= i3["close"]: return False, None, ""
-    if not is_bearish(i1): return False, None, ""
-
+    if len(candles) < 4: return False, None, ""
+    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
+    if not is_bullish(i3):             return False, None, ""
+    if not is_bullish(i2):             return False, None, ""
+    if i2["close"] <= i3["close"]:     return False, None, ""
+    if not is_bearish(i1):             return False, None, ""
     i2_body_top    = max(i2["open"], i2["close"])
     i2_body_bottom = min(i2["open"], i2["close"])
     i1_body_top    = max(i1["open"], i1["close"])
     i1_body_bottom = min(i1["open"], i1["close"])
     if not (i1_body_top <= i2_body_top and i1_body_bottom >= i2_body_bottom):
         return False, None, ""
-
-    if not is_bearish(signal): return False, None, ""
-    if signal["close"] >= i1["close"]: return False, None, ""
-
-    pattern_high = max(i2["high"], i1["high"])
+    if not is_bearish(signal):             return False, None, ""
+    if signal["close"] >= i1["close"]:     return False, None, ""
     sc = signal.copy()
-    sc["pattern_high"] = pattern_high
-    _log("info", "BEARISH_HARAMI", f"Harami pattern detected")
+    sc["pattern_high"] = max(i2["high"], i1["high"])
+    _log("info", "BEARISH_HARAMI", "Harami pattern detected")
     return True, sc, "BEARISH_HARAMI"
 
 
 # ================================================================
-#  13b. LONG STRATEGIES (MIRRORED FROM SHORT STRATEGIES)
+#  13b. LONG STRATEGIES
 # ================================================================
 
 def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 5:
-        return False, None, ""
-
-    signal = candles[-1]
-    i1     = candles[-2]
-    i2     = candles[-3]
-    i3     = candles[-4]
-    i4     = candles[-5]
-
-    if not (i3["close"] < i4["low"] and i2["close"] < i3["low"]):
-        return False, None, ""
-
+    if len(candles) < 5: return False, None, ""
+    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]
+    i3     = candles[-4]; i4 = candles[-5]
+    if not (i3["close"] < i4["low"] and i2["close"] < i3["low"]): return False, None, ""
     i1_body_top    = max(i1["open"], i1["close"])
     i1_body_bottom = min(i1["open"], i1["close"])
     i2_body_top    = max(i2["open"], i2["close"])
     i2_body_bottom = min(i2["open"], i2["close"])
-    overlap_top    = min(i1_body_top, i2_body_top)
-    overlap_bottom = max(i1_body_bottom, i2_body_bottom)
-    overlap        = max(0.0, overlap_top - overlap_bottom)
+    overlap        = max(0.0, min(i1_body_top, i2_body_top) - max(i1_body_bottom, i2_body_bottom))
     i1_body_size   = candle_body(i1)
     if i1_body_size <= 0 or (overlap / i1_body_size) < BREAKOUT_BODY_OVERLAP_MIN_PCT:
         return False, None, ""
-
-    if not is_bullish(i1):
-        return False, None, ""
-
-    if not is_bullish(signal):
-        return False, None, ""
-    if signal["close"] <= i1["close"]:
-        return False, None, ""
-
+    if not is_bullish(i1):              return False, None, ""
+    if not is_bullish(signal):          return False, None, ""
+    if signal["close"] <= i1["close"]:  return False, None, ""
     sc = signal.copy()
     sc["pattern_low"] = min(i2["low"], i1["low"], signal["low"])
-    _log("info", "STRATEGY_1_LONG",
-         f"Double Downward Breakout + bullish reversal | i3-i4 breakdown | i2-i3 breakdown")
+    _log("info", "STRATEGY_1_LONG", "Double Downward Breakout + bullish reversal")
     return True, sc, "STRATEGY_1_LONG"
 
 
 def check_long_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    signal = candles[-1]
-    i1     = candles[-2]
-    i2     = candles[-3]
-    i3     = candles[-4]
-
-    if i2["close"] >= i3["close"]: return False, None, ""
-    if not is_bearish(i2): return False, None, ""
-    if not is_bullish(i1): return False, None, ""
-
-    if body_pct_of_range(i1) < MIN_ENGULF_BODY_PCT:
-        return False, None, ""
-
-    if not (i1["open"] < i2["close"] and i1["close"] > i2["open"]):
-        return False, None, ""
-    if not is_bullish(signal): return False, None, ""
-    if signal["close"] <= i1["close"]: return False, None, ""
-
+    if len(candles) < 4: return False, None, ""
+    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
+    if i2["close"] >= i3["close"]:     return False, None, ""
+    if not is_bearish(i2):             return False, None, ""
+    if not is_bullish(i1):             return False, None, ""
+    if body_pct_of_range(i1) < MIN_ENGULF_BODY_PCT: return False, None, ""
+    if not (i1["open"] < i2["close"] and i1["close"] > i2["open"]): return False, None, ""
+    if not is_bullish(signal):             return False, None, ""
+    if signal["close"] <= i1["close"]:    return False, None, ""
     sc = signal.copy()
     sc["pattern_low"] = min(i1["low"], signal["low"])
-    _log("info", "STRATEGY_3_LONG", f"Bullish Engulfing confirmed")
+    _log("info", "STRATEGY_3_LONG", "Bullish Engulfing confirmed")
     return True, sc, "BULLISH_ENGULFING"
 
 
 def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    signal_c = candles[-1]
-    doji_c   = candles[-2]
-    i1       = candles[-3]
-    i2       = candles[-4]
-
-    if not is_bearish(i2): return False, None, ""
-    if not is_bearish(i1): return False, None, ""
-    if not is_doji(doji_c): return False, None, ""
-    if doji_c["low"] >= i1["low"]: return False, None, ""
-    if not is_bullish(signal_c): return False, None, ""
-
+    if len(candles) < 4: return False, None, ""
+    signal_c = candles[-1]; doji_c = candles[-2]; i1 = candles[-3]; i2 = candles[-4]
+    if not is_bearish(i2):             return False, None, ""
+    if not is_bearish(i1):             return False, None, ""
+    if not is_doji(doji_c):            return False, None, ""
+    if doji_c["low"] >= i1["low"]:     return False, None, ""
+    if not is_bullish(signal_c):       return False, None, ""
     result = signal_c.copy()
     result["doji_low"] = doji_c["low"]
     return True, result, "BULLISH_DOJI"
 
 
 def check_long_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    signal = candles[-1]
-    i1     = candles[-2]
-    i2     = candles[-3]
-    i3     = candles[-4]
-
-    if not is_bearish(i3): return False, None, ""
-    if not is_bearish(i2): return False, None, ""
-    if i2["close"] >= i3["close"]: return False, None, ""
-    if not is_bullish(i1): return False, None, ""
-
+    if len(candles) < 4: return False, None, ""
+    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
+    if not is_bearish(i3):             return False, None, ""
+    if not is_bearish(i2):             return False, None, ""
+    if i2["close"] >= i3["close"]:     return False, None, ""
+    if not is_bullish(i1):             return False, None, ""
     i2_body_top    = max(i2["open"], i2["close"])
     i2_body_bottom = min(i2["open"], i2["close"])
     i1_body_top    = max(i1["open"], i1["close"])
     i1_body_bottom = min(i1["open"], i1["close"])
     if not (i1_body_top <= i2_body_top and i1_body_bottom >= i2_body_bottom):
         return False, None, ""
-
-    if not is_bullish(signal): return False, None, ""
-    if signal["close"] <= i1["close"]: return False, None, ""
-
-    pattern_low = min(i2["low"], i1["low"])
+    if not is_bullish(signal):             return False, None, ""
+    if signal["close"] <= i1["close"]:     return False, None, ""
     sc = signal.copy()
-    sc["pattern_low"] = pattern_low
-    _log("info", "BULLISH_HARAMI", f"Bullish Harami pattern detected")
+    sc["pattern_low"] = min(i2["low"], i1["low"])
+    _log("info", "BULLISH_HARAMI", "Bullish Harami pattern detected")
     return True, sc, "BULLISH_HARAMI"
 
 
@@ -988,11 +1183,11 @@ def check_short_signal(
     candles: List[dict], symbol: str = "",
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     closed_candles = candles[:-1]
-    rsi_passes, rsi_value = check_rsi_filter(closed_candles, symbol=symbol,
-                                              period=RSI_PERIOD, threshold=RSI_OVERBOUGHT)
+    rsi_passes, rsi_value = check_rsi_filter(
+        closed_candles, symbol=symbol, period=RSI_PERIOD, threshold=RSI_OVERBOUGHT
+    )
     if not rsi_passes:
         return False, None, "", rsi_value
-
     for checker in (
         check_short_signal_strategy_1,
         check_short_signal_strategy_3,
@@ -1004,7 +1199,6 @@ def check_short_signal(
             _log("info", "SIGNAL",
                  f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
             return True, signal_candle, strategy, rsi_value
-
     return False, None, "", rsi_value
 
 
@@ -1015,12 +1209,9 @@ def check_long_signal(
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
     if rsi is None:
         return False, None, "", None
-
     if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
-
     _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
-
     for checker in (
         check_long_signal_strategy_1,
         check_long_signal_strategy_3,
@@ -1032,7 +1223,6 @@ def check_long_signal(
             _log("info", "SIGNAL",
                  f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
             return True, signal_candle, strategy, rsi
-
     return False, None, "", rsi
 
 
@@ -1048,7 +1238,7 @@ class SymbolValidator:
     def validate_trading_symbol(self, symbol: str) -> Tuple[Optional[str], str]:
         trading_sym = to_trading_symbol(symbol)
         if trading_sym in self.product_map:
-            return trading_sym, f"OK"
+            return trading_sym, "OK"
         matches = difflib.get_close_matches(trading_sym, self.known_symbols, n=3, cutoff=0.5)
         if matches:
             best = matches[0]
@@ -1076,19 +1266,19 @@ class SymbolValidator:
 
 def get_time_range(num_candles: int, timeframe_minutes: int) -> Tuple[int, int]:
     secs_per_candle = timeframe_minutes * 60
-    now         = int(time.time())
-    aligned_now = (now // secs_per_candle) * secs_per_candle
-    safe_end    = aligned_now - (CANDLE_SAFETY_SHIFT * secs_per_candle)
-    start       = safe_end - (num_candles * secs_per_candle)
-    start       = max(1, start)
-    safe_end    = max(secs_per_candle * (CANDLE_SAFETY_SHIFT + 1), safe_end)
+    now             = int(time.time())
+    aligned_now     = (now // secs_per_candle) * secs_per_candle
+    safe_end        = aligned_now - (CANDLE_SAFETY_SHIFT * secs_per_candle)
+    start           = safe_end - (num_candles * secs_per_candle)
+    start           = max(1, start)
+    safe_end        = max(secs_per_candle * (CANDLE_SAFETY_SHIFT + 1), safe_end)
     if start >= safe_end:
         raise ValueError(f"start={start} >= end={safe_end}")
     return start, safe_end
 
 
 def get_time_range_with_retry_shift(
-    num_candles: int, timeframe_minutes: int, shift_candles: int = 0
+    num_candles: int, timeframe_minutes: int, shift_candles: int = 0,
 ) -> Tuple[int, int]:
     start, end = get_time_range(num_candles, timeframe_minutes)
     if shift_candles > 0:
@@ -1125,11 +1315,11 @@ def _extract_price(src: dict, long_key: str, short_key: str) -> Optional[float]:
 def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
     ts = _extract_timestamp(row)
     if ts <= 0: return None
-    o = _extract_price(row, "open", "o")
-    h = _extract_price(row, "high", "h")
-    l = _extract_price(row, "low",  "l")
-    c = _extract_price(row, "close", "c")
-    v = _extract_price(row, "volume", "v") or 0.0
+    o  = _extract_price(row, "open",   "o")
+    h  = _extract_price(row, "high",   "h")
+    l  = _extract_price(row, "low",    "l")
+    c  = _extract_price(row, "close",  "c")
+    v  = _extract_price(row, "volume", "v") or 0.0
     if any(x is None for x in (o, h, l, c)): return None
     return {"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
 
@@ -1147,13 +1337,13 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 
 # ================================================================
-#  18. DELTA REST CLIENT (UPDATED WITH RETRY LOGIC)
+#  18. DELTA REST CLIENT
 # ================================================================
 
 class DeltaREST:
     def __init__(self, api_key: str = "", api_secret: str = ""):
-        self.api_key    = api_key
-        self.api_secret = api_secret
+        self.api_key         = api_key
+        self.api_secret      = api_secret
         self.request_handler = APIRequestHandler(api_key, api_secret)
         self._tick_sizes: Dict[str, float] = {}
 
@@ -1193,7 +1383,9 @@ class DeltaREST:
         return self._tick_sizes.get(symbol, 0.01)
 
     def get_order(self, order_id: int) -> Optional[dict]:
-        result = self.request_handler.request("GET", f"/v2/orders/{order_id}", endpoint_type="private")
+        result = self.request_handler.request(
+            "GET", f"/v2/orders/{order_id}", endpoint_type="private"
+        )
         if result and "result" in result:
             return result["result"]
         return None
@@ -1217,20 +1409,24 @@ class DeltaREST:
         return False, 0
 
     def place_order(self, product_id: int, side: str, size: int,
-                    order_type: str = "market_order", limit_price: Optional[float] = None) -> dict:
+                    order_type: str = "market_order",
+                    limit_price: Optional[float] = None) -> dict:
         if side not in ("buy", "sell"): return {"error": "invalid_side"}
-        if size < 1: return {"error": "invalid_size"}
-        body: Dict = {"product_id": product_id, "size": size, "side": side, "order_type": order_type}
+        if size < 1:                    return {"error": "invalid_size"}
+        body: Dict = {"product_id": product_id, "size": size,
+                      "side": side, "order_type": order_type}
         if limit_price and order_type == "limit_order":
             body["limit_price"] = str(limit_price)
-        result = self.request_handler.request("POST", "/v2/orders", endpoint_type="private", body=body)
+        result = self.request_handler.request(
+            "POST", "/v2/orders", endpoint_type="private", body=body
+        )
         return result or {"error": "no_response"}
 
     def place_take_profit_only(self, product_id: int, tp_price: float, symbol: str = "") -> dict:
         """Place ONLY a take-profit bracket order (no stop loss)."""
         if tp_price <= 0:
             return {"error": "invalid_tp_price"}
-        tick_size = self.get_tick_size(symbol) if symbol else 0.01
+        tick_size  = self.get_tick_size(symbol) if symbol else 0.01
         rounded_tp = round_to_tick(tp_price, tick_size)
         body: Dict = {
             "product_id": product_id,
@@ -1240,14 +1436,34 @@ class DeltaREST:
             },
             "bracket_take_profit_trigger_method": "last_traded_price",
         }
-        _log("info", "BRACKET-TP", f"Placing bracket TP only: pid={product_id} tp={rounded_tp}")
-        result = self.request_handler.request("POST", "/v2/orders/bracket",
-                                               endpoint_type="private", body=body)
+        _log("info", "BRACKET-TP",
+             f"Placing bracket TP only: pid={product_id} tp={rounded_tp}")
+        result = self.request_handler.request(
+            "POST", "/v2/orders/bracket", endpoint_type="private", body=body
+        )
         return result or {"error": "no_response"}
+
+    def cancel_bracket_tp(self, product_id: int) -> bool:
+        """Cancel an existing bracket/TP order for the product (best-effort)."""
+        try:
+            result = self.request_handler.request(
+                "DELETE", "/v2/orders/bracket",
+                endpoint_type="private",
+                body={"product_id": product_id},
+            )
+            if result and "error" not in result:
+                _log("info", "BRACKET-CANCEL",
+                     f"Bracket TP cancelled for product_id={product_id}")
+                return True
+        except Exception as e:
+            _log("warning", "BRACKET-CANCEL", f"Failed to cancel bracket TP: {e}")
+        return False
 
     def cancel_order(self, order_id: int, product_id: int) -> dict:
         body   = {"id": order_id, "product_id": product_id}
-        result = self.request_handler.request("DELETE", "/v2/orders", endpoint_type="private", body=body)
+        result = self.request_handler.request(
+            "DELETE", "/v2/orders", endpoint_type="private", body=body
+        )
         return result or {"error": "no_response"}
 
     def get_top_symbols(self, product_map: Dict[str, int], mode: str = "volatile",
@@ -1258,7 +1474,7 @@ class DeltaREST:
         for t in tickers:
             sym = t.get("symbol", "")
             if perp_only and "_PERP" not in sym: continue
-            if sym not in product_map: continue
+            if sym not in product_map:           continue
             try:
                 score = (abs(float(t.get("change", 0) or 0)) if mode == "volatile"
                          else float(t.get("volume", 0) or 0))
@@ -1287,15 +1503,21 @@ class DeltaREST:
         )
         timeframe_minutes = tf_entry["secs"] // 60
         api_resolution    = tf_entry["api_resolution"]
-        safe_limit = min(limit, 500)
+        safe_limit        = min(limit, 500)
         try:
-            start, end = get_time_range_with_retry_shift(safe_limit, timeframe_minutes, shift_candles)
+            start, end = get_time_range_with_retry_shift(
+                safe_limit, timeframe_minutes, shift_candles
+            )
         except ValueError as exc:
             _log("error", "CANDLES", f"Timestamp validation failed: {exc}")
             return []
-        params = {"resolution": api_resolution, "symbol": candle_symbol, "start": start, "end": end}
-        result = self.request_handler.request("GET", "/v2/history/candles",
-                                               endpoint_type="public", params=params)
+        params = {
+            "resolution": api_resolution, "symbol": candle_symbol,
+            "start": start, "end": end,
+        }
+        result = self.request_handler.request(
+            "GET", "/v2/history/candles", endpoint_type="public", params=params
+        )
         if not result: return []
         raw_result = result.get("result", [])
         if isinstance(raw_result, dict):
@@ -1317,48 +1539,42 @@ class DeltaREST:
         body   = {"leverage": str(leverage)}
         result = self.request_handler.request(
             "POST", f"/v2/products/{product_id}/orders/leverage",
-            endpoint_type="private", body=body)
+            endpoint_type="private", body=body,
+        )
         return bool(result and "result" in result)
 
     def close_position(self, product_id: int, size: int, side: str = "buy") -> dict:
-        return self.place_order(product_id=product_id, side=side, size=size, order_type="market_order")
-    
+        return self.place_order(
+            product_id=product_id, side=side, size=size, order_type="market_order"
+        )
+
     def get_position_realized_pnl(self, product_id: int) -> float:
-        """
-        Fetch realized PnL for a specific position from Delta Exchange.
-        Returns the realized PnL in USD (positive for profit, negative for loss).
-        """
         try:
             result = self.request_handler.request(
                 "GET", "/v2/positions", endpoint_type="private"
             )
             if result and "result" in result:
-                positions = result["result"]
-                for pos in positions:
+                for pos in result["result"]:
                     if pos.get("product_id") == product_id:
                         realized_pnl = float(pos.get("realized_pnl", 0))
-                        _log("info", "PNL", f"Fetched realized PnL for product_id={product_id}: ${realized_pnl:.2f}")
+                        _log("info", "PNL",
+                             f"Fetched realized PnL for product_id={product_id}: ${realized_pnl:.2f}")
                         return realized_pnl
                 _log("warning", "PNL", f"No position found for product_id={product_id}")
-            else:
-                _log("warning", "PNL", f"Failed to fetch positions: {result}")
         except Exception as e:
             _log("error", "PNL", f"Error fetching realized PnL: {e}")
         return 0.0
-    
+
     def get_order_realized_pnl(self, order_id: int) -> float:
-        """
-        Fetch realized PnL for a specific closed order.
-        Returns the realized PnL in USD (positive for profit, negative for loss).
-        """
         try:
             result = self.request_handler.request(
                 "GET", f"/v2/orders/{order_id}", endpoint_type="private"
             )
             if result and "result" in result:
-                order = result["result"]
+                order        = result["result"]
                 realized_pnl = float(order.get("realized_pnl", 0))
-                _log("info", "PNL", f"Fetched realized PnL for order_id={order_id}: ${realized_pnl:.2f}")
+                _log("info", "PNL",
+                     f"Fetched realized PnL for order_id={order_id}: ${realized_pnl:.2f}")
                 return realized_pnl
         except Exception as e:
             _log("error", "PNL", f"Error fetching order realized PnL: {e}")
@@ -1372,8 +1588,8 @@ class DeltaREST:
 def compute_position_size(entry_price: float, stop_loss_price: float,
                            account_balance: float, risk_pct: float,
                            leverage: int) -> Tuple[int, dict]:
-    risk_amount   = account_balance * risk_pct
-    stop_distance = abs(entry_price - stop_loss_price)
+    risk_amount    = account_balance * risk_pct
+    stop_distance  = abs(entry_price - stop_loss_price)
     if stop_distance <= 0:
         return 0, {}
     risk_size      = risk_amount / stop_distance
@@ -1384,21 +1600,21 @@ def compute_position_size(entry_price: float, stop_loss_price: float,
     max_loss_est   = final_size * stop_distance
     diag = {
         "account_balance": round(account_balance, 2), "risk_pct": round(risk_pct * 100, 2),
-        "risk_amount": round(risk_amount, 2), "entry_price": round(entry_price, 4),
+        "risk_amount":     round(risk_amount, 2),     "entry_price": round(entry_price, 4),
         "stop_loss_price": round(stop_loss_price, 4), "stop_distance": round(stop_distance, 4),
-        "risk_size_raw": round(risk_size, 4), "max_by_margin": round(max_by_margin, 4),
-        "final_size": final_size, "margin_used": round(margin_used, 2),
-        "max_loss_est": round(max_loss_est, 2), "leverage": leverage,
+        "risk_size_raw":   round(risk_size, 4),       "max_by_margin": round(max_by_margin, 4),
+        "final_size":      final_size,                "margin_used": round(margin_used, 2),
+        "max_loss_est":    round(max_loss_est, 2),    "leverage": leverage,
     }
     return final_size, diag
 
 
 def compute_take_profit(entry_price: float, stop_loss_price: float,
                          direction: str = "SHORT") -> float:
-    stop_distance = abs(entry_price - stop_loss_price)
+    stop_distance   = abs(entry_price - stop_loss_price)
     raw_tp_distance = stop_distance * TP_RR_RATIO
     max_tp_distance = entry_price * TP_MAX_PCT
-    tp_distance = min(raw_tp_distance, max_tp_distance)
+    tp_distance     = min(raw_tp_distance, max_tp_distance)
     if direction == "SHORT":
         tp = entry_price - tp_distance
     else:
@@ -1407,11 +1623,12 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
 
 
 # ================================================================
-#  20. DAILY LOSS TRACKER (UPDATED WITH RETRY LOGIC FOR REALIZED PNL)
+#  20. DAILY LOSS TRACKER
 # ================================================================
 
 class DailyLossTracker:
-    def __init__(self, trading_capital: float, limit_pct: float, notifier: Optional[GmailNotifier] = None):
+    def __init__(self, trading_capital: float, limit_pct: float,
+                 notifier: Optional[GmailNotifier] = None):
         self.trading_capital = trading_capital
         self.limit_pct       = limit_pct
         self.daily_loss_usd  = 0.0
@@ -1424,41 +1641,26 @@ class DailyLossTracker:
         if today != self._day:
             _log("info", "DAILY-LOSS", f"New day {today} — resetting daily loss counter")
             self.daily_loss_usd = 0.0
-            self._day = today
+            self._day           = today
 
     def update_with_realized_pnl(self, realized_pnl: float) -> None:
-        """
-        Update daily loss tracking using actual realized PnL from Delta Exchange.
-        
-        Args:
-            realized_pnl: Realized PnL from the trade (positive = profit, negative = loss)
-        """
         with self._lock:
             self._check_day_rollover()
             limit = self.trading_capital * self.limit_pct
-            
-            old_loss = self.daily_loss_usd
-            
             if realized_pnl < 0:
-                # Loss: add to daily loss total
                 loss_amount = abs(realized_pnl)
                 self.daily_loss_usd += loss_amount
                 _log("warning", "DAILY-LOSS",
                      f"Realized loss: ${loss_amount:.2f} | "
                      f"Daily loss total: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
             else:
-                # Profit: reduce daily loss total (can't go below zero)
                 profit_amount = realized_pnl
                 self.daily_loss_usd = max(0.0, self.daily_loss_usd - profit_amount)
                 _log("info", "DAILY-LOSS",
                      f"Realized profit: ${profit_amount:.2f} | "
                      f"Daily loss total reduced to: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
-            
-            # Send warning if near limit (80% or more)
             if self.notifier and self.daily_loss_usd >= limit * 0.8:
                 self.notifier.send_daily_loss_warning(self.daily_loss_usd, limit)
-            
-            # Send notification if limit is hit (100% or more)
             if self.notifier and self.daily_loss_usd >= limit:
                 self.notifier.send_daily_limit_hit(self.daily_loss_usd, limit)
 
@@ -1476,18 +1678,35 @@ class DailyLossTracker:
         with self._lock:
             self._check_day_rollover()
             limit = self.trading_capital * self.limit_pct
-            if limit > 0:
-                pct = (self.daily_loss_usd / limit * 100) if limit > 0 else 0
-            else:
-                pct = 0
+            pct   = (self.daily_loss_usd / limit * 100) if limit > 0 else 0
             return f"Daily loss: ${self.daily_loss_usd:.2f} / ${limit:.2f} ({pct:.1f}%)"
 
 
 # ================================================================
-#  21. TRADING BOT (UPDATED WITH ORDER-FIRST PNL AND RETRY LOOP)
+#  21. TRADING BOT  (v12.0 — dual SuperTrend TP extension)
 # ================================================================
 
 class TradingBot:
+    """
+    Key SuperTrend behaviour added in v12.0:
+
+    After taking entry:
+    ─ On every CLOSED candle, both ST(14,2) and ST(21,1) are evaluated.
+    ─ If BOTH confirm the trade direction (both RED for SHORT, both GREEN for LONG)
+      AND this is the first time this condition is detected for the trade:
+        • A Gmail alert is sent: "Strong down/up trend — SuperTrend confirmed"
+        • The existing bracket-TP is cancelled (live mode).
+        • The trade is flagged `st_mode = True`.
+        • Normal fixed-ratio TP no longer triggers for this trade.
+
+    While in st_mode:
+    ─ On every CLOSED candle, check if BOTH SuperTrends have REVERSED direction.
+    ─ If the reversal is detected:
+        • Position is closed at market (or bracket TP cancellation + close).
+        • Gmail exit alert is sent.
+        • Realized PnL is fetched and daily-loss tracker updated.
+    """
+
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
         self.config          = config
         self.notifier        = notifier
@@ -1499,10 +1718,8 @@ class TradingBot:
         self.trading_capital = float(config.get("trading_capital", 0.0))
         self.risk_pct        = config["risk_pct"] / 100.0
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
-        
-        # NEW: Direction filters
-        self.enable_short = config.get("enable_short", True)
-        self.enable_long = config.get("enable_long", True)
+        self.enable_short    = config.get("enable_short", True)
+        self.enable_long     = config.get("enable_long", True)
 
         self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
         self.timeframe      = self._tf.key
@@ -1516,7 +1733,7 @@ class TradingBot:
         self.product_map:  Dict[str, int]   = {}
         self.candle_store: Dict[str, deque] = {}
 
-        self._trade_lock   = threading.Lock()
+        self._trade_lock    = threading.Lock()
         self.active_trades: Dict[str, dict] = {}
 
         self.signals:   List[dict] = []
@@ -1542,130 +1759,217 @@ class TradingBot:
             try: self.on_log_callback(f"[{tag}] {msg}", level)
             except Exception: pass
 
-    def _get_realized_pnl_for_trade(self, trade: dict, max_retries: int = 5, retry_delay: float = 1.0) -> float:
-        """
-        Get the actual realized PnL for a closed trade from Delta Exchange.
-        PRIORITY: order_id first (safer for multiple concurrent trades), then product_id fallback.
-        Includes retry loop to ensure Delta has updated the PnL after position close.
-        
-        Args:
-            trade: Trade record containing order_id and product_id
-            max_retries: Number of retry attempts (default 5)
-            retry_delay: Seconds between retries (default 1.0)
-        
-        Returns:
-            Realized PnL in USD (positive = profit, negative = loss)
-        """
+    # ─── PnL helpers ───────────────────────────────────────────
+
+    def _get_realized_pnl_for_trade(self, trade: dict,
+                                     max_retries: int = 5,
+                                     retry_delay: float = 1.0) -> float:
         if self.paper:
-            # For paper trading, use the stored exit price
             exit_price = trade.get("exit_price")
-            entry = trade.get("entry")
-            size = trade.get("size", 0)
-            direction = trade.get("direction", "SHORT")
-            
+            entry      = trade.get("entry")
+            size       = trade.get("size", 0)
+            direction  = trade.get("direction", "SHORT")
             if exit_price and entry and size > 0:
-                if direction == "SHORT":
-                    pnl = (entry - exit_price) * size
-                else:
-                    pnl = (exit_price - entry) * size
-                return pnl
+                return (entry - exit_price) * size if direction == "SHORT" \
+                       else (exit_price - entry) * size
             return 0.0
-        
-        # Live trading: fetch from Delta Exchange with retry
-        order_id = trade.get("order_id")
+
+        order_id   = trade.get("order_id")
         product_id = trade.get("product_id")
-        
-        # PRIORITY 1: Try order-specific PnL first (more accurate for concurrent trades)
+
         if order_id:
             for attempt in range(1, max_retries + 1):
                 pnl = self.rest.get_order_realized_pnl(order_id)
                 if pnl != 0:
-                    _log("info", "PNL", f"Retrieved realized PnL from order_id {order_id} (attempt {attempt}): ${pnl:.2f}")
+                    _log("info", "PNL",
+                         f"Retrieved realized PnL from order_id {order_id} (attempt {attempt}): ${pnl:.2f}")
                     return pnl
                 if attempt < max_retries:
-                    _log("warning", "PNL", f"Order_id {order_id} returned PnL=0 (attempt {attempt}/{max_retries}), retrying in {retry_delay}s...")
+                    _log("warning", "PNL",
+                         f"Order_id {order_id} returned PnL=0 (attempt {attempt}/{max_retries}), "
+                         f"retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
-            _log("warning", "PNL", f"Could not fetch realized PnL from order_id {order_id} after {max_retries} attempts")
-        
-        # PRIORITY 2: Fall back to position-based PnL
+            _log("warning", "PNL",
+                 f"Could not fetch realized PnL from order_id {order_id} after {max_retries} attempts")
+
         if product_id:
             for attempt in range(1, max_retries + 1):
                 pnl = self.rest.get_position_realized_pnl(product_id)
                 if pnl != 0:
-                    _log("info", "PNL", f"Retrieved realized PnL from product_id {product_id} (fallback, attempt {attempt}): ${pnl:.2f}")
+                    _log("info", "PNL",
+                         f"Retrieved realized PnL from product_id {product_id} "
+                         f"(fallback, attempt {attempt}): ${pnl:.2f}")
                     return pnl
                 if attempt < max_retries:
-                    _log("warning", "PNL", f"Product_id {product_id} returned PnL=0 (attempt {attempt}/{max_retries}), retrying in {retry_delay}s...")
+                    _log("warning", "PNL",
+                         f"Product_id {product_id} returned PnL=0 (attempt {attempt}/{max_retries}), "
+                         f"retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
-            _log("warning", "PNL", f"Could not fetch realized PnL from product_id {product_id} after {max_retries} attempts")
-        
-        _log("error", "PNL", f"Could not fetch realized PnL for trade: order_id={order_id}, product_id={product_id}")
+            _log("warning", "PNL",
+                 f"Could not fetch realized PnL from product_id {product_id} after {max_retries} attempts")
+
+        _log("error", "PNL",
+             f"Could not fetch realized PnL for trade: order_id={order_id}, product_id={product_id}")
         return 0.0
 
-    def _close_trade(self, symbol: str, trade: dict, reason: str) -> None:
-        """Helper to close a trade and cleanup."""
-        entry = trade["entry"]
+    # ─── Trade close helper ────────────────────────────────────
+
+    def _close_trade(self, symbol: str, trade: dict, reason: str,
+                     exit_price: Optional[float] = None) -> None:
+        entry     = trade["entry"]
         direction = trade.get("direction", "SHORT")
-        
-        _log("info", "TRADE-CLOSE", f"Closing trade: {symbol} {direction} | Reason: {reason}")
-        
-        # For live trading, close the position on Delta first
+
+        _log("info", "TRADE-CLOSE",
+             f"Closing trade: {symbol} {direction} | Reason: {reason}")
+
         if not self.paper:
-            pid = trade.get("product_id")
+            pid  = trade.get("product_id")
             size = trade.get("size", 1)
             if pid and size > 0:
                 close_side = "buy" if direction == "SHORT" else "sell"
-                close_result = self.rest.close_position(pid, size, side=close_side)
-                _log("info", "TRADE-CLOSE", f"Closed position on Delta: product_id={pid}, size={size}, side={close_side}")
-                # Give Delta a moment to process the close
+                self.rest.close_position(pid, size, side=close_side)
+                _log("info", "TRADE-CLOSE",
+                     f"Closed position on Delta: product_id={pid}, size={size}, side={close_side}")
                 time.sleep(1)
-        
-        # Get actual realized PnL from Delta Exchange with retry logic
+
         realized_pnl = self._get_realized_pnl_for_trade(trade)
-        
-        # Update trade record with exit info
+
         trade["close_reason"] = reason
-        trade["close_time"] = datetime.now(timezone.utc).isoformat()
+        trade["close_time"]   = datetime.now(timezone.utc).isoformat()
         trade["realized_pnl"] = realized_pnl
-        
-        # Record the trade close event
-        if reason == "TAKE_PROFIT":
-            tp = trade.get("take_profit")
+
+        if reason in ("TAKE_PROFIT", "ST_EXIT"):
+            tp = exit_price or trade.get("take_profit")
             trade["exit_price"] = tp
             self.tp_events.append({
-                "time": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "entry": entry, "take_profit": tp,
-                "direction": direction, "realized_pnl": realized_pnl,
+                "time":         datetime.now(timezone.utc).isoformat(),
+                "symbol":       symbol, "entry": entry,
+                "take_profit":  tp,     "direction": direction,
+                "realized_pnl": realized_pnl, "reason": reason,
             })
         else:  # STOP_LOSS
             sl = trade["stop_loss"]
             trade["exit_price"] = sl
             self.sl_events.append({
-                "time": datetime.now(timezone.utc).isoformat(), 
-                "symbol": symbol, "entry": entry, "stop_loss": sl,
-                "direction": direction, "realized_pnl": realized_pnl,
+                "time":         datetime.now(timezone.utc).isoformat(),
+                "symbol":       symbol, "entry": entry,
+                "stop_loss":    sl,     "direction": direction,
+                "realized_pnl": realized_pnl,
             })
-        
-        # Update daily loss tracker with ACTUAL realized PnL
+
         self.daily_loss_tracker.update_with_realized_pnl(realized_pnl)
-        
-        # Log detailed PnL information
+
         limit = self.trading_capital * self.daily_loss_limit_pct
         _log("info", "TRADE-CLOSE",
              f"Trade Closed: {symbol} {direction} | Reason: {reason} | "
              f"Realized PnL: ${realized_pnl:.2f} | "
              f"Daily Loss Total: ${self.daily_loss_tracker.daily_loss_usd:.2f} | "
              f"Daily Loss Limit: ${limit:.2f}")
-        
-        # Send notification
+
         if self.notifier:
-            trade_copy = trade.copy()
-            trade_copy["symbol"] = symbol
-            self.notifier.send_trade_closed(trade_copy, reason, abs(realized_pnl))
-        
+            if reason == "ST_EXIT":
+                ep = trade.get("exit_price", entry)
+                self.notifier.send_supertrend_exit(
+                    symbol=symbol, direction=direction, entry=entry,
+                    exit_price=ep if ep else entry,
+                    realized_pnl=realized_pnl,
+                    timeframe=self.timeframe,
+                    mode="PAPER" if self.paper else "LIVE",
+                )
+            else:
+                trade_copy = trade.copy()
+                trade_copy["symbol"] = symbol
+                self.notifier.send_trade_closed(trade_copy, reason, abs(realized_pnl))
+
         self._cleanup_trade(symbol)
 
-    # ─────────────────── Start / Stop ───────────────────
+    def _cleanup_trade(self, symbol: str) -> None:
+        with self._trade_lock:
+            self.active_trades.pop(symbol, None)
+        self._log("info", "CLEANUP", f"Trade record removed for {symbol}")
+
+    # ─── SuperTrend evaluation on closed candle ────────────────
+
+    def _check_supertrend_conditions(self, symbol: str, closed_candles: List[dict]) -> None:
+        """
+        Called on every new CLOSED candle for symbols with an active trade.
+        Handles both:
+          1. ST confirmation → upgrade to st_mode (send alert, change TP logic)
+          2. ST reversal     → exit trade (while in st_mode)
+        """
+        trade = self.active_trades.get(symbol)
+        if not trade or "_reserved" in trade:
+            return
+
+        direction = trade.get("direction", "SHORT")
+        entry     = trade.get("entry", 0)
+        st_mode   = trade.get("st_mode", False)      # True once both STs confirmed
+
+        # Need enough candles for ST(21) → at least 23 closed candles
+        if len(closed_candles) < ST2_LENGTH + 2:
+            return
+
+        bearish_now = both_supertrends_bearish(closed_candles)
+        bullish_now = both_supertrends_bullish(closed_candles)
+
+        # ── 1. Not yet in ST mode → check if both STs NOW confirm direction ──
+        if not st_mode:
+            confirmed = (
+                (direction == "SHORT" and bearish_now) or
+                (direction == "LONG"  and bullish_now)
+            )
+            if confirmed:
+                st1_val, st2_val = get_supertrend_values(closed_candles)
+                trade["st_mode"]         = True
+                trade["st_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+
+                # Cancel existing fixed-ratio bracket TP (live only)
+                if not self.paper:
+                    pid = trade.get("product_id")
+                    if pid:
+                        self.rest.cancel_bracket_tp(pid)
+
+                trend_label = "📉 STRONG DOWN TREND" if direction == "SHORT" else "📈 STRONG UP TREND"
+                print()
+                print(f"  [SUPERTREND CONFIRMED] {symbol} {trend_label}")
+                print(f"    Both ST(14,2) + ST(21,1) {'RED' if direction=='SHORT' else 'GREEN'}")
+                print(f"    Entry: {entry:.4f}")
+                print(f"    ST(14,2) value: {st1_val:.4f}" if st1_val else "    ST(14,2): N/A")
+                print(f"    ST(21,1) value: {st2_val:.4f}" if st2_val else "    ST(21,1): N/A")
+                print(f"    TP CHANGED → Will exit when BOTH SuperTrends reverse direction")
+                print()
+
+                _log("info", "ST-CONFIRM",
+                     f"[{symbol}] {direction} trade — Both SuperTrends confirmed. "
+                     f"Switched to ST-mode exit.")
+
+                if self.notifier:
+                    self.notifier.send_supertrend_strong(
+                        symbol=symbol, direction=direction, entry=entry,
+                        new_tp=0.0,   # price-based exit, not a fixed level
+                        st1=st1_val or 0.0, st2=st2_val or 0.0,
+                        timeframe=self.timeframe,
+                        mode="PAPER" if self.paper else "LIVE",
+                    )
+
+        # ── 2. Already in ST mode → watch for REVERSAL ───────────────────
+        else:
+            reversed_trend = (
+                (direction == "SHORT" and bullish_now) or   # was SHORT, both ST now GREEN
+                (direction == "LONG"  and bearish_now)      # was LONG,  both ST now RED
+            )
+            if reversed_trend:
+                _log("info", "ST-EXIT",
+                     f"[{symbol}] {direction} — Both SuperTrends REVERSED. "
+                     "Closing trade via ST exit.")
+                print()
+                print(f"  [ST REVERSAL EXIT] {symbol} {direction}")
+                flip_label = "both GREEN" if direction == "SHORT" else "both RED"
+                print(f"    SuperTrends flipped {flip_label} — closing position")
+                print()
+                self._close_trade(symbol, trade, "ST_EXIT")
+
+    # ─── Start / Stop ──────────────────────────────────────────
 
     def start(self) -> None:
         self.running = True
@@ -1689,8 +1993,9 @@ class TradingBot:
 
         raw_syms = self.config.get("symbols", [])
         if not raw_syms:
-            raw_syms = self.rest.get_top_symbols(self.product_map, mode="volatile",
-                                                  limit=5, perp_only=True) or []
+            raw_syms = self.rest.get_top_symbols(
+                self.product_map, mode="volatile", limit=5, perp_only=True
+            ) or []
 
         validator    = SymbolValidator(self.product_map)
         self.symbols = validator.validate_list(raw_syms)
@@ -1708,10 +2013,10 @@ class TradingBot:
                 if pid: self.rest.set_leverage(pid, self.leverage)
 
         self._print_startup_summary()
-        
+
         if self.notifier:
             self.notifier.send_startup_report(self.config, self.symbols)
-        
+
         self._fetch_all_historical()
         self._start_ws()
 
@@ -1720,22 +2025,24 @@ class TradingBot:
         if self.ws_manager: self.ws_manager.stop()
         self._log("info", "BOT", "Bot stopped.")
 
-    # ─────────────────── Historical load ───────────────────
+    # ─── Historical load ───────────────────────────────────────
 
     def _fetch_all_historical(self) -> None:
         self._log("info", "CANDLES",
-                  f"Loading {CANDLE_LIMIT} candles x {self.timeframe} for {len(self.symbols)} symbol(s)")
+                  f"Loading {CANDLE_LIMIT} candles x {self.timeframe} "
+                  f"for {len(self.symbols)} symbol(s)")
         for sym in self.symbols:
             candles = self.rest.get_candles_with_retry(sym, self.api_resolution, CANDLE_LIMIT)
             if candles:
                 for c in candles:
                     self.candle_store[sym].append(c)
                 self._log("info", "CANDLES",
-                          f"  [OK] {sym}: {len(candles)} candles loaded | last_close={candles[-1]['close']:.4f}")
+                          f"  [OK] {sym}: {len(candles)} candles loaded | "
+                          f"last_close={candles[-1]['close']:.4f}")
             else:
                 self._log("warning", "CANDLES", f"  [WARN] {sym}: 0 candles after retries.")
 
-    # ─────────────────── WebSocket ───────────────────
+    # ─── WebSocket ─────────────────────────────────────────────
 
     def _start_ws(self) -> None:
         self.ws_manager = DeltaWebSocket()
@@ -1775,107 +2082,120 @@ class TradingBot:
                 store.append(c)
                 existing_ts.add(c["time"])
 
-    # ─────────────────── Candle processing ───────────────────
+    # ─── Candle processing ─────────────────────────────────────
 
     def process_candle(self, symbol: str, candle: dict) -> None:
         store = self.candle_store.get(symbol)
         if store is None: return
         if not validate_candle(candle, symbol): return
 
-        # Case 1: LIVE UPDATE (same timestamp = intra-candle)
+        # ── LIVE UPDATE (same timestamp = intra-candle) ───────
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
             if symbol in self.active_trades:
-                # ONLY check TAKE PROFIT on live updates (immediate execution on price touch)
-                self._check_take_profit(symbol, candle)
-            return  # ← EARLY RETURN - NO STOP LOSS CHECK during live updates
+                trade = self.active_trades.get(symbol)
+                # Only check price-touch TP when NOT in st_mode
+                if trade and not trade.get("st_mode", False):
+                    self._check_take_profit(symbol, candle)
+            return
 
-        # Case 2: NEW CANDLE ARRIVED (previous candle is now CLOSED)
+        # ── NEW CANDLE (previous candle is fully CLOSED) ──────
         if store:
-            closed_candle = store[-1]  # ← This is the FULLY CLOSED candle
+            closed_candle  = store[-1]
+            closed_candles = list(store)   # includes the just-closed candle
+
             self._log("info", "CANDLE-CLOSED",
-                      f"{symbol} [{self.timeframe}] O={closed_candle['open']:.2f} "
-                      f"H={closed_candle['high']:.2f} L={closed_candle['low']:.2f} C={closed_candle['close']:.2f}")
+                      f"{symbol} [{self.timeframe}] "
+                      f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
+                      f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f}")
 
-            # Check STOP LOSS on the closed candle (only triggers on candle close)
             if symbol in self.active_trades:
-                self._check_stop_loss_on_close(symbol, closed_candle)
+                trade = self.active_trades.get(symbol)
+                if trade and not trade.get("_reserved"):
+                    # SuperTrend evaluation runs on every closed candle
+                    self._check_supertrend_conditions(symbol, closed_candles)
 
-            # Check for new signals on closed candle
+                    # Re-fetch trade in case ST-exit already closed it
+                    trade = self.active_trades.get(symbol)
+                    if trade and not trade.get("_reserved"):
+                        st_mode = trade.get("st_mode", False)
+                        if not st_mode:
+                            # Normal SL check (candle close)
+                            self._check_stop_loss_on_close(symbol, closed_candle)
+
+            # New entry signals (only when not in a trade)
             if symbol not in self.active_trades:
                 if self.daily_loss_tracker.is_limit_reached():
                     self._log("warning", "DAILY-LOSS",
                               f"[{symbol}] Skipping signal check — daily loss limit hit")
                 else:
-                    # Check SHORT signals only if enabled
+                    candle_list = list(store) + [candle]   # include live candle as last
+
                     if self.enable_short:
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
-                            list(store), symbol=symbol
+                            candle_list, symbol=symbol
                         )
                         if triggered and signal_candle is not None:
-                            self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "SHORT")
-                    
-                    # Check LONG signals only if enabled (and only if no short signal was taken)
+                            self._on_signal(symbol, signal_candle, strategy_name,
+                                            rsi_value, "SHORT")
+
                     if self.enable_long and symbol not in self.active_trades:
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
-                            list(store), symbol=symbol
+                            candle_list, symbol=symbol
                         )
                         if triggered and signal_candle is not None:
-                            self._on_signal(symbol, signal_candle, strategy_name, rsi_value, "LONG")
+                            self._on_signal(symbol, signal_candle, strategy_name,
+                                            rsi_value, "LONG")
 
-        # Add the new candle to store
         store.append(candle)
 
     def _check_take_profit(self, symbol: str, candle: dict) -> None:
-        """Check TP on intra-candle updates (immediate execution on price touch)."""
+        """Check fixed-ratio TP on intra-candle updates (price touch). Not used in st_mode."""
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade: return
-        
-        tp = trade.get("take_profit")
-        if tp is None: return
-        
+        if trade.get("st_mode", False): return   # ST-mode uses candle-close reversal only
+
+        tp        = trade.get("take_profit")
         direction = trade.get("direction", "SHORT")
-        entry = trade["entry"]
-        
-        # TP triggers on PRICE TOUCH (using low/high, NOT close)
+        entry     = trade["entry"]
+        if tp is None: return
+
         if direction == "SHORT" and candle["low"] <= tp:
             self._log("info", "TP-HIT",
-                      f"TAKE PROFIT HIT (intra-candle) | {symbol} | entry={entry:.4f} tp={tp:.4f} low={candle['low']:.4f}")
-            self._close_trade(symbol, trade, "TAKE_PROFIT")
+                      f"TAKE PROFIT HIT (intra-candle) | {symbol} | "
+                      f"entry={entry:.4f} tp={tp:.4f} low={candle['low']:.4f}")
+            self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=tp)
+
         elif direction == "LONG" and candle["high"] >= tp:
             self._log("info", "TP-HIT",
-                      f"TAKE PROFIT HIT (intra-candle) | {symbol} | entry={entry:.4f} tp={tp:.4f} high={candle['high']:.4f}")
-            self._close_trade(symbol, trade, "TAKE_PROFIT")
+                      f"TAKE PROFIT HIT (intra-candle) | {symbol} | "
+                      f"entry={entry:.4f} tp={tp:.4f} high={candle['high']:.4f}")
+            self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=tp)
 
     def _check_stop_loss_on_close(self, symbol: str, closed_candle: dict) -> None:
-        """Check SL only on FULLY CLOSED candles."""
+        """Check SL only on FULLY CLOSED candles. Not used once ST-mode is active."""
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade: return
-        
-        sl = trade["stop_loss"]
-        direction = trade.get("direction", "SHORT")
-        entry = trade["entry"]
+        if trade.get("st_mode", False): return   # no SL check in ST mode
+
+        sl          = trade["stop_loss"]
+        direction   = trade.get("direction", "SHORT")
+        entry       = trade["entry"]
         close_price = closed_candle["close"]
-        
-        sl_hit = False
+
         if direction == "SHORT" and close_price >= sl:
-            sl_hit = True
             self._log("info", "SL-CLOSE",
-                      f"STOP LOSS HIT (candle close) | {symbol} SHORT | close={close_price:.4f} >= sl={sl:.4f}")
-        elif direction == "LONG" and close_price <= sl:
-            sl_hit = True
-            self._log("info", "SL-CLOSE",
-                      f"STOP LOSS HIT (candle close) | {symbol} LONG | close={close_price:.4f} <= sl={sl:.4f}")
-        
-        if sl_hit:
+                      f"STOP LOSS HIT (candle close) | {symbol} SHORT | "
+                      f"close={close_price:.4f} >= sl={sl:.4f}")
             self._close_trade(symbol, trade, "STOP_LOSS")
 
-    def _cleanup_trade(self, symbol: str) -> None:
-        with self._trade_lock:
-            self.active_trades.pop(symbol, None)
-        self._log("info", "CLEANUP", f"Trade record removed for {symbol}")
+        elif direction == "LONG" and close_price <= sl:
+            self._log("info", "SL-CLOSE",
+                      f"STOP LOSS HIT (candle close) | {symbol} LONG | "
+                      f"close={close_price:.4f} <= sl={sl:.4f}")
+            self._close_trade(symbol, trade, "STOP_LOSS")
 
-    # ─────────────────── Signal handler ───────────────────
+    # ─── Signal handler ────────────────────────────────────────
 
     def _on_signal(self, symbol: str, signal_candle: dict, strategy_name: str,
                    rsi_value: Optional[float], direction: str = "SHORT") -> None:
@@ -1884,27 +2204,23 @@ class TradingBot:
         if direction == "SHORT":
             if strategy_name == "BEARISH_DOJI" and "doji_high" in signal_candle:
                 sl = signal_candle["doji_high"]
-            elif strategy_name in ("STRATEGY_1_SHORT", "STRATEGY_3_SHORT", "BEARISH_HARAMI") and "pattern_high" in signal_candle:
+            elif strategy_name in ("STRATEGY_1_SHORT", "STRATEGY_3_SHORT",
+                                    "BEARISH_HARAMI") and "pattern_high" in signal_candle:
                 sl = signal_candle["pattern_high"]
             else:
                 store = self.candle_store.get(symbol)
-                if store and len(store) >= 2:
-                    prev = list(store)[-2]
-                    sl = prev["high"]
-                else:
-                    sl = signal_candle["high"]
+                sl    = list(store)[-2]["high"] if store and len(store) >= 2 \
+                        else signal_candle["high"]
         else:
             if strategy_name == "BULLISH_DOJI" and "doji_low" in signal_candle:
                 sl = signal_candle["doji_low"]
-            elif strategy_name in ("STRATEGY_1_LONG", "BULLISH_ENGULFING", "BULLISH_HARAMI") and "pattern_low" in signal_candle:
+            elif strategy_name in ("STRATEGY_1_LONG", "BULLISH_ENGULFING",
+                                    "BULLISH_HARAMI") and "pattern_low" in signal_candle:
                 sl = signal_candle["pattern_low"]
             else:
                 store = self.candle_store.get(symbol)
-                if store and len(store) >= 2:
-                    prev = list(store)[-2]
-                    sl = prev["low"]
-                else:
-                    sl = signal_candle["low"]
+                sl    = list(store)[-2]["low"] if store and len(store) >= 2 \
+                        else signal_candle["low"]
 
         if abs(sl - entry) == 0:
             self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} — skip")
@@ -1913,10 +2229,9 @@ class TradingBot:
         tp = compute_take_profit(entry, sl, direction)
 
         with self._trade_lock:
-            if len(self.active_trades) >= self.max_trades:
-                return
-            if symbol in self.active_trades:
-                return
+            if len(self.active_trades) >= self.max_trades: return
+            if symbol in self.active_trades:               return
+
             risk_usd = round(self.trading_capital * self.risk_pct, 2)
             signal = {
                 "time":            datetime.now(timezone.utc).isoformat(),
@@ -1938,11 +2253,12 @@ class TradingBot:
 
             if self.paper:
                 self.active_trades[symbol] = {
-                    "entry": entry, "stop_loss": sl, "take_profit": tp,
-                    "direction": direction, "size": 0,
+                    "entry":      entry, "stop_loss": sl, "take_profit": tp,
+                    "direction":  direction, "size": 0,
                     "product_id": self.product_map.get(symbol),
-                    "open_time": datetime.now(timezone.utc).isoformat(),
-                    "strategy": strategy_name, "rsi": rsi_value,
+                    "open_time":  datetime.now(timezone.utc).isoformat(),
+                    "strategy":   strategy_name, "rsi": rsi_value,
+                    "st_mode":    False,      # ← SuperTrend mode flag
                 }
 
         rsi_str   = f"{rsi_value:.2f}" if rsi_value is not None else "N/A"
@@ -1957,6 +2273,7 @@ class TradingBot:
         print(f"           Risk        : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
         print(f"           RSI(14)     : {rsi_str}")
         print(f"           Mode        : {signal['mode']}")
+        print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
         print()
 
         if self.notifier:
@@ -1969,7 +2286,7 @@ class TradingBot:
             try: self.on_signal_callback(signal)
             except Exception: pass
 
-    # ─────────────────── Live trade execution ───────────────────
+    # ─── Live trade execution ──────────────────────────────────
 
     def _execute_trade(self, symbol: str, signal: dict) -> None:
         try:
@@ -1979,24 +2296,24 @@ class TradingBot:
 
             account_balance = self.rest.get_usd_balance() or 0.0
             capital         = self.trading_capital
-            if capital <= 0: self._cleanup_trade(symbol); return
-            if account_balance < capital: capital = account_balance
-            if capital <= 0: self._cleanup_trade(symbol); return
+            if capital <= 0:                    self._cleanup_trade(symbol); return
+            if account_balance < capital:       capital = account_balance
+            if capital <= 0:                    self._cleanup_trade(symbol); return
 
             entry     = signal["entry"]
             sl        = signal["stop_loss"]
             tp        = signal["take_profit"]
             direction = signal["direction"]
             pid       = self.product_map.get(symbol)
-            if not pid: self._cleanup_trade(symbol); return
+            if not pid:                         self._cleanup_trade(symbol); return
 
-            position_size, size_diag = compute_position_size(
+            position_size, _ = compute_position_size(
                 entry_price=entry, stop_loss_price=sl,
                 account_balance=capital, risk_pct=self.risk_pct, leverage=self.leverage,
             )
-            if position_size < 1: self._cleanup_trade(symbol); return
+            if position_size < 1:               self._cleanup_trade(symbol); return
 
-            side = "sell" if direction == "SHORT" else "buy"
+            side         = "sell" if direction == "SHORT" else "buy"
             entry_result = self.rest.place_order(
                 product_id=pid, side=side, size=position_size, order_type="market_order",
             )
@@ -2015,47 +2332,53 @@ class TradingBot:
 
             if not filled or actual_filled_size < 1:
                 self._log("error", "TRADE",
-                          f"Fill not confirmed for {symbol} — attempting cancel and checking position...")
-                cancel_result = self.rest.cancel_order(order_id, pid)
+                          f"Fill not confirmed for {symbol} — attempting cancel...")
+                self.rest.cancel_order(order_id, pid)
                 self._log("error", "TRADE",
                           f"IMPORTANT: Check {symbol} position manually. order_id={order_id}")
                 self._cleanup_trade(symbol)
                 return
 
-            print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | filled={actual_filled_size} contracts")
+            print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | "
+                  f"filled={actual_filled_size} contracts")
 
-            # Place ONLY take-profit bracket order (no stop loss)
-            bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
+            # Place initial fixed-ratio bracket TP
+            bracket_result = self.rest.place_take_profit_only(
+                product_id=pid, tp_price=tp, symbol=symbol
+            )
             bracket_ok = bracket_result and "error" not in bracket_result
 
             if bracket_ok:
-                print(f"  [TP BRACKET OK] Take profit bracket placed at {tp:.4f} (triggers on price touch)")
+                print(f"  [TP BRACKET OK] Take profit bracket placed at {tp:.4f}")
                 self._log("info", "BRACKET", f"TP bracket placed for {symbol} at {tp:.4f}")
             else:
-                self._log("warning", "BRACKET", f"TP bracket FAILED for {symbol}: {bracket_result}")
+                self._log("warning", "BRACKET",
+                          f"TP bracket FAILED for {symbol}: {bracket_result}")
 
-            self._log("info", "LOCAL-SL", 
-                      f"Stop loss will be managed locally for {symbol} at {sl:.4f} (triggers on CANDLE CLOSE)")
+            self._log("info", "LOCAL-SL",
+                      f"Stop loss managed locally for {symbol} at {sl:.4f} (candle close)")
 
-            signal["executed"]     = True
-            signal["size"]         = actual_filled_size
-            signal["order_id"]     = order_id
-            signal["bracket_tp_ok"]   = bracket_ok
+            signal["executed"]      = True
+            signal["size"]          = actual_filled_size
+            signal["order_id"]      = order_id
+            signal["bracket_tp_ok"] = bracket_ok
 
             trade_record = {
-                "entry":       entry, "stop_loss": sl, "take_profit": tp,
-                "direction":   direction, "size": actual_filled_size,
-                "product_id":  pid, "order_id": order_id,
-                "open_time":   datetime.now(timezone.utc).isoformat(),
-                "strategy":    signal.get("strategy", "UNKNOWN"),
-                "rsi":         signal.get("rsi"), "bracket_tp_ok": bracket_ok,
+                "entry":          entry, "stop_loss": sl, "take_profit": tp,
+                "direction":      direction, "size": actual_filled_size,
+                "product_id":     pid, "order_id": order_id,
+                "open_time":      datetime.now(timezone.utc).isoformat(),
+                "strategy":       signal.get("strategy", "UNKNOWN"),
+                "rsi":            signal.get("rsi"),
+                "bracket_tp_ok":  bracket_ok,
+                "st_mode":        False,   # ← SuperTrend mode flag
             }
-            
+
             with self._trade_lock:
                 self.active_trades[symbol] = trade_record
 
             if self.notifier:
-                trade_copy = trade_record.copy()
+                trade_copy         = trade_record.copy()
                 trade_copy["symbol"] = symbol
                 self.notifier.send_trade_executed(trade_copy)
 
@@ -2067,51 +2390,52 @@ class TradingBot:
             self._cleanup_trade(symbol)
             self._log("error", "TRADE", f"Execution error for {symbol}: {exc}")
 
-    # ─────────────────── UI helpers ───────────────────
+    # ─── UI helpers ────────────────────────────────────────────
 
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v11.3           |")
-        print("|   FULLY INTEGRATED WITH GMAIL NOTIFICATIONS           |")
-        print("|   ALL SHORT STRATEGIES MIRRORED TO LONG               |")
-        print("|   COMPLETE LONG STRATEGY SET (1,3,5,6)                |")
-        print("|                                                       |")
-        print("|   KEY FEATURES:                                       |")
-        print("|   ✓ STOP LOSS: Triggers ONLY on CANDLE CLOSE          |")
-        print("|   ✓ TAKE PROFIT: Triggers IMMEDIATELY on price touch  |")
-        print("|   ✓ RSI SHORT filter: RSI(14) > 55                    |")
-        print("|   ✓ RSI LONG filter: RSI(14) < 37                     |")
-        print("|   ✓ Daily loss limit based on REALIZED PnL            |")
-        print("|   ✓ Order-first PnL fetching (safer for concurrent trades)")
-        print("|   ✓ Retry loop for PnL updates (5 attempts, 1s delay)")
-        print("|   ✓ Gmail notifications for signals & trades          |")
-        print("|                                                       |")
-        print("|   Strategies SHORT: 1(Breakout) 3(Engulf) 5(Doji) 6(Harami)")
-        print("|   Strategies LONG:  1(Breakout) 3(Engulf) 5(Doji) 6(Harami)")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.0           |")
+        print("|   DUAL SUPERTREND TP EXTENSION                         |")
+        print("|                                                        |")
+        print("|   STOP LOSS : Triggers ONLY on CANDLE CLOSE            |")
+        print("|   TAKE PROFIT (normal)  : 2:1 R:R on price touch       |")
+        print("|   TAKE PROFIT (ST mode) : Both SuperTrends REVERSE      |")
+        print("|                                                        |")
+        print("|   SuperTrend 1 : Length=14, Factor=2.0  (accurate)     |")
+        print("|   SuperTrend 2 : Length=21, Factor=1.0  (trend)        |")
+        print("|                                                        |")
+        print("|   RSI SHORT filter : RSI(14) > 55                      |")
+        print("|   RSI LONG  filter : RSI(14) < 37                      |")
+        print("|   Daily loss limit : based on REALIZED PnL             |")
+        print("|   Order-first PnL  : order_id → product_id (5 retries) |")
+        print("|   Gmail alerts     : signal, ST confirm, ST exit        |")
         print("+========================================================+")
         print()
 
     def _print_startup_summary(self) -> None:
-        mode_str = "PAPER (signals only)" if self.paper else "LIVE TRADING"
-        risk_usd = self.trading_capital * self.risk_pct
+        mode_str        = "PAPER (signals only)" if self.paper else "LIVE TRADING"
+        risk_usd        = self.trading_capital * self.risk_pct
         daily_limit_usd = self.trading_capital * self.daily_loss_limit_pct
         print("+--------------------------------------------------------+")
-        print(f"  Mode            : {mode_str}")
-        print(f"  Timeframe       : {self.timeframe}")
-        print(f"  Trading capital : ${self.trading_capital:,.2f} USD")
-        print(f"  Risk / trade    : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
-        print(f"  Take-Profit     : {TP_RR_RATIO:.1f}:1 (triggers on PRICE TOUCH)")
-        print(f"  Stop Loss       : Triggers on CANDLE CLOSE only")
-        print(f"  Daily loss cap  : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
-        print(f"  Leverage        : {self.leverage}x")
-        print(f"  Max open trades : {self.max_trades}")
-        print(f"  SHORT TRADES    : {'ENABLED' if self.enable_short else 'DISABLED'}")
-        print(f"  LONG TRADES     : {'ENABLED' if self.enable_long else 'DISABLED'}")
-        print(f"  RSI SHORT filter: RSI(14) > {RSI_OVERBOUGHT}")
-        print(f"  RSI LONG  filter: RSI(14) < {RSI_OVERSOLD}")
-        print(f"  GMAIL NOTIFICATIONS: {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
-        print(f"  PnL Fetch Priority: order_id → product_id (with retry)")
+        print(f"  Mode              : {mode_str}")
+        print(f"  Timeframe         : {self.timeframe}")
+        print(f"  Trading capital   : ${self.trading_capital:,.2f} USD")
+        print(f"  Risk / trade      : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
+        print(f"  Take-Profit (def) : {TP_RR_RATIO:.1f}:1 (triggers on PRICE TOUCH)")
+        print(f"  Take-Profit (ST)  : Both SuperTrends reverse direction")
+        print(f"  Stop Loss         : Triggers on CANDLE CLOSE only (disabled in ST mode)")
+        print(f"  Daily loss cap    : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
+        print(f"  Leverage          : {self.leverage}x")
+        print(f"  Max open trades   : {self.max_trades}")
+        print(f"  SHORT TRADES      : {'ENABLED' if self.enable_short else 'DISABLED'}")
+        print(f"  LONG TRADES       : {'ENABLED' if self.enable_long else 'DISABLED'}")
+        print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
+        print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
+        print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
+        print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
+        print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
+        print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid     = self.product_map.get(sym, "???")
@@ -2157,61 +2481,45 @@ def ask_mode() -> Tuple[bool, str, str]:
 
 
 def ask_trade_directions() -> Tuple[bool, bool]:
-    """Ask user which trade directions to enable."""
     _divider("TRADE DIRECTIONS")
     print("  Select which types of trades the bot should execute:")
     print()
-    
-    enable_short = input("  Enable SHORT trades? (Y/n) : ").strip().lower()
-    enable_short = enable_short != 'n'  # Default to Yes
-    
-    enable_long = input("  Enable LONG trades? (Y/n) : ").strip().lower()
-    enable_long = enable_long != 'n'  # Default to Yes
-    
+    enable_short = input("  Enable SHORT trades? (Y/n) : ").strip().lower() != 'n'
+    enable_long  = input("  Enable LONG trades? (Y/n) : ").strip().lower()  != 'n'
     if not enable_short and not enable_long:
         print("\n  ⚠️  WARNING: Both short and long trades are disabled!")
         print("  The bot will monitor markets but will NOT execute any trades.")
-        print()
         proceed = input("  Do you want to continue anyway? (y/N) : ").strip().lower()
         if proceed != 'y':
             print("  Restart and select at least one direction.")
             exit(0)
-    
     print()
     print(f"  Short trades: {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
-    print(f"  Long trades:  {'ENABLED ✅' if enable_long else 'DISABLED ❌'}")
+    print(f"  Long trades : {'ENABLED ✅' if enable_long  else 'DISABLED ❌'}")
     print()
-    
     return enable_short, enable_long
 
 
 def ask_gmail_config() -> Optional[GmailNotifier]:
     _divider("GMAIL NOTIFICATIONS")
-    print("  Get alerts for signals, trade executions, and daily limits.")
+    print("  Get alerts for signals, trade executions, SuperTrend events, and daily limits.")
     print("  You'll need a Gmail App Password (not your regular password).")
-    
     enable = input("  Enable Gmail notifications? (y/N) : ").strip().lower()
     if enable != 'y':
         print("  Gmail notifications DISABLED")
         return None
-    
     print()
     sender = input("  Your Gmail address (e.g., yourname@gmail.com): ").strip()
     if not sender:
         print("  Invalid email. Notifications disabled.")
         return None
-    
     app_password = input("  Gmail App Password (16 chars, no spaces): ").strip()
     if not app_password or len(app_password) < 10:
         print("  Invalid password. Notifications disabled.")
         return None
-    
     recipients_raw = input("  Recipient emails (comma separated, default = your email): ").strip()
-    if recipients_raw:
-        recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
-    else:
-        recipients = [sender]
-    
+    recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()] \
+                 if recipients_raw else [sender]
     print(f"  Gmail notifications ENABLED for {', '.join(recipients)}")
     return GmailNotifier(
         sender_email=sender,
@@ -2274,7 +2582,6 @@ def ask_risk_params() -> Tuple[float, int]:
 def ask_daily_loss_limit() -> float:
     _divider("DAILY LOSS LIMIT")
     print("  Daily loss limit stops trading if cumulative REALIZED losses exceed this % of capital.")
-    print("  Only actual realized PnL from closed trades counts toward this limit.")
     try:
         daily_loss = float(input("  Daily loss limit % (default = 5) : ").strip() or 5)
         daily_loss = max(0.1, min(daily_loss, 50.0))
@@ -2291,42 +2598,43 @@ def ask_daily_loss_limit() -> float:
 def test_gmail():
     print("\n  📧 TESTING GMAIL NOTIFICATIONS")
     print("  " + "=" * 50)
-    
     sender = input("  Your Gmail address: ").strip()
     if not sender:
         print("  ❌ Invalid email. Test cancelled.")
         return
-    
     app_password = input("  Gmail App Password: ").strip()
     if not app_password:
         print("  ❌ Invalid password. Test cancelled.")
         return
-    
     notifier = GmailNotifier(
         sender_email=sender,
         gmail_app_password=app_password,
         recipient_emails=[sender],
         enabled=True,
     )
-    
     print("\n  📤 Sending test signal notification...")
     success = notifier.send_signal({
         "direction": "LONG",
-        "symbol": "BTCUSD_PERP",
-        "strategy": "TEST_SIGNAL",
+        "symbol":    "BTCUSD_PERP",
+        "strategy":  "TEST_SIGNAL",
         "timeframe": "1h",
-        "entry": 65000.0,
+        "entry":     65000.0,
         "stop_loss": 63000.0,
         "take_profit": 69000.0,
-        "rsi": 28.5,
-        "mode": "PAPER",
-        "risk_usd": 20.0,
+        "rsi":       28.5,
+        "mode":      "PAPER",
+        "risk_usd":  20.0,
         "trading_capital": 1000.0,
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time":      datetime.now(timezone.utc).isoformat(),
     })
-    
     if success:
         print("  ✅ Test email sent successfully!")
+        print("\n  📤 Sending test SuperTrend confirmation notification...")
+        notifier.send_supertrend_strong(
+            symbol="BTCUSD_PERP", direction="LONG", entry=65000.0,
+            new_tp=0.0, st1=64200.0, st2=63800.0, timeframe="1h", mode="PAPER",
+        )
+        print("  ✅ SuperTrend test email sent!")
     else:
         print("  ❌ Failed to send email. Check your App Password and settings.")
 
@@ -2338,11 +2646,11 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v11.3       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.0       |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
-    print("  |   Short + Long strategies  |  TP 2:1 R:R            |")
-    print("  |   RSI(14) filter (LONG: <37) | Daily loss limit     |")
-    print("  |   Order-first PnL | Retry loop | GMAIL NOTIFICATIONS|")
+    print("  |   DUAL SUPERTREND TP EXTENSION                       |")
+    print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
+    print("  |   Short + Long  |  RSI(14) filter  |  GMAIL         |")
     print("  +======================================================+")
 
     _divider("SETUP")
@@ -2351,13 +2659,10 @@ def main() -> None:
         test_gmail()
         print("\n  Continuing with bot setup...")
 
-    timeframe = ask_timeframe()
+    timeframe            = ask_timeframe()
     paper, api_key, api_secret = ask_mode()
-    
-    # NEW: Ask user which trade directions to enable
-    enable_short, enable_long = ask_trade_directions()
-    
-    notifier = ask_gmail_config()
+    enable_short, enable_long  = ask_trade_directions()
+    notifier             = ask_gmail_config()
 
     _divider("CONNECTING TO DELTA EXCHANGE INDIA")
     rest_tmp = DeltaREST(api_key, api_secret)
@@ -2379,7 +2684,9 @@ def main() -> None:
     else:
         _divider("PAPER MODE CAPITAL")
         try:
-            account_balance = float(input("  Notional capital USD (default = 1000) : ").strip() or 1000)
+            account_balance = float(
+                input("  Notional capital USD (default = 1000) : ").strip() or 1000
+            )
         except ValueError:
             account_balance = 1000.0
 
@@ -2388,22 +2695,24 @@ def main() -> None:
     daily_loss_limit_pct = ask_daily_loss_limit()
 
     _divider("CONFIRM")
-    risk_usd       = trading_capital * risk_pct / 100
+    risk_usd        = trading_capital * risk_pct / 100
     daily_limit_usd = trading_capital * (daily_loss_limit_pct / 100)
-    print(f"  Mode            : {'PAPER' if paper else 'LIVE TRADING'}")
-    print(f"  Timeframe       : {timeframe}")
-    print(f"  Short Trades    : {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
-    print(f"  Long Trades     : {'ENABLED ✅' if enable_long else 'DISABLED ❌'}")
-    print(f"  Symbols         : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
-    print(f"  Leverage        : {leverage}x")
-    print(f"  Trading capital : ${trading_capital:,.2f}")
-    print(f"  Risk / trade    : {risk_pct}%  =  ~${risk_usd:,.2f}")
-    print(f"  Take-Profit     : {TP_RR_RATIO:.1f}:1 R:R (triggers on PRICE TOUCH)")
-    print(f"  Stop Loss       : Triggers on CANDLE CLOSE only")
-    print(f"  Daily loss cap  : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f} (based on REALIZED PnL)")
-    print(f"  Max open trades : {max_trades}")
-    print(f"  GMAIL NOTIFICATIONS: {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
-    print(f"  PnL Fetch Priority: order_id → product_id (with retry)")
+    print(f"  Mode              : {'PAPER' if paper else 'LIVE TRADING'}")
+    print(f"  Timeframe         : {timeframe}")
+    print(f"  Short Trades      : {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
+    print(f"  Long Trades       : {'ENABLED ✅' if enable_long  else 'DISABLED ❌'}")
+    print(f"  Symbols           : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
+    print(f"  Leverage          : {leverage}x")
+    print(f"  Trading capital   : ${trading_capital:,.2f}")
+    print(f"  Risk / trade      : {risk_pct}%  =  ~${risk_usd:,.2f}")
+    print(f"  Take-Profit (def) : {TP_RR_RATIO:.1f}:1 R:R (triggers on PRICE TOUCH)")
+    print(f"  Take-Profit (ST)  : Both SuperTrends ST(14,2)+ST(21,1) reverse")
+    print(f"  Stop Loss         : Triggers on CANDLE CLOSE only")
+    print(f"  Daily loss cap    : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f}")
+    print(f"  Max open trades   : {max_trades}")
+    print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
+    print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
+    print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
@@ -2411,18 +2720,18 @@ def main() -> None:
         return
 
     cfg = {
-        "paper_mode": paper, 
-        "symbols": raw_symbols, 
-        "risk_pct": risk_pct,
-        "leverage": leverage, 
-        "trading_capital": trading_capital,
-        "max_concurrent_trades": max_trades, 
-        "timeframe": timeframe,
-        "api_key": api_key, 
-        "api_secret": api_secret,
-        "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
-        "enable_short": enable_short,
-        "enable_long": enable_long,
+        "paper_mode":            paper,
+        "symbols":               raw_symbols,
+        "risk_pct":              risk_pct,
+        "leverage":              leverage,
+        "trading_capital":       trading_capital,
+        "max_concurrent_trades": max_trades,
+        "timeframe":             timeframe,
+        "api_key":               api_key,
+        "api_secret":            api_secret,
+        "daily_loss_limit_pct":  daily_loss_limit_pct / 100.0,
+        "enable_short":          enable_short,
+        "enable_long":           enable_long,
     }
 
     bot = TradingBot(cfg, notifier=notifier)
@@ -2442,12 +2751,18 @@ def main() -> None:
             open_n    = len(bot.active_trades)
             open_syms = list(bot.active_trades.keys())
             ws_state  = bot.ws_manager.get_state() if bot.ws_manager else "N/A"
+            # Show ST-mode status for each active trade
+            st_info = ""
+            for sym, t in bot.active_trades.items():
+                if isinstance(t, dict) and t.get("st_mode"):
+                    st_info += f"[{sym}:ST-MODE] "
             print(
                 f"  [STATUS] Open={open_n}/{max_trades}  "
                 f"Signals={len(bot.signals)}  "
                 f"TPs={len(bot.tp_events)}  SLs={len(bot.sl_events)}  "
                 f"WS={ws_state}  {bot.daily_loss_tracker.status()}  "
                 + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
+                + (f"  {st_info}" if st_info else "")
             )
     except KeyboardInterrupt:
         bot.stop()
