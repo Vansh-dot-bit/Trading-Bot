@@ -73,6 +73,51 @@ def _log(level: str, tag: str, msg: str) -> None:
 
 
 # ================================================================
+#  3b.  PRICE FORMATTING UTILITY  (NEW — precision for altcoins)
+# ================================================================
+
+def smart_fmt(price: float) -> str:
+    """
+    Dynamically selects decimal places based on price magnitude so that
+    small-priced altcoins (e.g. 0.13498, 1.05928, 0.00142) are displayed
+    with full precision while large prices (BTC at 65 000) stay clean.
+
+    Scale:
+        >= 10 000  → 2 dp    e.g. 65432.12
+        >= 1 000   → 3 dp    e.g. 1850.500  → "1850.50"
+        >= 100     → 4 dp    e.g. 105.9280  → "105.928"
+        >= 10      → 5 dp    e.g. 12.34560  → "12.3456"
+        >= 1       → 6 dp    e.g. 1.059280  → "1.05928"
+        >= 0.1     → 7 dp    e.g. 0.1349800 → "0.13498"
+        >= 0.01    → 8 dp    e.g. 0.0014200 → "0.00142"
+        < 0.01     → 10 dp   e.g. 0.000035
+
+    Trailing zeros are stripped, but at least 2 decimal places are kept.
+    """
+    if price == 0:
+        return "0"
+    abs_p = abs(price)
+    if abs_p >= 10_000:  decimals = 2
+    elif abs_p >= 1_000: decimals = 3
+    elif abs_p >= 100:   decimals = 4
+    elif abs_p >= 10:    decimals = 5
+    elif abs_p >= 1:     decimals = 6
+    elif abs_p >= 0.1:   decimals = 7
+    elif abs_p >= 0.01:  decimals = 8
+    else:                decimals = 10
+
+    formatted = f"{price:.{decimals}f}"
+    if "." in formatted:
+        stripped = formatted.rstrip("0")
+        if stripped.endswith("."):
+            stripped += "00"
+        elif len(stripped.split(".")[1]) < 2:
+            stripped += "0" * (2 - len(stripped.split(".")[1]))
+        return stripped
+    return formatted
+
+
+# ================================================================
 #  4.  GMAIL NOTIFIER
 # ================================================================
 
@@ -80,6 +125,7 @@ class GmailNotifier:
     """
     Gmail notification handler for trading signals and events.
     Uses Gmail App Password (not regular password) for security.
+    All price fields now use smart_fmt() for full altcoin precision.
     """
 
     def __init__(
@@ -116,19 +162,27 @@ class GmailNotifier:
     def send_signal(self, signal: dict) -> bool:
         if not self.enabled:
             return False
-        direction      = signal.get("direction", "UNKNOWN")
-        symbol         = signal.get("symbol", "UNKNOWN")
-        strategy       = signal.get("strategy", "UNKNOWN")
-        timeframe      = signal.get("timeframe", "UNKNOWN")
-        entry          = signal.get("entry", 0)
-        stop_loss      = signal.get("stop_loss", 0)
-        take_profit    = signal.get("take_profit", 0)
-        rsi            = signal.get("rsi", "N/A")
-        mode           = signal.get("mode", "PAPER")
-        risk_usd       = signal.get("risk_usd", 0)
+        direction       = signal.get("direction", "UNKNOWN")
+        symbol          = signal.get("symbol", "UNKNOWN")
+        strategy        = signal.get("strategy", "UNKNOWN")
+        timeframe       = signal.get("timeframe", "UNKNOWN")
+        entry           = signal.get("entry", 0)
+        stop_loss       = signal.get("stop_loss", 0)
+        take_profit     = signal.get("take_profit", 0)
+        rsi             = signal.get("rsi", "N/A")
+        mode            = signal.get("mode", "PAPER")
+        risk_usd        = signal.get("risk_usd", 0)
         trading_capital = signal.get("trading_capital", 0)
-        signal_time    = signal.get("time", datetime.now(timezone.utc).isoformat())
+        signal_time     = signal.get("time", datetime.now(timezone.utc).isoformat())
         direction_emoji = "🔴 SHORT" if direction == "SHORT" else "🟢 LONG"
+
+        # ── use smart_fmt for all price fields ───────────────
+        risk_dist   = abs(entry - stop_loss)
+        reward_dist = abs(take_profit - entry)
+        rr          = (reward_dist / risk_dist) if risk_dist > 0 else 0
+        rsi_str     = f"{rsi:.2f}" if isinstance(rsi, float) else str(rsi)
+        risk_pct    = (risk_usd / trading_capital * 100) if trading_capital > 0 else 0
+
         subject = f"[{mode}] {direction_emoji} {symbol} - {strategy}"
         body = f"""
 ╔══════════════════════════════════════════════════════════════╗
@@ -141,17 +195,17 @@ class GmailNotifier:
 ║  Strategy   : {strategy}
 ║  Timeframe  : {timeframe}
 ╠══════════════════════════════════════════════════════════════╣
-║  Entry      : {entry:.4f}
-║  Stop Loss  : {stop_loss:.4f}
-║  Take Profit: {take_profit:.4f}
-║  Risk Dist  : {abs(entry - stop_loss):.4f}
-║  Reward Dist: {abs(take_profit - entry):.4f}
-║  Risk:Reward: {abs(take_profit - entry) / abs(entry - stop_loss):.2f}:1
+║  Entry      : {smart_fmt(entry)}
+║  Stop Loss  : {smart_fmt(stop_loss)}
+║  Take Profit: {smart_fmt(take_profit)}
+║  Risk Dist  : {smart_fmt(risk_dist)}
+║  Reward Dist: {smart_fmt(reward_dist)}
+║  Risk:Reward: {rr:.2f}:1
 ╠══════════════════════════════════════════════════════════════╣
-║  RSI(14)    : {rsi}
+║  RSI(14)    : {rsi_str}
 ║  Risk $     : ${risk_usd:.2f}
 ║  Capital    : ${trading_capital:,.2f}
-║  Risk %     : {(risk_usd / trading_capital * 100) if trading_capital > 0 else 0:.2f}%
+║  Risk %     : {risk_pct:.2f}%
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
@@ -183,10 +237,10 @@ class GmailNotifier:
 ╠══════════════════════════════════════════════════════════════╣
 ║  {trend_desc}
 ╠══════════════════════════════════════════════════════════════╣
-║  Entry Price     : {entry:.4f}
-║  New Take Profit : {new_tp:.4f}  (SuperTrend-based EXIT)
-║  SuperTrend(14,2): {st1:.4f}
-║  SuperTrend(21,1): {st2:.4f}
+║  Entry Price     : {smart_fmt(entry)}
+║  New Take Profit : SuperTrend-based EXIT (no fixed level)
+║  SuperTrend(14,2): {smart_fmt(st1)}
+║  SuperTrend(21,1): {smart_fmt(st2)}
 ╠══════════════════════════════════════════════════════════════╣
 ║  {tp_note}
 ╚══════════════════════════════════════════════════════════════╝
@@ -219,8 +273,8 @@ class GmailNotifier:
 ║  Mode        : {mode}
 ╠══════════════════════════════════════════════════════════════╣
 ║  Exit Reason : {flip_desc}
-║  Entry       : {entry:.4f}
-║  Exit Price  : {exit_price:.4f}
+║  Entry       : {smart_fmt(entry)}
+║  Exit Price  : {smart_fmt(exit_price)}
 ║  Realized PnL: {pnl_text}
 ║  Result      : {result_text}
 ╚══════════════════════════════════════════════════════════════╝
@@ -247,9 +301,9 @@ class GmailNotifier:
 ║  Direction  : {direction_emoji}
 ║  Strategy   : {strategy}
 ║  Size       : {size} contracts
-║  Entry      : {entry:.4f}
-║  Stop Loss  : {stop_loss:.4f} (candle close trigger)
-║  Take Profit: {take_profit:.4f} (immediate trigger)
+║  Entry      : {smart_fmt(entry)}
+║  Stop Loss  : {smart_fmt(stop_loss)} (candle close trigger)
+║  Take Profit: {smart_fmt(take_profit)} (immediate trigger)
 ╚══════════════════════════════════════════════════════════════╝
         """
         return self._send_email(subject, body)
@@ -271,7 +325,7 @@ class GmailNotifier:
 ║  Symbol      : {symbol}
 ║  Direction   : {"SHORT" if direction == "SHORT" else "LONG"}
 ║  Close Reason: {close_reason}
-║  Entry       : {entry:.4f}
+║  Entry       : {smart_fmt(entry)}
 ║  Realized PnL: {pnl_text}
 ║  Result      : {"PROFIT 🎉" if is_profit else "LOSS 😢"}
 ╚══════════════════════════════════════════════════════════════╝
@@ -314,8 +368,8 @@ class GmailNotifier:
     def send_startup_report(self, config: dict, symbols: List[str]) -> bool:
         if not self.enabled:
             return False
-        mode        = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
-        subject     = f"🤖 TRADING BOT STARTED - {mode}"
+        mode         = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
+        subject      = f"🤖 TRADING BOT STARTED - {mode}"
         symbols_list = "\n".join([f"  • {sym}" for sym in symbols[:10]])
         if len(symbols) > 10:
             symbols_list += f"\n  • ... and {len(symbols) - 10} more"
@@ -335,11 +389,12 @@ class GmailNotifier:
 ║  LONG TRADES    : {"ENABLED" if config.get('enable_long', True) else "DISABLED"}
 ║  SHORT RSI      : > 55
 ║  LONG RSI       : < 37
-║  RSI LONG BLOCK : < 22 (extreme oversold)
+║  RSI LONG BLOCK : < 24 (extreme oversold)
 ║  Take Profit    : 2:1 R:R (or SuperTrend exit if both ST confirm)
 ║  Stop Loss      : Triggers on CANDLE CLOSE (not intraday)
 ║  SuperTrend 1   : Length=14, Factor=2.0
 ║  SuperTrend 2   : Length=21, Factor=1.0
+║  Price Display  : Auto-precision (up to 10 dp for micro-price alts)
 ╠══════════════════════════════════════════════════════════════╣
 ║  Symbols ({len(symbols)}):
 {symbols_list}
@@ -530,6 +585,11 @@ class DeltaWebSocket:
         return {"symbol": trading_symbol, "candle": candle}
 
     def _normalize_candle_flat(self, data: dict) -> Optional[dict]:
+        """
+        Parse candle fields from WebSocket message.
+        Prices stored as raw float — NO rounding applied here so altcoin
+        micro-prices (e.g. 0.00142) are preserved exactly.
+        """
         try:
             ts_raw = data.get("candle_start_time")
             if ts_raw is not None:
@@ -545,10 +605,14 @@ class DeltaWebSocket:
                         break
                 else: return None
             if ts <= 0: return None
+            # Store prices as full-precision floats — no rounding
             return {
-                "time": ts, "open": float(data.get("open", 0)),
-                "high": float(data.get("high", 0)), "low": float(data.get("low", 0)),
-                "close": float(data.get("close", 0)), "volume": float(data.get("volume", 0)),
+                "time":   ts,
+                "open":   float(data.get("open",   0)),
+                "high":   float(data.get("high",   0)),
+                "low":    float(data.get("low",    0)),
+                "close":  float(data.get("close",  0)),
+                "volume": float(data.get("volume", 0)),
             }
         except (TypeError, ValueError): return None
 
@@ -590,7 +654,7 @@ def to_candle_symbol(symbol: str) -> str:
 REST_BASE_INDIA  = "https://api.india.delta.exchange"
 REST_BASE_GLOBAL = "https://api.delta.exchange"
 
-CANDLE_LIMIT        = 200          # increased to ensure enough data for ST(21)
+CANDLE_LIMIT        = 200
 MAX_RETRIES         = 3
 RETRY_DELAYS        = [5, 10, 15]
 TIMEOUT             = 30
@@ -714,7 +778,7 @@ class APIRequestHandler:
                 time.sleep(RETRY_DELAYS[retry_count])
                 return self.request(method, endpoint, endpoint_type, params, body, retry_count + 1)
             return None
-        except requests.HTTPError as exc:
+        except requests.exceptions.HTTPError as exc:
             status = exc.response.status_code if exc.response else 0
             if status == 429 and retry_count < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAYS[retry_count])
@@ -734,12 +798,12 @@ class TimeframeSafe:
         k = key.strip().lower()
         if k not in TIMEFRAME_MAP:
             raise ValueError(f"[TIMEFRAME] '{k}' not valid. Choose from: {list(TIMEFRAME_MAP)}")
-        entry            = TIMEFRAME_MAP[k]
-        self._key        = k
-        self._resolution = entry["resolution"]
+        entry                = TIMEFRAME_MAP[k]
+        self._key            = k
+        self._resolution     = entry["resolution"]
         self._api_resolution = entry["api_resolution"]
-        self._ws_channel = entry["ws_channel"]
-        self._secs       = entry["secs"]
+        self._ws_channel     = entry["ws_channel"]
+        self._secs           = entry["secs"]
 
     @property
     def key(self)            -> str: return self._key
@@ -768,7 +832,7 @@ def validate_candle(candle: dict, symbol: str = "") -> bool:
             v = float(candle[f])
         except (TypeError, ValueError): return False
         if math.isnan(v) or math.isinf(v): return False
-    if candle["time"] <= 0:      return False
+    if candle["time"] <= 0:           return False
     if candle["high"] < candle["low"]: return False
     for f in ("open", "high", "low", "close"):
         if candle[f] <= 0: return False
@@ -819,21 +883,20 @@ def compute_atr(candles: List[dict], period: int) -> List[float]:
     Compute ATR using Wilder's smoothing (RMA).
     Returns a list of ATR values aligned to candles (index 0..N-1).
     Values before index `period` are None placeholders → stored as 0.0.
+    All arithmetic uses full float precision — no rounding.
     """
     n = len(candles)
     if n < 2:
         return [0.0] * n
 
-    # True Range for each bar
-    trs = [0.0]  # first bar has no previous close
+    trs = [0.0]
     for i in range(1, n):
-        h   = candles[i]["high"]
-        l   = candles[i]["low"]
-        pc  = candles[i - 1]["close"]
-        tr  = max(h - l, abs(h - pc), abs(l - pc))
+        h  = candles[i]["high"]
+        l  = candles[i]["low"]
+        pc = candles[i - 1]["close"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
 
-    # Wilder RMA seed = simple average of first `period` TRs
     atrs = [0.0] * n
     if n < period + 1:
         return atrs
@@ -851,18 +914,13 @@ def compute_supertrend(candles: List[dict],
                         length: int, factor: float) -> List[Optional[bool]]:
     """
     Compute SuperTrend for a list of closed candles.
+    All band arithmetic uses full float precision — essential for altcoins
+    with prices like 0.00142 where rounding would corrupt the signal.
 
-    Returns a list of booleans (same length as `candles`):
-        True  → price is ABOVE SuperTrend → bullish / GREEN
-        False → price is BELOW SuperTrend → bearish / RED
+    Returns list of booleans:
+        True  → bullish / GREEN
+        False → bearish / RED
         None  → insufficient data
-
-    Algorithm mirrors Pine Script's SuperTrend indicator exactly:
-        hl2        = (high + low) / 2
-        upperBand  = hl2 + factor * ATR
-        lowerBand  = hl2 - factor * ATR
-        Bands are only tightened, never widened between bars.
-        Direction flips when close crosses the active band.
     """
     n    = len(candles)
     atrs = compute_atr(candles, length)
@@ -871,8 +929,7 @@ def compute_supertrend(candles: List[dict],
     upper_bands  = [0.0] * n
     lower_bands  = [0.0] * n
 
-    # Seed the first valid index
-    start = length  # first bar with a valid ATR
+    start = length
 
     for i in range(start, n):
         hl2 = (candles[i]["high"] + candles[i]["low"]) / 2.0
@@ -884,32 +941,28 @@ def compute_supertrend(candles: List[dict],
         if i == start:
             upper_bands[i] = raw_upper
             lower_bands[i] = raw_lower
-            # Initial direction: close vs mid-band
-            directions[i] = candles[i]["close"] >= hl2
+            directions[i]  = candles[i]["close"] >= hl2
         else:
             prev_upper = upper_bands[i - 1]
             prev_lower = lower_bands[i - 1]
             prev_close = candles[i - 1]["close"]
 
-            # Lower band: only raise it (tighten from below)
             lower_bands[i] = (
                 raw_lower if raw_lower > prev_lower or prev_close < prev_lower
                 else prev_lower
             )
-            # Upper band: only lower it (tighten from above)
             upper_bands[i] = (
                 raw_upper if raw_upper < prev_upper or prev_close > prev_upper
                 else prev_upper
             )
 
-            # Direction
             prev_dir = directions[i - 1]
             close    = candles[i]["close"]
 
-            if prev_dir is False:           # was bearish
-                directions[i] = close > upper_bands[i]   # flip to bullish if price breaks above
-            elif prev_dir is True:          # was bullish
-                directions[i] = close >= lower_bands[i]  # stay bullish if price stays above lower
+            if prev_dir is False:
+                directions[i] = close > upper_bands[i]
+            elif prev_dir is True:
+                directions[i] = close >= lower_bands[i]
             else:
                 directions[i] = close >= hl2
 
@@ -918,14 +971,9 @@ def compute_supertrend(candles: List[dict],
 
 def get_supertrend_state(candles: List[dict],
                           length: int, factor: float) -> Optional[bool]:
-    """
-    Return the CURRENT SuperTrend direction for the most recent CLOSED candle.
-    True  = bullish (GREEN), False = bearish (RED), None = not enough data.
-    """
-    if len(candles) < length + 2:   # need at least length+1 for ATR + 1 for direction
+    if len(candles) < length + 2:
         return None
     dirs = compute_supertrend(candles, length, factor)
-    # Return the last direction (most recent closed candle)
     for d in reversed(dirs):
         if d is not None:
             return d
@@ -933,14 +981,12 @@ def get_supertrend_state(candles: List[dict],
 
 
 def both_supertrends_bullish(candles: List[dict]) -> bool:
-    """Returns True when BOTH ST(14,2) and ST(21,1) are GREEN (bullish)."""
     st1 = get_supertrend_state(candles, ST1_LENGTH, ST1_FACTOR)
     st2 = get_supertrend_state(candles, ST2_LENGTH, ST2_FACTOR)
     return st1 is True and st2 is True
 
 
 def both_supertrends_bearish(candles: List[dict]) -> bool:
-    """Returns True when BOTH ST(14,2) and ST(21,1) are RED (bearish)."""
     st1 = get_supertrend_state(candles, ST1_LENGTH, ST1_FACTOR)
     st2 = get_supertrend_state(candles, ST2_LENGTH, ST2_FACTOR)
     return st1 is False and st2 is False
@@ -948,9 +994,8 @@ def both_supertrends_bearish(candles: List[dict]) -> bool:
 
 def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optional[float]]:
     """
-    Return the numeric SuperTrend line values for the last closed candle:
-    (ST1_value, ST2_value).
-    These are the band levels (upper or lower) that act as the active line.
+    Return the numeric SuperTrend line values for the last closed candle.
+    Returned as raw floats — caller uses smart_fmt() for display.
     """
     def _get_last_band(cndls, length, factor):
         n    = len(cndls)
@@ -990,7 +1035,6 @@ def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optiona
                     dirs[i] = close >= lower_bands[i]
                 else:
                     dirs[i] = close >= hl2
-        # The active line is lower_band when bullish, upper_band when bearish
         if dirs[n - 1] is True:
             return lower_bands[n - 1]
         elif dirs[n - 1] is False:
@@ -1210,10 +1254,9 @@ def check_long_signal(
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
     if rsi is None:
         return False, None, "", None
-    # BLOCK LONG TRADES WHEN RSI IS BELOW 22 (EXTREME OVERSOLD - POTENTIAL BOTTOM FISHING)
-    if rsi < 22.0:
-        _log("warning", f"RSI [{symbol}]", 
-             f"RSI={rsi:.2f} < 22 — BLOCKING LONG TRADE (extreme oversold)")
+    if rsi < 24.0:
+        _log("warning", f"RSI [{symbol}]",
+             f"RSI={rsi:.2f} < 24 — BLOCKING LONG TRADE (extreme oversold)")
         return False, None, "", rsi
     if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
@@ -1310,6 +1353,10 @@ def _extract_timestamp(src: dict) -> int:
 
 
 def _extract_price(src: dict, long_key: str, short_key: str) -> Optional[float]:
+    """
+    Extract price as raw float — NO rounding applied.
+    Preserves full precision for micro-price altcoins.
+    """
     for k in (long_key, short_key):
         v = src.get(k)
         if v is not None:
@@ -1327,6 +1374,7 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
     c  = _extract_price(row, "close",  "c")
     v  = _extract_price(row, "volume", "v") or 0.0
     if any(x is None for x in (o, h, l, c)): return None
+    # Store as raw floats — smart_fmt() handles display precision
     return {"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
 
 
@@ -1335,11 +1383,21 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
 # ================================================================
 
 def round_to_tick(price: float, tick_size: float) -> float:
-    if tick_size <= 0: return round(price, 2)
+    """
+    Round price to the nearest tick size.
+
+    FIXED: fallback now uses 8 decimal places (was 2), so altcoins with
+    micro tick sizes like 0.00001 are not truncated to 2 dp.
+
+    The decimal-places count is derived from the tick_size string
+    representation — this handles sizes like 0.00001 correctly.
+    """
+    if tick_size <= 0:
+        return round(price, 8)          # ← was round(price, 2) — FIXED
     rounded  = round(price / tick_size) * tick_size
     tick_str = f"{tick_size:.10f}".rstrip("0")
     dp       = len(tick_str.split(".")[-1]) if "." in tick_str else 0
-    return round(rounded, dp)
+    return round(rounded, max(dp, 2))   # keep at least 2 dp for exchange compatibility
 
 
 # ================================================================
@@ -1381,8 +1439,11 @@ class DeltaREST:
                 tick_raw = item.get("tick_size", "0.01")
                 if sym and pid is not None:
                     pmap[sym] = int(pid)
-                    try: self._tick_sizes[sym] = float(tick_raw)
-                    except (TypeError, ValueError): self._tick_sizes[sym] = 0.01
+                    try:
+                        # Store tick_size as full-precision float
+                        self._tick_sizes[sym] = float(tick_raw)
+                    except (TypeError, ValueError):
+                        self._tick_sizes[sym] = 0.01
         return pmap
 
     def get_tick_size(self, symbol: str) -> float:
@@ -1429,7 +1490,10 @@ class DeltaREST:
         return result or {"error": "no_response"}
 
     def place_take_profit_only(self, product_id: int, tp_price: float, symbol: str = "") -> dict:
-        """Place ONLY a take-profit bracket order (no stop loss)."""
+        """
+        Place ONLY a take-profit bracket order (no stop loss).
+        Uses round_to_tick() which now supports full altcoin precision.
+        """
         if tp_price <= 0:
             return {"error": "invalid_tp_price"}
         tick_size  = self.get_tick_size(symbol) if symbol else 0.01
@@ -1437,13 +1501,13 @@ class DeltaREST:
         body: Dict = {
             "product_id": product_id,
             "take_profit_order": {
-                "order_type": "limit_order",
+                "order_type":  "limit_order",
                 "limit_price": str(rounded_tp),
             },
             "bracket_take_profit_trigger_method": "last_traded_price",
         }
         _log("info", "BRACKET-TP",
-             f"Placing bracket TP only: pid={product_id} tp={rounded_tp}")
+             f"Placing bracket TP only: pid={product_id} tp={smart_fmt(rounded_tp)}")
         result = self.request_handler.request(
             "POST", "/v2/orders/bracket", endpoint_type="private", body=body
         )
@@ -1605,12 +1669,18 @@ def compute_position_size(entry_price: float, stop_loss_price: float,
     margin_used    = (final_size * entry_price) / leverage
     max_loss_est   = final_size * stop_distance
     diag = {
-        "account_balance": round(account_balance, 2), "risk_pct": round(risk_pct * 100, 2),
-        "risk_amount":     round(risk_amount, 2),     "entry_price": round(entry_price, 4),
-        "stop_loss_price": round(stop_loss_price, 4), "stop_distance": round(stop_distance, 4),
-        "risk_size_raw":   round(risk_size, 4),       "max_by_margin": round(max_by_margin, 4),
-        "final_size":      final_size,                "margin_used": round(margin_used, 2),
-        "max_loss_est":    round(max_loss_est, 2),    "leverage": leverage,
+        "account_balance":  round(account_balance, 2),
+        "risk_pct":         round(risk_pct * 100, 2),
+        "risk_amount":      round(risk_amount, 2),
+        "entry_price":      entry_price,          # ← full precision (was round(,4))
+        "stop_loss_price":  stop_loss_price,      # ← full precision (was round(,4))
+        "stop_distance":    stop_distance,        # ← full precision (was round(,4))
+        "risk_size_raw":    round(risk_size, 6),
+        "max_by_margin":    round(max_by_margin, 6),
+        "final_size":       final_size,
+        "margin_used":      round(margin_used, 2),
+        "max_loss_est":     round(max_loss_est, 2),
+        "leverage":         leverage,
     }
     return final_size, diag
 
@@ -1625,7 +1695,8 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
         tp = entry_price - tp_distance
     else:
         tp = entry_price + tp_distance
-    return round(tp, 8)
+    # Keep full float precision — do NOT round here; rounding happens in round_to_tick()
+    return tp
 
 
 # ================================================================
@@ -1711,6 +1782,13 @@ class TradingBot:
         • Position is closed at market (or bracket TP cancellation + close).
         • Gmail exit alert is sent.
         • Realized PnL is fetched and daily-loss tracker updated.
+
+    Precision update (v12.0p):
+    ─ All price display now uses smart_fmt() instead of :.4f
+    ─ Supports altcoin prices with up to 10 decimal places
+    ─ round_to_tick() fallback changed from 2dp to 8dp
+    ─ compute_take_profit() no longer applies premature rounding
+    ─ Candle OHLC stored as raw float — no truncation at any stage
     """
 
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
@@ -1909,9 +1987,8 @@ class TradingBot:
 
         direction = trade.get("direction", "SHORT")
         entry     = trade.get("entry", 0)
-        st_mode   = trade.get("st_mode", False)      # True once both STs confirmed
+        st_mode   = trade.get("st_mode", False)
 
-        # Need enough candles for ST(21) → at least 23 closed candles
         if len(closed_candles) < ST2_LENGTH + 2:
             return
 
@@ -1929,7 +2006,6 @@ class TradingBot:
                 trade["st_mode"]         = True
                 trade["st_confirmed_at"] = datetime.now(timezone.utc).isoformat()
 
-                # Cancel existing fixed-ratio bracket TP (live only)
                 if not self.paper:
                     pid = trade.get("product_id")
                     if pid:
@@ -1939,9 +2015,9 @@ class TradingBot:
                 print()
                 print(f"  [SUPERTREND CONFIRMED] {symbol} {trend_label}")
                 print(f"    Both ST(14,2) + ST(21,1) {'RED' if direction=='SHORT' else 'GREEN'}")
-                print(f"    Entry: {entry:.4f}")
-                print(f"    ST(14,2) value: {st1_val:.4f}" if st1_val else "    ST(14,2): N/A")
-                print(f"    ST(21,1) value: {st2_val:.4f}" if st2_val else "    ST(21,1): N/A")
+                print(f"    Entry        : {smart_fmt(entry)}")
+                print(f"    ST(14,2) val : {smart_fmt(st1_val) if st1_val else 'N/A'}")
+                print(f"    ST(21,1) val : {smart_fmt(st2_val) if st2_val else 'N/A'}")
                 print(f"    TP CHANGED → Will exit when BOTH SuperTrends reverse direction")
                 print()
 
@@ -1952,7 +2028,7 @@ class TradingBot:
                 if self.notifier:
                     self.notifier.send_supertrend_strong(
                         symbol=symbol, direction=direction, entry=entry,
-                        new_tp=0.0,   # price-based exit, not a fixed level
+                        new_tp=0.0,
                         st1=st1_val or 0.0, st2=st2_val or 0.0,
                         timeframe=self.timeframe,
                         mode="PAPER" if self.paper else "LIVE",
@@ -1961,8 +2037,8 @@ class TradingBot:
         # ── 2. Already in ST mode → watch for REVERSAL ───────────────────
         else:
             reversed_trend = (
-                (direction == "SHORT" and bullish_now) or   # was SHORT, both ST now GREEN
-                (direction == "LONG"  and bearish_now)      # was LONG,  both ST now RED
+                (direction == "SHORT" and bullish_now) or
+                (direction == "LONG"  and bearish_now)
             )
             if reversed_trend:
                 _log("info", "ST-EXIT",
@@ -2044,7 +2120,7 @@ class TradingBot:
                     self.candle_store[sym].append(c)
                 self._log("info", "CANDLES",
                           f"  [OK] {sym}: {len(candles)} candles loaded | "
-                          f"last_close={candles[-1]['close']:.4f}")
+                          f"last_close={smart_fmt(candles[-1]['close'])}")
             else:
                 self._log("warning", "CANDLES", f"  [WARN] {sym}: 0 candles after retries.")
 
@@ -2100,7 +2176,6 @@ class TradingBot:
             store[-1] = candle
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
-                # Only check price-touch TP when NOT in st_mode
                 if trade and not trade.get("st_mode", False):
                     self._check_take_profit(symbol, candle)
             return
@@ -2108,34 +2183,32 @@ class TradingBot:
         # ── NEW CANDLE (previous candle is fully CLOSED) ──────
         if store:
             closed_candle  = store[-1]
-            closed_candles = list(store)   # includes the just-closed candle
+            closed_candles = list(store)
 
             self._log("info", "CANDLE-CLOSED",
                       f"{symbol} [{self.timeframe}] "
-                      f"O={closed_candle['open']:.2f} H={closed_candle['high']:.2f} "
-                      f"L={closed_candle['low']:.2f} C={closed_candle['close']:.2f}")
+                      f"O={smart_fmt(closed_candle['open'])} "
+                      f"H={smart_fmt(closed_candle['high'])} "
+                      f"L={smart_fmt(closed_candle['low'])} "
+                      f"C={smart_fmt(closed_candle['close'])}")
 
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
                 if trade and not trade.get("_reserved"):
-                    # SuperTrend evaluation runs on every closed candle
                     self._check_supertrend_conditions(symbol, closed_candles)
 
-                    # Re-fetch trade in case ST-exit already closed it
                     trade = self.active_trades.get(symbol)
                     if trade and not trade.get("_reserved"):
                         st_mode = trade.get("st_mode", False)
                         if not st_mode:
-                            # Normal SL check (candle close)
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
-            # New entry signals (only when not in a trade)
             if symbol not in self.active_trades:
                 if self.daily_loss_tracker.is_limit_reached():
                     self._log("warning", "DAILY-LOSS",
                               f"[{symbol}] Skipping signal check — daily loss limit hit")
                 else:
-                    candle_list = list(store) + [candle]   # include live candle as last
+                    candle_list = list(store) + [candle]
 
                     if self.enable_short:
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
@@ -2159,7 +2232,7 @@ class TradingBot:
         """Check fixed-ratio TP on intra-candle updates (price touch). Not used in st_mode."""
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade: return
-        if trade.get("st_mode", False): return   # ST-mode uses candle-close reversal only
+        if trade.get("st_mode", False): return
 
         tp        = trade.get("take_profit")
         direction = trade.get("direction", "SHORT")
@@ -2169,20 +2242,20 @@ class TradingBot:
         if direction == "SHORT" and candle["low"] <= tp:
             self._log("info", "TP-HIT",
                       f"TAKE PROFIT HIT (intra-candle) | {symbol} | "
-                      f"entry={entry:.4f} tp={tp:.4f} low={candle['low']:.4f}")
+                      f"entry={smart_fmt(entry)} tp={smart_fmt(tp)} low={smart_fmt(candle['low'])}")
             self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=tp)
 
         elif direction == "LONG" and candle["high"] >= tp:
             self._log("info", "TP-HIT",
                       f"TAKE PROFIT HIT (intra-candle) | {symbol} | "
-                      f"entry={entry:.4f} tp={tp:.4f} high={candle['high']:.4f}")
+                      f"entry={smart_fmt(entry)} tp={smart_fmt(tp)} high={smart_fmt(candle['high'])}")
             self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=tp)
 
     def _check_stop_loss_on_close(self, symbol: str, closed_candle: dict) -> None:
         """Check SL only on FULLY CLOSED candles. Not used once ST-mode is active."""
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade: return
-        if trade.get("st_mode", False): return   # no SL check in ST mode
+        if trade.get("st_mode", False): return
 
         sl          = trade["stop_loss"]
         direction   = trade.get("direction", "SHORT")
@@ -2192,13 +2265,13 @@ class TradingBot:
         if direction == "SHORT" and close_price >= sl:
             self._log("info", "SL-CLOSE",
                       f"STOP LOSS HIT (candle close) | {symbol} SHORT | "
-                      f"close={close_price:.4f} >= sl={sl:.4f}")
+                      f"close={smart_fmt(close_price)} >= sl={smart_fmt(sl)}")
             self._close_trade(symbol, trade, "STOP_LOSS")
 
         elif direction == "LONG" and close_price <= sl:
             self._log("info", "SL-CLOSE",
                       f"STOP LOSS HIT (candle close) | {symbol} LONG | "
-                      f"close={close_price:.4f} <= sl={sl:.4f}")
+                      f"close={smart_fmt(close_price)} <= sl={smart_fmt(sl)}")
             self._close_trade(symbol, trade, "STOP_LOSS")
 
     # ─── Signal handler ────────────────────────────────────────
@@ -2232,6 +2305,7 @@ class TradingBot:
             self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} — skip")
             return
 
+        # Compute TP without early rounding — precision kept through the pipeline
         tp = compute_take_profit(entry, sl, direction)
 
         with self._trade_lock:
@@ -2264,18 +2338,22 @@ class TradingBot:
                     "product_id": self.product_map.get(symbol),
                     "open_time":  datetime.now(timezone.utc).isoformat(),
                     "strategy":   strategy_name, "rsi": rsi_value,
-                    "st_mode":    False,      # ← SuperTrend mode flag
+                    "st_mode":    False,
                 }
 
-        rsi_str   = f"{rsi_value:.2f}" if rsi_value is not None else "N/A"
-        stop_dist = abs(entry - sl)
-        rr_actual = abs(entry - tp) / stop_dist if stop_dist > 0 else 0
+        rsi_str    = f"{rsi_value:.2f}" if rsi_value is not None else "N/A"
+        stop_dist  = abs(entry - sl)
+        rr_actual  = abs(entry - tp) / stop_dist if stop_dist > 0 else 0
         direction_arrow = "↓ SHORT" if direction == "SHORT" else "↑ LONG"
+
+        # ── All prices through smart_fmt for altcoin precision ─
         print()
         print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] — {strategy_name}")
-        print(f"           Entry       : {entry:.4f}")
-        print(f"           Stop Loss   : {sl:.4f}  (distance={stop_dist:.4f}) [triggers on CANDLE CLOSE]")
-        print(f"           Take Profit : {tp:.4f}  (R:R = 1:{rr_actual:.2f}) [triggers on PRICE TOUCH]")
+        print(f"           Entry       : {smart_fmt(entry)}")
+        print(f"           Stop Loss   : {smart_fmt(sl)}  "
+              f"(distance={smart_fmt(stop_dist)}) [triggers on CANDLE CLOSE]")
+        print(f"           Take Profit : {smart_fmt(tp)}  "
+              f"(R:R = 1:{rr_actual:.2f}) [triggers on PRICE TOUCH]")
         print(f"           Risk        : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
         print(f"           RSI(14)     : {rsi_str}")
         print(f"           Mode        : {signal['mode']}")
@@ -2302,22 +2380,22 @@ class TradingBot:
 
             account_balance = self.rest.get_usd_balance() or 0.0
             capital         = self.trading_capital
-            if capital <= 0:                    self._cleanup_trade(symbol); return
-            if account_balance < capital:       capital = account_balance
-            if capital <= 0:                    self._cleanup_trade(symbol); return
+            if capital <= 0:              self._cleanup_trade(symbol); return
+            if account_balance < capital: capital = account_balance
+            if capital <= 0:              self._cleanup_trade(symbol); return
 
             entry     = signal["entry"]
             sl        = signal["stop_loss"]
             tp        = signal["take_profit"]
             direction = signal["direction"]
             pid       = self.product_map.get(symbol)
-            if not pid:                         self._cleanup_trade(symbol); return
+            if not pid:                   self._cleanup_trade(symbol); return
 
             position_size, _ = compute_position_size(
                 entry_price=entry, stop_loss_price=sl,
                 account_balance=capital, risk_pct=self.risk_pct, leverage=self.leverage,
             )
-            if position_size < 1:               self._cleanup_trade(symbol); return
+            if position_size < 1:         self._cleanup_trade(symbol); return
 
             side         = "sell" if direction == "SHORT" else "buy"
             entry_result = self.rest.place_order(
@@ -2348,21 +2426,20 @@ class TradingBot:
             print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | "
                   f"filled={actual_filled_size} contracts")
 
-            # Place initial fixed-ratio bracket TP
             bracket_result = self.rest.place_take_profit_only(
                 product_id=pid, tp_price=tp, symbol=symbol
             )
             bracket_ok = bracket_result and "error" not in bracket_result
 
             if bracket_ok:
-                print(f"  [TP BRACKET OK] Take profit bracket placed at {tp:.4f}")
-                self._log("info", "BRACKET", f"TP bracket placed for {symbol} at {tp:.4f}")
+                print(f"  [TP BRACKET OK] Take profit bracket placed at {smart_fmt(tp)}")
+                self._log("info", "BRACKET", f"TP bracket placed for {symbol} at {smart_fmt(tp)}")
             else:
                 self._log("warning", "BRACKET",
                           f"TP bracket FAILED for {symbol}: {bracket_result}")
 
             self._log("info", "LOCAL-SL",
-                      f"Stop loss managed locally for {symbol} at {sl:.4f} (candle close)")
+                      f"Stop loss managed locally for {symbol} at {smart_fmt(sl)} (candle close)")
 
             signal["executed"]      = True
             signal["size"]          = actual_filled_size
@@ -2370,21 +2447,21 @@ class TradingBot:
             signal["bracket_tp_ok"] = bracket_ok
 
             trade_record = {
-                "entry":          entry, "stop_loss": sl, "take_profit": tp,
-                "direction":      direction, "size": actual_filled_size,
-                "product_id":     pid, "order_id": order_id,
-                "open_time":      datetime.now(timezone.utc).isoformat(),
-                "strategy":       signal.get("strategy", "UNKNOWN"),
-                "rsi":            signal.get("rsi"),
-                "bracket_tp_ok":  bracket_ok,
-                "st_mode":        False,   # ← SuperTrend mode flag
+                "entry":         entry, "stop_loss": sl, "take_profit": tp,
+                "direction":     direction, "size": actual_filled_size,
+                "product_id":    pid, "order_id": order_id,
+                "open_time":     datetime.now(timezone.utc).isoformat(),
+                "strategy":      signal.get("strategy", "UNKNOWN"),
+                "rsi":           signal.get("rsi"),
+                "bracket_tp_ok": bracket_ok,
+                "st_mode":       False,
             }
 
             with self._trade_lock:
                 self.active_trades[symbol] = trade_record
 
             if self.notifier:
-                trade_copy         = trade_record.copy()
+                trade_copy           = trade_record.copy()
                 trade_copy["symbol"] = symbol
                 self.notifier.send_trade_executed(trade_copy)
 
@@ -2413,10 +2490,9 @@ class TradingBot:
         print("|                                                        |")
         print("|   RSI SHORT filter : RSI(14) > 55                      |")
         print("|   RSI LONG  filter : RSI(14) < 37                      |")
-        print("|   RSI LONG  BLOCK   : RSI(14) < 22 (extreme oversold)  |")
+        print("|   RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold)  |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
-        print("|   Order-first PnL  : order_id → product_id (5 retries) |")
-        print("|   Gmail alerts     : signal, ST confirm, ST exit        |")
+        print("|   Precision        : auto dp — altcoin micro-prices OK  |")
         print("+========================================================+")
         print()
 
@@ -2439,16 +2515,17 @@ class TradingBot:
         print(f"  LONG TRADES       : {'ENABLED' if self.enable_long else 'DISABLED'}")
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
-        print(f"  RSI LONG  BLOCK   : RSI(14) < 22 (extreme oversold — no trades)")
+        print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
+        print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid     = self.product_map.get(sym, "???")
             tick_sz = self.rest.get_tick_size(sym)
-            print(f"    - {sym:<22} pid={pid}  tick={tick_sz}")
+            print(f"    - {sym:<22} pid={pid}  tick={smart_fmt(tick_sz)}")
         print("+--------------------------------------------------------+")
         print()
 
@@ -2659,7 +2736,8 @@ def main() -> None:
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
     print("  |   Short + Long  |  RSI(14) filter  |  GMAIL         |")
-    print("  |   RSI LONG BLOCK: < 22 (extreme oversold)           |")
+    print("  |   RSI LONG BLOCK: < 24 (extreme oversold)           |")
+    print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
 
     _divider("SETUP")
@@ -2668,10 +2746,10 @@ def main() -> None:
         test_gmail()
         print("\n  Continuing with bot setup...")
 
-    timeframe            = ask_timeframe()
+    timeframe                  = ask_timeframe()
     paper, api_key, api_secret = ask_mode()
     enable_short, enable_long  = ask_trade_directions()
-    notifier             = ask_gmail_config()
+    notifier                   = ask_gmail_config()
 
     _divider("CONNECTING TO DELTA EXCHANGE INDIA")
     rest_tmp = DeltaREST(api_key, api_secret)
@@ -2722,7 +2800,8 @@ def main() -> None:
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
-    print(f"  RSI LONG BLOCK    : RSI(14) < 22 (prevents trades in extreme oversold)")
+    print(f"  RSI LONG BLOCK    : RSI(14) < 24 (prevents trades in extreme oversold)")
+    print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
@@ -2761,8 +2840,7 @@ def main() -> None:
             open_n    = len(bot.active_trades)
             open_syms = list(bot.active_trades.keys())
             ws_state  = bot.ws_manager.get_state() if bot.ws_manager else "N/A"
-            # Show ST-mode status for each active trade
-            st_info = ""
+            st_info   = ""
             for sym, t in bot.active_trades.items():
                 if isinstance(t, dict) and t.get("st_mode"):
                     st_info += f"[{sym}:ST-MODE] "
