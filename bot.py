@@ -73,7 +73,7 @@ def _log(level: str, tag: str, msg: str) -> None:
 
 
 # ================================================================
-#  3b.  PRICE FORMATTING UTILITY  (NEW — precision for altcoins)
+#  3b.  PRICE FORMATTING UTILITY
 # ================================================================
 
 def smart_fmt(price: float) -> str:
@@ -81,18 +81,6 @@ def smart_fmt(price: float) -> str:
     Dynamically selects decimal places based on price magnitude so that
     small-priced altcoins (e.g. 0.13498, 1.05928, 0.00142) are displayed
     with full precision while large prices (BTC at 65 000) stay clean.
-
-    Scale:
-        >= 10 000  → 2 dp    e.g. 65432.12
-        >= 1 000   → 3 dp    e.g. 1850.500  → "1850.50"
-        >= 100     → 4 dp    e.g. 105.9280  → "105.928"
-        >= 10      → 5 dp    e.g. 12.34560  → "12.3456"
-        >= 1       → 6 dp    e.g. 1.059280  → "1.05928"
-        >= 0.1     → 7 dp    e.g. 0.1349800 → "0.13498"
-        >= 0.01    → 8 dp    e.g. 0.0014200 → "0.00142"
-        < 0.01     → 10 dp   e.g. 0.000035
-
-    Trailing zeros are stripped, but at least 2 decimal places are kept.
     """
     if price == 0:
         return "0"
@@ -125,7 +113,6 @@ class GmailNotifier:
     """
     Gmail notification handler for trading signals and events.
     Uses Gmail App Password (not regular password) for security.
-    All price fields now use smart_fmt() for full altcoin precision.
     """
 
     def __init__(
@@ -176,7 +163,6 @@ class GmailNotifier:
         signal_time     = signal.get("time", datetime.now(timezone.utc).isoformat())
         direction_emoji = "🔴 SHORT" if direction == "SHORT" else "🟢 LONG"
 
-        # ── use smart_fmt for all price fields ───────────────
         risk_dist   = abs(entry - stop_loss)
         reward_dist = abs(take_profit - entry)
         rr          = (reward_dist / risk_dist) if risk_dist > 0 else 0
@@ -213,7 +199,6 @@ class GmailNotifier:
     def send_supertrend_strong(self, symbol: str, direction: str, entry: float,
                                 new_tp: float, st1: float, st2: float,
                                 timeframe: str, mode: str) -> bool:
-        """Send notification when both SuperTrends confirm the trade direction."""
         if not self.enabled:
             return False
         if direction == "SHORT":
@@ -250,7 +235,6 @@ class GmailNotifier:
     def send_supertrend_exit(self, symbol: str, direction: str, entry: float,
                               exit_price: float, realized_pnl: float,
                               timeframe: str, mode: str) -> bool:
-        """Send notification when SuperTrend-based TP is triggered (trend reversal)."""
         if not self.enabled:
             return False
         is_profit   = realized_pnl > 0
@@ -365,7 +349,7 @@ class GmailNotifier:
         """
         return self._send_email(subject, body)
 
-    def send_startup_report(self, config: dict, symbols: List[str]) -> bool:
+    def send_startup_report(self, config: dict, symbols: List[str], harami_tolerance: float) -> bool:
         if not self.enabled:
             return False
         mode         = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
@@ -395,6 +379,7 @@ class GmailNotifier:
 ║  SuperTrend 1   : Length=14, Factor=2.0
 ║  SuperTrend 2   : Length=21, Factor=1.0
 ║  Price Display  : Auto-precision (up to 10 dp for micro-price alts)
+║  Harami Tolerance: {harami_tolerance*100:.2f}% body tolerance
 ╠══════════════════════════════════════════════════════════════╣
 ║  Symbols ({len(symbols)}):
 {symbols_list}
@@ -585,11 +570,6 @@ class DeltaWebSocket:
         return {"symbol": trading_symbol, "candle": candle}
 
     def _normalize_candle_flat(self, data: dict) -> Optional[dict]:
-        """
-        Parse candle fields from WebSocket message.
-        Prices stored as raw float — NO rounding applied here so altcoin
-        micro-prices (e.g. 0.00142) are preserved exactly.
-        """
         try:
             ts_raw = data.get("candle_start_time")
             if ts_raw is not None:
@@ -605,7 +585,6 @@ class DeltaWebSocket:
                         break
                 else: return None
             if ts <= 0: return None
-            # Store prices as full-precision floats — no rounding
             return {
                 "time":   ts,
                 "open":   float(data.get("open",   0)),
@@ -676,12 +655,14 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 BREAKOUT_BODY_OVERLAP_MIN_PCT = 0.50
 MIN_ENGULF_BODY_PCT           = 0.30
 
+# ── Harami pattern tolerance (default, can be overridden by user input) ──
+HARAMI_BODY_TOLERANCE = 0.001   # 0.1% default
+
 # ── SuperTrend parameters ─────────────────────────────────────
 ST1_LENGTH = 14    # Accurate SuperTrend
 ST1_FACTOR = 2.0
 ST2_LENGTH = 21    # Trend SuperTrend
 ST2_FACTOR = 1.0
-# ─────────────────────────────────────────────────────────────
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m":  {"resolution": "1m",  "api_resolution": "1m",  "ws_channel": "candlestick_1m",  "secs": 60},
@@ -714,7 +695,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/12.0",
+            "User-Agent":   "python-DeltaBot/12.1",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -879,12 +860,6 @@ def check_rsi_filter(closed_candles: List[dict], symbol: str = "",
 # ================================================================
 
 def compute_atr(candles: List[dict], period: int) -> List[float]:
-    """
-    Compute ATR using Wilder's smoothing (RMA).
-    Returns a list of ATR values aligned to candles (index 0..N-1).
-    Values before index `period` are None placeholders → stored as 0.0.
-    All arithmetic uses full float precision — no rounding.
-    """
     n = len(candles)
     if n < 2:
         return [0.0] * n
@@ -912,16 +887,6 @@ def compute_atr(candles: List[dict], period: int) -> List[float]:
 
 def compute_supertrend(candles: List[dict],
                         length: int, factor: float) -> List[Optional[bool]]:
-    """
-    Compute SuperTrend for a list of closed candles.
-    All band arithmetic uses full float precision — essential for altcoins
-    with prices like 0.00142 where rounding would corrupt the signal.
-
-    Returns list of booleans:
-        True  → bullish / GREEN
-        False → bearish / RED
-        None  → insufficient data
-    """
     n    = len(candles)
     atrs = compute_atr(candles, length)
 
@@ -993,10 +958,6 @@ def both_supertrends_bearish(candles: List[dict]) -> bool:
 
 
 def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Return the numeric SuperTrend line values for the last closed candle.
-    Returned as raw floats — caller uses smart_fmt() for display.
-    """
     def _get_last_band(cndls, length, factor):
         n    = len(cndls)
         atrs = compute_atr(cndls, length)
@@ -1123,7 +1084,7 @@ def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[d
     return True, result, "BEARISH_DOJI"
 
 
-def check_short_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+def check_short_signal_strategy_6(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 4: return False, None, ""
     signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
     if not is_bullish(i3):             return False, None, ""
@@ -1134,13 +1095,18 @@ def check_short_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[d
     i2_body_bottom = min(i2["open"], i2["close"])
     i1_body_top    = max(i1["open"], i1["close"])
     i1_body_bottom = min(i1["open"], i1["close"])
-    if not (i1_body_top <= i2_body_top and i1_body_bottom >= i2_body_bottom):
+    
+    i1_body_size = candle_body(i1)
+    tolerance = max(i1_body_size * harami_tolerance, 0.0001)
+    
+    if not (i1_body_top >= i2_body_top - tolerance and i1_body_bottom <= i2_body_bottom + tolerance):
         return False, None, ""
+    
     if not is_bearish(signal):             return False, None, ""
     if signal["close"] >= i1["close"]:     return False, None, ""
     sc = signal.copy()
     sc["pattern_high"] = max(i2["high"], i1["high"])
-    _log("info", "BEARISH_HARAMI", "Harami pattern detected")
+    _log("info", "BEARISH_HARAMI", f"Bearish Harami with {harami_tolerance*100:.1f}% tolerance")
     return True, sc, "BEARISH_HARAMI"
 
 
@@ -1199,7 +1165,7 @@ def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[di
     return True, result, "BULLISH_DOJI"
 
 
-def check_long_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+def check_long_signal_strategy_6(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 4: return False, None, ""
     signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
     if not is_bearish(i3):             return False, None, ""
@@ -1210,13 +1176,18 @@ def check_long_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[di
     i2_body_bottom = min(i2["open"], i2["close"])
     i1_body_top    = max(i1["open"], i1["close"])
     i1_body_bottom = min(i1["open"], i1["close"])
-    if not (i1_body_top <= i2_body_top and i1_body_bottom >= i2_body_bottom):
+    
+    i1_body_size = candle_body(i1)
+    tolerance = max(i1_body_size * harami_tolerance, 0.0001)
+    
+    if not (i1_body_top >= i2_body_top - tolerance and i1_body_bottom <= i2_body_bottom + tolerance):
         return False, None, ""
+    
     if not is_bullish(signal):             return False, None, ""
     if signal["close"] <= i1["close"]:     return False, None, ""
     sc = signal.copy()
     sc["pattern_low"] = min(i2["low"], i1["low"])
-    _log("info", "BULLISH_HARAMI", "Bullish Harami pattern detected")
+    _log("info", "BULLISH_HARAMI", f"Bullish Harami with {harami_tolerance*100:.1f}% tolerance")
     return True, sc, "BULLISH_HARAMI"
 
 
@@ -1225,7 +1196,7 @@ def check_long_signal_strategy_6(candles: List[dict]) -> Tuple[bool, Optional[di
 # ================================================================
 
 def check_short_signal(
-    candles: List[dict], symbol: str = "",
+    candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     closed_candles = candles[:-1]
     rsi_passes, rsi_value = check_rsi_filter(
@@ -1237,18 +1208,25 @@ def check_short_signal(
         check_short_signal_strategy_1,
         check_short_signal_strategy_3,
         check_short_signal_strategy_5,
-        check_short_signal_strategy_6,
     ):
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
             _log("info", "SIGNAL",
                  f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
             return True, signal_candle, strategy, rsi_value
+    
+    # Check Harami with tolerance
+    triggered, signal_candle, strategy = check_short_signal_strategy_6(candles, harami_tolerance)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+        return True, signal_candle, strategy, rsi_value
+    
     return False, None, "", rsi_value
 
 
 def check_long_signal(
-    candles: List[dict], symbol: str = "",
+    candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     closed_candles = candles[:-1]
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
@@ -1265,13 +1243,20 @@ def check_long_signal(
         check_long_signal_strategy_1,
         check_long_signal_strategy_3,
         check_long_signal_strategy_5,
-        check_long_signal_strategy_6,
     ):
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
             _log("info", "SIGNAL",
                  f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
             return True, signal_candle, strategy, rsi
+    
+    # Check Harami with tolerance
+    triggered, signal_candle, strategy = check_long_signal_strategy_6(candles, harami_tolerance)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
+        return True, signal_candle, strategy, rsi
+    
     return False, None, "", rsi
 
 
@@ -1353,10 +1338,6 @@ def _extract_timestamp(src: dict) -> int:
 
 
 def _extract_price(src: dict, long_key: str, short_key: str) -> Optional[float]:
-    """
-    Extract price as raw float — NO rounding applied.
-    Preserves full precision for micro-price altcoins.
-    """
     for k in (long_key, short_key):
         v = src.get(k)
         if v is not None:
@@ -1374,7 +1355,6 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
     c  = _extract_price(row, "close",  "c")
     v  = _extract_price(row, "volume", "v") or 0.0
     if any(x is None for x in (o, h, l, c)): return None
-    # Store as raw floats — smart_fmt() handles display precision
     return {"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
 
 
@@ -1383,21 +1363,12 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
 # ================================================================
 
 def round_to_tick(price: float, tick_size: float) -> float:
-    """
-    Round price to the nearest tick size.
-
-    FIXED: fallback now uses 8 decimal places (was 2), so altcoins with
-    micro tick sizes like 0.00001 are not truncated to 2 dp.
-
-    The decimal-places count is derived from the tick_size string
-    representation — this handles sizes like 0.00001 correctly.
-    """
     if tick_size <= 0:
-        return round(price, 8)          # ← was round(price, 2) — FIXED
+        return round(price, 8)
     rounded  = round(price / tick_size) * tick_size
     tick_str = f"{tick_size:.10f}".rstrip("0")
     dp       = len(tick_str.split(".")[-1]) if "." in tick_str else 0
-    return round(rounded, max(dp, 2))   # keep at least 2 dp for exchange compatibility
+    return round(rounded, max(dp, 2))
 
 
 # ================================================================
@@ -1440,7 +1411,6 @@ class DeltaREST:
                 if sym and pid is not None:
                     pmap[sym] = int(pid)
                     try:
-                        # Store tick_size as full-precision float
                         self._tick_sizes[sym] = float(tick_raw)
                     except (TypeError, ValueError):
                         self._tick_sizes[sym] = 0.01
@@ -1490,10 +1460,6 @@ class DeltaREST:
         return result or {"error": "no_response"}
 
     def place_take_profit_only(self, product_id: int, tp_price: float, symbol: str = "") -> dict:
-        """
-        Place ONLY a take-profit bracket order (no stop loss).
-        Uses round_to_tick() which now supports full altcoin precision.
-        """
         if tp_price <= 0:
             return {"error": "invalid_tp_price"}
         tick_size  = self.get_tick_size(symbol) if symbol else 0.01
@@ -1514,7 +1480,6 @@ class DeltaREST:
         return result or {"error": "no_response"}
 
     def cancel_bracket_tp(self, product_id: int) -> bool:
-        """Cancel an existing bracket/TP order for the product (best-effort)."""
         try:
             result = self.request_handler.request(
                 "DELETE", "/v2/orders/bracket",
@@ -1672,9 +1637,9 @@ def compute_position_size(entry_price: float, stop_loss_price: float,
         "account_balance":  round(account_balance, 2),
         "risk_pct":         round(risk_pct * 100, 2),
         "risk_amount":      round(risk_amount, 2),
-        "entry_price":      entry_price,          # ← full precision (was round(,4))
-        "stop_loss_price":  stop_loss_price,      # ← full precision (was round(,4))
-        "stop_distance":    stop_distance,        # ← full precision (was round(,4))
+        "entry_price":      entry_price,
+        "stop_loss_price":  stop_loss_price,
+        "stop_distance":    stop_distance,
         "risk_size_raw":    round(risk_size, 6),
         "max_by_margin":    round(max_by_margin, 6),
         "final_size":       final_size,
@@ -1695,7 +1660,6 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
         tp = entry_price - tp_distance
     else:
         tp = entry_price + tp_distance
-    # Keep full float precision — do NOT round here; rounding happens in round_to_tick()
     return tp
 
 
@@ -1760,35 +1724,14 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT  (v12.0 — dual SuperTrend TP extension)
+#  21. TRADING BOT  (v12.1 — Configurable Harami Tolerance)
 # ================================================================
 
 class TradingBot:
     """
-    Key SuperTrend behaviour added in v12.0:
-
-    After taking entry:
-    ─ On every CLOSED candle, both ST(14,2) and ST(21,1) are evaluated.
-    ─ If BOTH confirm the trade direction (both RED for SHORT, both GREEN for LONG)
-      AND this is the first time this condition is detected for the trade:
-        • A Gmail alert is sent: "Strong down/up trend — SuperTrend confirmed"
-        • The existing bracket-TP is cancelled (live mode).
-        • The trade is flagged `st_mode = True`.
-        • Normal fixed-ratio TP no longer triggers for this trade.
-
-    While in st_mode:
-    ─ On every CLOSED candle, check if BOTH SuperTrends have REVERSED direction.
-    ─ If the reversal is detected:
-        • Position is closed at market (or bracket TP cancellation + close).
-        • Gmail exit alert is sent.
-        • Realized PnL is fetched and daily-loss tracker updated.
-
-    Precision update (v12.0p):
-    ─ All price display now uses smart_fmt() instead of :.4f
-    ─ Supports altcoin prices with up to 10 decimal places
-    ─ round_to_tick() fallback changed from 2dp to 8dp
-    ─ compute_take_profit() no longer applies premature rounding
-    ─ Candle OHLC stored as raw float — no truncation at any stage
+    v12.1: Added configurable Harami body tolerance.
+    The user can set HARAMI_BODY_TOLERANCE at startup (0.001 = 0.1% default).
+    Both Bearish and Bullish Harami patterns use this tolerance.
     """
 
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
@@ -1804,6 +1747,9 @@ class TradingBot:
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
         self.enable_short    = config.get("enable_short", True)
         self.enable_long     = config.get("enable_long", True)
+        
+        # Get Harami tolerance from config, fallback to default
+        self.harami_tolerance = config.get("harami_tolerance", HARAMI_BODY_TOLERANCE)
 
         self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
         self.timeframe      = self._tf.key
@@ -1975,12 +1921,6 @@ class TradingBot:
     # ─── SuperTrend evaluation on closed candle ────────────────
 
     def _check_supertrend_conditions(self, symbol: str, closed_candles: List[dict]) -> None:
-        """
-        Called on every new CLOSED candle for symbols with an active trade.
-        Handles both:
-          1. ST confirmation → upgrade to st_mode (send alert, change TP logic)
-          2. ST reversal     → exit trade (while in st_mode)
-        """
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade:
             return
@@ -1995,7 +1935,6 @@ class TradingBot:
         bearish_now = both_supertrends_bearish(closed_candles)
         bullish_now = both_supertrends_bullish(closed_candles)
 
-        # ── 1. Not yet in ST mode → check if both STs NOW confirm direction ──
         if not st_mode:
             confirmed = (
                 (direction == "SHORT" and bearish_now) or
@@ -2034,7 +1973,6 @@ class TradingBot:
                         mode="PAPER" if self.paper else "LIVE",
                     )
 
-        # ── 2. Already in ST mode → watch for REVERSAL ───────────────────
         else:
             reversed_trend = (
                 (direction == "SHORT" and bullish_now) or
@@ -2097,7 +2035,7 @@ class TradingBot:
         self._print_startup_summary()
 
         if self.notifier:
-            self.notifier.send_startup_report(self.config, self.symbols)
+            self.notifier.send_startup_report(self.config, self.symbols, self.harami_tolerance)
 
         self._fetch_all_historical()
         self._start_ws()
@@ -2171,7 +2109,6 @@ class TradingBot:
         if store is None: return
         if not validate_candle(candle, symbol): return
 
-        # ── LIVE UPDATE (same timestamp = intra-candle) ───────
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
             if symbol in self.active_trades:
@@ -2180,7 +2117,6 @@ class TradingBot:
                     self._check_take_profit(symbol, candle)
             return
 
-        # ── NEW CANDLE (previous candle is fully CLOSED) ──────
         if store:
             closed_candle  = store[-1]
             closed_candles = list(store)
@@ -2212,7 +2148,7 @@ class TradingBot:
 
                     if self.enable_short:
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
-                            candle_list, symbol=symbol
+                            candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
@@ -2220,7 +2156,7 @@ class TradingBot:
 
                     if self.enable_long and symbol not in self.active_trades:
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
-                            candle_list, symbol=symbol
+                            candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
@@ -2229,7 +2165,6 @@ class TradingBot:
         store.append(candle)
 
     def _check_take_profit(self, symbol: str, candle: dict) -> None:
-        """Check fixed-ratio TP on intra-candle updates (price touch). Not used in st_mode."""
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade: return
         if trade.get("st_mode", False): return
@@ -2252,7 +2187,6 @@ class TradingBot:
             self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=tp)
 
     def _check_stop_loss_on_close(self, symbol: str, closed_candle: dict) -> None:
-        """Check SL only on FULLY CLOSED candles. Not used once ST-mode is active."""
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade: return
         if trade.get("st_mode", False): return
@@ -2305,7 +2239,6 @@ class TradingBot:
             self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} — skip")
             return
 
-        # Compute TP without early rounding — precision kept through the pipeline
         tp = compute_take_profit(entry, sl, direction)
 
         with self._trade_lock:
@@ -2346,7 +2279,6 @@ class TradingBot:
         rr_actual  = abs(entry - tp) / stop_dist if stop_dist > 0 else 0
         direction_arrow = "↓ SHORT" if direction == "SHORT" else "↑ LONG"
 
-        # ── All prices through smart_fmt for altcoin precision ─
         print()
         print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] — {strategy_name}")
         print(f"           Entry       : {smart_fmt(entry)}")
@@ -2358,6 +2290,8 @@ class TradingBot:
         print(f"           RSI(14)     : {rsi_str}")
         print(f"           Mode        : {signal['mode']}")
         print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
+        if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
+            print(f"           Harami Tol : {self.harami_tolerance*100:.2f}%")
         print()
 
         if self.notifier:
@@ -2478,12 +2412,12 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.0           |")
-        print("|   DUAL SUPERTREND TP EXTENSION                         |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.1           |")
+        print("|   CONFIGURABLE HARAMI TOLERANCE                        |")
         print("|                                                        |")
         print("|   STOP LOSS : Triggers ONLY on CANDLE CLOSE            |")
         print("|   TAKE PROFIT (normal)  : 2:1 R:R on price touch       |")
-        print("|   TAKE PROFIT (ST mode) : Both SuperTrends REVERSE      |")
+        print("|   TAKE PROFIT (ST mode) : Both SuperTrends REVERSE     |")
         print("|                                                        |")
         print("|   SuperTrend 1 : Length=14, Factor=2.0  (accurate)     |")
         print("|   SuperTrend 2 : Length=21, Factor=1.0  (trend)        |")
@@ -2493,6 +2427,7 @@ class TradingBot:
         print("|   RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold)  |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
         print("|   Precision        : auto dp — altcoin micro-prices OK  |")
+        print(f"|   Harami Tolerance : {self.harami_tolerance*100:.2f}% body tolerance  |")
         print("+========================================================+")
         print()
 
@@ -2518,6 +2453,7 @@ class TradingBot:
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
+        print(f"  Harami Tolerance  : {self.harami_tolerance*100:.2f}% body tolerance")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
@@ -2676,6 +2612,34 @@ def ask_daily_loss_limit() -> float:
     return daily_loss
 
 
+def ask_harami_tolerance() -> float:
+    _divider("HARAMI TOLERANCE")
+    print("  Harami tolerance allows the second candle's body to be")
+    print("  slightly outside the first candle's body boundaries.")
+    print()
+    print("  Examples:")
+    print("    0.001  = 0.1% tolerance  (very strict - default)")
+    print("    0.005  = 0.5% tolerance  (some flexibility)")
+    print("    0.01   = 1.0% tolerance  (moderate flexibility)")
+    print("    0.05   = 5.0% tolerance  (very flexible)")
+    print("    0.10   = 10.0% tolerance (highly flexible)")
+    print("    0.20   = 20.0% tolerance (almost any pattern)")
+    print()
+    try:
+        tolerance = float(input("  Harami body tolerance (default = 0.001) : ").strip() or 0.001)
+        if tolerance > 0.20:
+            print(f"  ⚠️  WARNING: {tolerance*100:.1f}% is very permissive!")
+            print("  This may detect patterns that aren't true Harami.")
+            proceed = input("  Continue with this value? (y/N) : ").strip().lower()
+            if proceed != 'y':
+                return ask_harami_tolerance()
+        tolerance = max(0.0001, tolerance)
+    except ValueError:
+        tolerance = 0.001
+    print(f"  Harami tolerance : {tolerance*100:.2f}%")
+    return tolerance
+
+
 # ================================================================
 #  23. TEST FUNCTION
 # ================================================================
@@ -2731,12 +2695,13 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.0       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.1       |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
     print("  |   Short + Long  |  RSI(14) filter  |  GMAIL         |")
     print("  |   RSI LONG BLOCK: < 24 (extreme oversold)           |")
+    print("  |   CONFIGURABLE HARAMI TOLERANCE                     |")
     print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
 
@@ -2750,6 +2715,7 @@ def main() -> None:
     paper, api_key, api_secret = ask_mode()
     enable_short, enable_long  = ask_trade_directions()
     notifier                   = ask_gmail_config()
+    harami_tolerance           = ask_harami_tolerance()
 
     _divider("CONNECTING TO DELTA EXCHANGE INDIA")
     rest_tmp = DeltaREST(api_key, api_secret)
@@ -2801,6 +2767,7 @@ def main() -> None:
     print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print(f"  RSI LONG BLOCK    : RSI(14) < 24 (prevents trades in extreme oversold)")
+    print(f"  Harami Tolerance  : {harami_tolerance*100:.2f}% body tolerance")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
@@ -2821,6 +2788,7 @@ def main() -> None:
         "daily_loss_limit_pct":  daily_loss_limit_pct / 100.0,
         "enable_short":          enable_short,
         "enable_long":           enable_long,
+        "harami_tolerance":      harami_tolerance,
     }
 
     bot = TradingBot(cfg, notifier=notifier)
