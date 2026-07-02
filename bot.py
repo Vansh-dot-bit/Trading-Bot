@@ -372,7 +372,7 @@ class GmailNotifier:
 ║  SHORT TRADES   : {"ENABLED" if config.get('enable_short', True) else "DISABLED"}
 ║  LONG TRADES    : {"ENABLED" if config.get('enable_long', True) else "DISABLED"}
 ║  SHORT RSI      : > 55
-║  LONG RSI       : < 37
+║  LONG RSI       : < 40
 ║  RSI LONG BLOCK : < 24 (extreme oversold)
 ║  Take Profit    : 2:1 R:R (or SuperTrend exit if both ST confirm)
 ║  Stop Loss      : Triggers on CANDLE CLOSE (not intraday)
@@ -641,7 +641,7 @@ CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD      = 14
 RSI_OVERBOUGHT  = 55.0
-RSI_OVERSOLD    = 37.0
+RSI_OVERSOLD    = 40.0  # Changed from 37 to 40
 RSI_MIN_CANDLES = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL = 0.5
@@ -1236,7 +1236,7 @@ def check_long_signal(
         _log("warning", f"RSI [{symbol}]",
              f"RSI={rsi:.2f} < 24 — BLOCKING LONG TRADE (extreme oversold)")
         return False, None, "", rsi
-    if rsi >= RSI_OVERSOLD:
+    if rsi >= RSI_OVERSOLD:  # Now using 40.0
         return False, None, "", rsi
     _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
     for checker in (
@@ -2423,7 +2423,7 @@ class TradingBot:
         print("|   SuperTrend 2 : Length=21, Factor=1.0  (trend)        |")
         print("|                                                        |")
         print("|   RSI SHORT filter : RSI(14) > 55                      |")
-        print("|   RSI LONG  filter : RSI(14) < 37                      |")
+        print("|   RSI LONG  filter : RSI(14) < 40                      |")
         print("|   RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold)  |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
         print("|   Precision        : auto dp — altcoin micro-prices OK  |")
