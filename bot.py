@@ -206,7 +206,7 @@ Take Profit: Triggers on PRICE TOUCH
 SuperTrend : Monitored post-entry"""
         
         if no_rsi:
-            body += "\nRSI Filter : DISABLED (Range Break strategy)"
+            body += "\nRSI Filter : DISABLED"
         if strategy in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
             body += f"\nHarami Tol : {signal.get('harami_tolerance', 0.001)*100:.2f}%"
         
@@ -323,7 +323,7 @@ Take Profit: Triggers on PRICE TOUCH
 SuperTrend : Monitoring post-entry"""
         
         if no_rsi:
-            body += "\nRSI Filter : DISABLED (Range Break strategy)"
+            body += "\nRSI Filter : DISABLED"
         
         return self._send_email(subject, body)
 
@@ -414,7 +414,7 @@ RSI FILTERS
 SHORT RSI      : > 55
 LONG RSI       : < 40
 RSI LONG BLOCK : < 24 (extreme oversold)
-RANGE BREAK    : No RSI filter
+NO RSI         : Range Break, Small→Large Body
 
 STRATEGY PARAMETERS
 ─────────────────────────────
@@ -423,6 +423,8 @@ Stop Loss      : Triggers on CANDLE CLOSE
 SuperTrend 1   : Length=14, Factor=2.0
 SuperTrend 2   : Length=21, Factor=1.0
 Harami Tolerance: {harami_tolerance*100:.2f}%
+Small Body Thresh: 25% of range
+Large Body Factor: 2x avg
 Price Display  : Auto-precision (up to 10 dp for micro-price alts)
 
 MONITORED SYMBOLS ({len(symbols)})
@@ -704,6 +706,11 @@ HARAMI_BODY_TOLERANCE = 0.001   # 0.1% default
 
 # ── Range Break Strategy Constants ──────────────────────────────
 RANGE_BREAK_LOOKBACK = 7          # Number of candles to identify range
+
+# ── Small Body → Large Body Strategy Constants ──────────────────
+SMALL_BODY_LOOKBACK = 7           # Number of candles to check for small bodies
+LARGE_BODY_MULTIPLIER = 2.0       # Current body must be at least 2x the average of previous bodies
+SMALL_BODY_THRESHOLD = 0.25       # 25% - Body must be less than 25% of range (UPDATED)
 
 # ── SuperTrend parameters ─────────────────────────────────────
 ST1_LENGTH = 14    # Accurate SuperTrend
@@ -1119,6 +1126,10 @@ def check_short_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[d
 
 
 def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Doji Short Strategy - UPDATED:
+    Signal candle must close BELOW the doji candle's LOW.
+    """
     if len(candles) < 4: return False, None, ""
     signal_c = candles[-1]; doji_c = candles[-2]; i1 = candles[-3]; i2 = candles[-4]
     if not is_bullish(i2):             return False, None, ""
@@ -1126,8 +1137,11 @@ def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[d
     if not is_doji(doji_c):            return False, None, ""
     if doji_c["high"] <= i1["high"]:   return False, None, ""
     if not is_bearish(signal_c):       return False, None, ""
+    # UPDATED: Signal candle must close BELOW doji low
+    if signal_c["close"] >= doji_c["low"]: return False, None, ""
     result = signal_c.copy()
-    result["doji_high"] = doji_c["high"]
+    result["doji_low"] = doji_c["low"]      # Use doji low as reference
+    _log("info", "BEARISH_DOJI", f"Signal close {signal_c['close']} < doji low {doji_c['low']}")
     return True, result, "BEARISH_DOJI"
 
 
@@ -1161,11 +1175,8 @@ def check_short_signal_strategy_6(candles: List[dict], harami_tolerance: float =
 
 def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Range Break Short Strategy:
-    1. Identify 6-7 candles in a range
-    2. One candle breaks below the range
-    3. Signal candle confirms with bearish close below the break
-    No RSI filter applied.
+    Range Break Short Strategy - UPDATED:
+    Signal candle must close BELOW the break candle's CLOSE.
     """
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 2:
@@ -1196,11 +1207,12 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     if break_candle["close"] >= range_low:
         return False, None, ""
     
-    # Signal candle must be bearish and close below break candle's low
+    # Signal candle must be bearish
     if not is_bearish(signal_candle):
         return False, None, ""
     
-    if signal_candle["close"] >= break_candle["low"]:
+    # UPDATED: Signal candle must close BELOW break candle's CLOSE
+    if signal_candle["close"] >= break_candle["close"]:
         return False, None, ""
     
     # Set stop loss at the break candle's high (or range high if higher)
@@ -1208,8 +1220,63 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     signal_candle_copy["pattern_high"] = max(break_candle["high"], range_high)
     
     _log("info", "RANGE_BREAK_SHORT", 
-         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} broken below at {smart_fmt(break_candle['low'])}")
+         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} broken below at {smart_fmt(break_candle['low'])}, "
+         f"signal close {signal_candle['close']} < break close {break_candle['close']}")
     return True, signal_candle_copy, "RANGE_BREAK_SHORT"
+
+
+# ─── SMALL BODY → LARGE BODY SHORT STRATEGY ─────────────────────
+
+def check_short_signal_small_to_large_body(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Small Body → Large Body Short Strategy (NO RSI):
+    1. Check previous 7 candles have small bodies (ignore wicks)
+    2. Current candle has a large body (at least 2x average of previous)
+    3. Current candle is RED (bearish) → take SHORT trade immediately
+    """
+    lookback = SMALL_BODY_LOOKBACK
+    if len(candles) < lookback + 1:
+        return False, None, ""
+    
+    # Get the previous lookback candles (excluding current)
+    prev_candles = candles[-(lookback + 1):-1]
+    if len(prev_candles) < lookback:
+        return False, None, ""
+    
+    current = candles[-1]
+    
+    # Calculate average body size of previous candles (ignoring wicks)
+    avg_body = sum(candle_body(c) for c in prev_candles) / lookback
+    
+    if avg_body <= 0:
+        return False, None, ""
+    
+    current_body = candle_body(current)
+    
+    # Current body must be at least LARGE_BODY_MULTIPLIER times the average
+    if current_body < avg_body * LARGE_BODY_MULTIPLIER:
+        return False, None, ""
+    
+    # Check if previous candles have small bodies (body is small relative to their range)
+    # UPDATED: Now using SMALL_BODY_THRESHOLD = 0.25 (25%)
+    for c in prev_candles:
+        if body_pct_of_range(c) >= SMALL_BODY_THRESHOLD:
+            return False, None, ""
+    
+    # Current candle must be bearish (RED) for short
+    if not is_bearish(current):
+        return False, None, ""
+    
+    # Set stop loss at current candle's high
+    current_copy = current.copy()
+    current_copy["pattern_high"] = current["high"]
+    current_copy["small_body_lookback"] = lookback
+    current_copy["avg_body"] = avg_body
+    
+    _log("info", "SMALL_TO_LARGE_SHORT", 
+         f"Small body avg {smart_fmt(avg_body)} → large body {smart_fmt(current_body)} "
+         f"({current_body/avg_body:.1f}x) - RED candle")
+    return True, current_copy, "SMALL_TO_LARGE_SHORT"
 
 
 # ================================================================
@@ -1255,6 +1322,10 @@ def check_long_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[di
 
 
 def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Doji Long Strategy - UPDATED:
+    Signal candle must close ABOVE the doji candle's HIGH.
+    """
     if len(candles) < 4: return False, None, ""
     signal_c = candles[-1]; doji_c = candles[-2]; i1 = candles[-3]; i2 = candles[-4]
     if not is_bearish(i2):             return False, None, ""
@@ -1262,8 +1333,11 @@ def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[di
     if not is_doji(doji_c):            return False, None, ""
     if doji_c["low"] >= i1["low"]:     return False, None, ""
     if not is_bullish(signal_c):       return False, None, ""
+    # UPDATED: Signal candle must close ABOVE doji high
+    if signal_c["close"] <= doji_c["high"]: return False, None, ""
     result = signal_c.copy()
-    result["doji_low"] = doji_c["low"]
+    result["doji_high"] = doji_c["high"]    # Use doji high as reference
+    _log("info", "BULLISH_DOJI", f"Signal close {signal_c['close']} > doji high {doji_c['high']}")
     return True, result, "BULLISH_DOJI"
 
 
@@ -1297,11 +1371,8 @@ def check_long_signal_strategy_6(candles: List[dict], harami_tolerance: float = 
 
 def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Range Break Long Strategy:
-    1. Identify 6-7 candles in a range
-    2. One candle breaks above the range
-    3. Signal candle confirms with bullish close above the break
-    No RSI filter applied.
+    Range Break Long Strategy - UPDATED:
+    Signal candle must close ABOVE the break candle's CLOSE.
     """
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 2:
@@ -1332,11 +1403,12 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     if break_candle["close"] <= range_high:
         return False, None, ""
     
-    # Signal candle must be bullish and close above break candle's high
+    # Signal candle must be bullish
     if not is_bullish(signal_candle):
         return False, None, ""
     
-    if signal_candle["close"] <= break_candle["high"]:
+    # UPDATED: Signal candle must close ABOVE break candle's CLOSE
+    if signal_candle["close"] <= break_candle["close"]:
         return False, None, ""
     
     # Set stop loss at the break candle's low (or range low if lower)
@@ -1344,8 +1416,63 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     signal_candle_copy["pattern_low"] = min(break_candle["low"], range_low)
     
     _log("info", "RANGE_BREAK_LONG", 
-         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} broken above at {smart_fmt(break_candle['high'])}")
+         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} broken above at {smart_fmt(break_candle['high'])}, "
+         f"signal close {signal_candle['close']} > break close {break_candle['close']}")
     return True, signal_candle_copy, "RANGE_BREAK_LONG"
+
+
+# ─── SMALL BODY → LARGE BODY LONG STRATEGY ─────────────────────
+
+def check_long_signal_small_to_large_body(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Small Body → Large Body Long Strategy (NO RSI):
+    1. Check previous 7 candles have small bodies (ignore wicks)
+    2. Current candle has a large body (at least 2x average of previous)
+    3. Current candle is GREEN (bullish) → take LONG trade immediately
+    """
+    lookback = SMALL_BODY_LOOKBACK
+    if len(candles) < lookback + 1:
+        return False, None, ""
+    
+    # Get the previous lookback candles (excluding current)
+    prev_candles = candles[-(lookback + 1):-1]
+    if len(prev_candles) < lookback:
+        return False, None, ""
+    
+    current = candles[-1]
+    
+    # Calculate average body size of previous candles (ignoring wicks)
+    avg_body = sum(candle_body(c) for c in prev_candles) / lookback
+    
+    if avg_body <= 0:
+        return False, None, ""
+    
+    current_body = candle_body(current)
+    
+    # Current body must be at least LARGE_BODY_MULTIPLIER times the average
+    if current_body < avg_body * LARGE_BODY_MULTIPLIER:
+        return False, None, ""
+    
+    # Check if previous candles have small bodies (body is small relative to their range)
+    # UPDATED: Now using SMALL_BODY_THRESHOLD = 0.25 (25%)
+    for c in prev_candles:
+        if body_pct_of_range(c) >= SMALL_BODY_THRESHOLD:
+            return False, None, ""
+    
+    # Current candle must be bullish (GREEN) for long
+    if not is_bullish(current):
+        return False, None, ""
+    
+    # Set stop loss at current candle's low
+    current_copy = current.copy()
+    current_copy["pattern_low"] = current["low"]
+    current_copy["small_body_lookback"] = lookback
+    current_copy["avg_body"] = avg_body
+    
+    _log("info", "SMALL_TO_LARGE_LONG", 
+         f"Small body avg {smart_fmt(avg_body)} → large body {smart_fmt(current_body)} "
+         f"({current_body/avg_body:.1f}x) - GREEN candle")
+    return True, current_copy, "SMALL_TO_LARGE_LONG"
 
 
 # ================================================================
@@ -1364,7 +1491,7 @@ def check_short_signal(
     for checker in (
         check_short_signal_strategy_1,
         check_short_signal_strategy_3,
-        check_short_signal_strategy_5,
+        check_short_signal_strategy_5,  # Updated Doji strategy
     ):
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
@@ -1386,7 +1513,8 @@ def check_short_signal_no_rsi(
     candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    Check short signals WITHOUT RSI filter (for Range Break strategy).
+    Check short signals WITHOUT RSI filter.
+    Strategies: Range Break, Small→Large Body
     """
     # Check Range Break first (no RSI required)
     triggered, signal_candle, strategy = check_short_signal_range_break(candles)
@@ -1394,6 +1522,14 @@ def check_short_signal_no_rsi(
         _log("info", "SIGNAL",
              f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
+    
+    # Check Small→Large Body (no RSI required)
+    triggered, signal_candle, strategy = check_short_signal_small_to_large_body(candles)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
+        return True, signal_candle, strategy, None
+    
     return False, None, "", None
 
 
@@ -1414,7 +1550,7 @@ def check_long_signal(
     for checker in (
         check_long_signal_strategy_1,
         check_long_signal_strategy_3,
-        check_long_signal_strategy_5,
+        check_long_signal_strategy_5,  # Updated Doji strategy
     ):
         triggered, signal_candle, strategy = checker(candles)
         if triggered:
@@ -1436,7 +1572,8 @@ def check_long_signal_no_rsi(
     candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    Check long signals WITHOUT RSI filter (for Range Break strategy).
+    Check long signals WITHOUT RSI filter.
+    Strategies: Range Break, Small→Large Body
     """
     # Check Range Break first (no RSI required)
     triggered, signal_candle, strategy = check_long_signal_range_break(candles)
@@ -1444,6 +1581,14 @@ def check_long_signal_no_rsi(
         _log("info", "SIGNAL",
              f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
+    
+    # Check Small→Large Body (no RSI required)
+    triggered, signal_candle, strategy = check_long_signal_small_to_large_body(candles)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
+        return True, signal_candle, strategy, None
+    
     return False, None, "", None
 
 
@@ -1911,14 +2056,15 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT  (v12.2 — Added Range Break Strategy)
+#  21. TRADING BOT  (v12.2 — Added Range Break & Small→Large Body)
 # ================================================================
 
 class TradingBot:
     """
-    v12.2: Added Range Break strategy for both LONG and SHORT directions.
-    Range Break: 6-7 candles in range → one candle breaks → signal candle confirms.
-    No RSI filter applied to Range Break strategy.
+    v12.2: Added Range Break strategy (with close-based confirmation) and
+    Small Body → Large Body strategy. Updated Doji strategy to use close
+    vs doji low/high. Both new strategies have NO RSI filter.
+    Small Body threshold updated to 25%.
     """
 
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
@@ -2335,7 +2481,7 @@ class TradingBot:
 
                     # Check SHORT signals
                     if self.enable_short:
-                        # First check Range Break (no RSI filter)
+                        # First check no-RSI strategies (Range Break, Small→Large Body)
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal_no_rsi(
                             candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                         )
@@ -2343,7 +2489,7 @@ class TradingBot:
                             self._on_signal(symbol, signal_candle, strategy_name,
                                             rsi_value, "SHORT", no_rsi=True)
                         else:
-                            # If Range Break didn't trigger, check regular strategies with RSI
+                            # If no-RSI didn't trigger, check regular strategies with RSI
                             triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
                                 candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                             )
@@ -2353,7 +2499,7 @@ class TradingBot:
 
                     # Check LONG signals
                     if self.enable_long and symbol not in self.active_trades:
-                        # First check Range Break (no RSI filter)
+                        # First check no-RSI strategies (Range Break, Small→Large Body)
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi(
                             candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                         )
@@ -2361,7 +2507,7 @@ class TradingBot:
                             self._on_signal(symbol, signal_candle, strategy_name,
                                             rsi_value, "LONG", no_rsi=True)
                         else:
-                            # If Range Break didn't trigger, check regular strategies with RSI
+                            # If no-RSI didn't trigger, check regular strategies with RSI
                             triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
                                 candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                             )
@@ -2423,24 +2569,22 @@ class TradingBot:
         entry = signal_candle["close"]
 
         if direction == "SHORT":
-            if strategy_name == "BEARISH_DOJI" and "doji_high" in signal_candle:
-                sl = signal_candle["doji_high"]
+            if strategy_name == "BEARISH_DOJI" and "doji_low" in signal_candle:
+                sl = signal_candle["doji_low"]
             elif strategy_name in ("STRATEGY_1_SHORT", "STRATEGY_3_SHORT",
-                                    "BEARISH_HARAMI") and "pattern_high" in signal_candle:
-                sl = signal_candle["pattern_high"]
-            elif strategy_name == "RANGE_BREAK_SHORT" and "pattern_high" in signal_candle:
+                                    "BEARISH_HARAMI", "RANGE_BREAK_SHORT",
+                                    "SMALL_TO_LARGE_SHORT") and "pattern_high" in signal_candle:
                 sl = signal_candle["pattern_high"]
             else:
                 store = self.candle_store.get(symbol)
                 sl    = list(store)[-2]["high"] if store and len(store) >= 2 \
                         else signal_candle["high"]
         else:
-            if strategy_name == "BULLISH_DOJI" and "doji_low" in signal_candle:
-                sl = signal_candle["doji_low"]
+            if strategy_name == "BULLISH_DOJI" and "doji_high" in signal_candle:
+                sl = signal_candle["doji_high"]
             elif strategy_name in ("STRATEGY_1_LONG", "BULLISH_ENGULFING",
-                                    "BULLISH_HARAMI") and "pattern_low" in signal_candle:
-                sl = signal_candle["pattern_low"]
-            elif strategy_name == "RANGE_BREAK_LONG" and "pattern_low" in signal_candle:
+                                    "BULLISH_HARAMI", "RANGE_BREAK_LONG",
+                                    "SMALL_TO_LARGE_LONG") and "pattern_low" in signal_candle:
                 sl = signal_candle["pattern_low"]
             else:
                 store = self.candle_store.get(symbol)
@@ -2504,11 +2648,16 @@ class TradingBot:
         print(f"           Risk        : ${risk_usd:,.2f}  ({self.config['risk_pct']}%)")
         print(f"           RSI(14)     : {rsi_str}")
         if no_rsi:
-            print(f"           RSI Filter  : DISABLED (Range Break strategy)")
+            print(f"           RSI Filter  : DISABLED")
         print(f"           Mode        : {signal['mode']}")
         print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
         if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
             print(f"           Harami Tol : {self.harami_tolerance*100:.2f}%")
+        if strategy_name in ("SMALL_TO_LARGE_SHORT", "SMALL_TO_LARGE_LONG"):
+            avg_body = signal_candle.get("avg_body", 0)
+            if avg_body > 0:
+                print(f"           Avg Body    : {smart_fmt(avg_body)}")
+                print(f"           Body Ratio  : {candle_body(signal_candle) / avg_body:.1f}x")
         print()
 
         if self.notifier:
@@ -2631,7 +2780,9 @@ class TradingBot:
         print()
         print("+========================================================+")
         print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.2           |")
-        print("|   ADDED: RANGE BREAK STRATEGY (No RSI filter)         |")
+        print("|   ADDED: RANGE BREAK (close-based) & SMALL→LARGE BODY  |")
+        print("|   UPDATED: DOJI uses close vs doji low/high           |")
+        print("|   UPDATED: Small body threshold → 25%                 |")
         print("|                                                        |")
         print("|   STOP LOSS : Triggers ONLY on CANDLE CLOSE            |")
         print("|   TAKE PROFIT (normal)  : 2:1 R:R on price touch       |")
@@ -2643,10 +2794,11 @@ class TradingBot:
         print("|   RSI SHORT filter : RSI(14) > 55                      |")
         print("|   RSI LONG  filter : RSI(14) < 40                      |")
         print("|   RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold)  |")
-        print("|   RANGE BREAK       : NO RSI FILTER (both directions)  |")
+        print("|   NO RSI FILTER    : Range Break, Small→Large Body     |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
         print("|   Precision        : auto dp — altcoin micro-prices OK  |")
         print(f"|   Harami Tolerance : {self.harami_tolerance*100:.2f}% body tolerance  |")
+        print(f"|   Small→Large Body  : 7 small bodies (≤25%) → 1 large body    |")
         print("+========================================================+")
         print()
 
@@ -2670,10 +2822,15 @@ class TradingBot:
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
-        print(f"  RANGE BREAK       : NO RSI FILTER (both directions)")
+        print(f"  NO RSI FILTER     : Range Break, Small→Large Body")
+        print(f"  Doji confirmation : close vs doji low/high")
+        print(f"  Range Break conf  : close vs break candle close")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
         print(f"  Harami Tolerance  : {self.harami_tolerance*100:.2f}% body tolerance")
+        print(f"  Small Body lookback: {SMALL_BODY_LOOKBACK} candles")
+        print(f"  Small Body threshold: {SMALL_BODY_THRESHOLD*100:.0f}% of range")
+        print(f"  Large Body factor : {LARGE_BODY_MULTIPLIER}x avg")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
@@ -2922,7 +3079,8 @@ def main() -> None:
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
     print("  |   Short + Long  |  RSI(14) filter  |  GMAIL         |")
     print("  |   RSI LONG BLOCK: < 24 (extreme oversold)           |")
-    print("  |   RANGE BREAK STRATEGY — NO RSI FILTER              |")
+    print("  |   NO RSI FILTER: Range Break, Small→Large Body      |")
+    print("  |   Small Body Threshold: 25% of range                |")
     print("  |   CONFIGURABLE HARAMI TOLERANCE                     |")
     print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
@@ -2989,7 +3147,12 @@ def main() -> None:
     print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print(f"  RSI LONG BLOCK    : RSI(14) < 24 (prevents trades in extreme oversold)")
-    print(f"  RANGE BREAK       : NO RSI FILTER (both directions)")
+    print(f"  NO RSI FILTER     : Range Break, Small→Large Body")
+    print(f"  Doji Confirmation : close vs doji low/high")
+    print(f"  Range Break Conf  : close vs break candle close")
+    print(f"  Small Body Lookback: {SMALL_BODY_LOOKBACK} candles")
+    print(f"  Small Body Threshold: {SMALL_BODY_THRESHOLD*100:.0f}% of range")
+    print(f"  Large Body Factor : {LARGE_BODY_MULTIPLIER}x avg body")
     print(f"  Harami Tolerance  : {harami_tolerance*100:.2f}% body tolerance")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
@@ -3032,13 +3195,13 @@ def main() -> None:
             open_syms = list(bot.active_trades.keys())
             ws_state  = bot.ws_manager.get_state() if bot.ws_manager else "N/A"
             st_info   = ""
-            range_info = ""
+            no_rsi_info = ""
             for sym, t in bot.active_trades.items():
                 if isinstance(t, dict):
                     if t.get("st_mode"):
                         st_info += f"[{sym}:ST-MODE] "
                     if t.get("no_rsi"):
-                        range_info += f"[{sym}:RANGE-BREAK] "
+                        no_rsi_info += f"[{sym}:NO-RSI] "
             print(
                 f"  [STATUS] Open={open_n}/{max_trades}  "
                 f"Signals={len(bot.signals)}  "
@@ -3046,7 +3209,7 @@ def main() -> None:
                 f"WS={ws_state}  {bot.daily_loss_tracker.status()}  "
                 + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
                 + (f"  {st_info}" if st_info else "")
-                + (f"  {range_info}" if range_info else "")
+                + (f"  {no_rsi_info}" if no_rsi_info else "")
             )
     except KeyboardInterrupt:
         bot.stop()
