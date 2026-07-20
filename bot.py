@@ -209,6 +209,10 @@ SuperTrend : Monitored post-entry"""
             body += "\nRSI Filter : DISABLED"
         if strategy in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
             body += f"\nHarami Tol : {signal.get('harami_tolerance', 0.001)*100:.2f}%"
+        if "breakout_level" in signal:
+            body += f"\nBreakout Lvl: {smart_fmt(signal['breakout_level'])}"
+        if "level_strength" in signal:
+            body += f"\nLevel Strength: {signal['level_strength']}x"
         
         return self._send_email(subject, body)
 
@@ -414,7 +418,7 @@ RSI FILTERS
 SHORT RSI      : > 55
 LONG RSI       : < 40
 RSI LONG BLOCK : < 24 (extreme oversold)
-NO RSI         : Range Break, Small→Large Body
+NO RSI         : Range Break, Vol Expansion, S/R Breakout
 
 STRATEGY PARAMETERS
 ─────────────────────────────
@@ -423,8 +427,9 @@ Stop Loss      : Triggers on CANDLE CLOSE
 SuperTrend 1   : Length=14, Factor=2.0
 SuperTrend 2   : Length=21, Factor=1.0
 Harami Tolerance: {harami_tolerance*100:.2f}%
-Small Body Thresh: 25% of range
-Large Body Factor: 2x avg
+Vol Expansion  : Body ≥ 3x avg, Body ≥75% of range, Wick ≤10%
+S/R Detection  : 100 candles, merge within 0.5%
+S/R Strength   : Minimum Strength 2 (★★ or higher)
 Price Display  : Auto-precision (up to 10 dp for micro-price alts)
 
 MONITORED SYMBOLS ({len(symbols)})
@@ -707,10 +712,20 @@ HARAMI_BODY_TOLERANCE = 0.001   # 0.1% default
 # ── Range Break Strategy Constants ──────────────────────────────
 RANGE_BREAK_LOOKBACK = 7          # Number of candles to identify range
 
-# ── Small Body → Large Body Strategy Constants ──────────────────
-SMALL_BODY_LOOKBACK = 7           # Number of candles to check for small bodies
-LARGE_BODY_MULTIPLIER = 2.0       # Current body must be at least 2x the average of previous bodies
-SMALL_BODY_THRESHOLD = 0.25       # 25% - Body must be less than 25% of range (UPDATED)
+# ── Volatility Expansion Strategy Constants ────────────────────
+VOL_EXP_LOOKBACK = 7              # Number of candles to check for low volatility
+VOL_EXP_MIN_BODY_MULTIPLIER = 3.0 # Body must be at least 3x average
+VOL_EXP_MIN_BODY_RATIO = 0.75     # Body must be at least 75% of total range
+VOL_EXP_MAX_WICK_RATIO = 0.10     # Wick must be at most 10% of total range
+
+# ── Support/Resistance Strategy Constants ─────────────────────
+SR_LOOKBACK = 100                 # Number of candles to analyze for S/R
+SR_SWING_SENSITIVITY = 5          # Number of candles to check for swing highs/lows
+SR_MERGE_THRESHOLD = 0.005        # 0.5% threshold to merge nearby levels
+SR_MIN_LEVEL_AGE = 3              # Minimum candles before a level is "valid"
+SR_MAX_LEVEL_AGE = 50             # Maximum candles before a level expires
+SR_MIN_STRENGTH = 2               # Minimum strength score required for trades (★ = 1, ★★ = 2, etc.)
+SR_PRICE_TOUCH_THRESHOLD = 0.002  # 0.2% threshold for price touching a level
 
 # ── SuperTrend parameters ─────────────────────────────────────
 ST1_LENGTH = 14    # Accurate SuperTrend
@@ -749,7 +764,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/12.2",
+            "User-Agent":   "python-DeltaBot/12.3",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -1225,16 +1240,19 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     return True, signal_candle_copy, "RANGE_BREAK_SHORT"
 
 
-# ─── SMALL BODY → LARGE BODY SHORT STRATEGY ─────────────────────
+# ─── VOLATILITY EXPANSION SHORT STRATEGY ────────────────────────
 
-def check_short_signal_small_to_large_body(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Small Body → Large Body Short Strategy (NO RSI):
-    1. Check previous 7 candles have small bodies (ignore wicks)
-    2. Current candle has a large body (at least 2x average of previous)
-    3. Current candle is RED (bearish) → take SHORT trade immediately
+    Volatility Expansion Short Strategy (NO RSI):
+    1. Previous 7 candles have small bodies (low volatility)
+    2. Current candle body ≥ 3× average body
+    3. Current candle body ≥ 75% of total range
+    4. Current candle lower wick ≤ 10% of total range
+    5. Current candle is bearish (RED)
+    6. Candle closes below the lowest low of previous 7 candles
     """
-    lookback = SMALL_BODY_LOOKBACK
+    lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 1:
         return False, None, ""
     
@@ -1245,38 +1263,48 @@ def check_short_signal_small_to_large_body(candles: List[dict]) -> Tuple[bool, O
     
     current = candles[-1]
     
-    # Calculate average body size of previous candles (ignoring wicks)
+    # Calculate average body size of previous candles
     avg_body = sum(candle_body(c) for c in prev_candles) / lookback
     
     if avg_body <= 0:
         return False, None, ""
     
     current_body = candle_body(current)
+    current_range = candle_range(current)
     
-    # Current body must be at least LARGE_BODY_MULTIPLIER times the average
-    if current_body < avg_body * LARGE_BODY_MULTIPLIER:
+    if current_range <= 0:
         return False, None, ""
     
-    # Check if previous candles have small bodies (body is small relative to their range)
-    # UPDATED: Now using SMALL_BODY_THRESHOLD = 0.25 (25%)
-    for c in prev_candles:
-        if body_pct_of_range(c) >= SMALL_BODY_THRESHOLD:
-            return False, None, ""
+    # Check: Body ≥ 3× average body
+    if current_body < avg_body * VOL_EXP_MIN_BODY_MULTIPLIER:
+        return False, None, ""
     
-    # Current candle must be bearish (RED) for short
+    # Check: Body ≥ 75% of total range
+    if current_body / current_range < VOL_EXP_MIN_BODY_RATIO:
+        return False, None, ""
+    
+    # Check: Lower wick ≤ 10% of total range
+    if lower_wick(current) / current_range > VOL_EXP_MAX_WICK_RATIO:
+        return False, None, ""
+    
+    # Check: Current candle is bearish (RED)
     if not is_bearish(current):
+        return False, None, ""
+    
+    # Check: Candle closes below the lowest low of previous 7 candles
+    prev_low = min(c["low"] for c in prev_candles)
+    if current["close"] >= prev_low:
         return False, None, ""
     
     # Set stop loss at current candle's high
     current_copy = current.copy()
     current_copy["pattern_high"] = current["high"]
-    current_copy["small_body_lookback"] = lookback
-    current_copy["avg_body"] = avg_body
+    current_copy["breakout_level"] = prev_low
     
-    _log("info", "SMALL_TO_LARGE_SHORT", 
-         f"Small body avg {smart_fmt(avg_body)} → large body {smart_fmt(current_body)} "
-         f"({current_body/avg_body:.1f}x) - RED candle")
-    return True, current_copy, "SMALL_TO_LARGE_SHORT"
+    _log("info", "VOL_EXPANSION_SHORT", 
+         f"Body {smart_fmt(current_body)} (x{current_body/avg_body:.1f} avg) | "
+         f"Close {smart_fmt(current['close'])} < prev low {smart_fmt(prev_low)}")
+    return True, current_copy, "VOL_EXPANSION_SHORT"
 
 
 # ================================================================
@@ -1421,16 +1449,19 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     return True, signal_candle_copy, "RANGE_BREAK_LONG"
 
 
-# ─── SMALL BODY → LARGE BODY LONG STRATEGY ─────────────────────
+# ─── VOLATILITY EXPANSION LONG STRATEGY ────────────────────────
 
-def check_long_signal_small_to_large_body(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Small Body → Large Body Long Strategy (NO RSI):
-    1. Check previous 7 candles have small bodies (ignore wicks)
-    2. Current candle has a large body (at least 2x average of previous)
-    3. Current candle is GREEN (bullish) → take LONG trade immediately
+    Volatility Expansion Long Strategy (NO RSI):
+    1. Previous 7 candles have small bodies (low volatility)
+    2. Current candle body ≥ 3× average body
+    3. Current candle body ≥ 75% of total range
+    4. Current candle upper wick ≤ 10% of total range
+    5. Current candle is bullish (GREEN)
+    6. Candle closes above the highest high of previous 7 candles
     """
-    lookback = SMALL_BODY_LOOKBACK
+    lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 1:
         return False, None, ""
     
@@ -1441,42 +1472,484 @@ def check_long_signal_small_to_large_body(candles: List[dict]) -> Tuple[bool, Op
     
     current = candles[-1]
     
-    # Calculate average body size of previous candles (ignoring wicks)
+    # Calculate average body size of previous candles
     avg_body = sum(candle_body(c) for c in prev_candles) / lookback
     
     if avg_body <= 0:
         return False, None, ""
     
     current_body = candle_body(current)
+    current_range = candle_range(current)
     
-    # Current body must be at least LARGE_BODY_MULTIPLIER times the average
-    if current_body < avg_body * LARGE_BODY_MULTIPLIER:
+    if current_range <= 0:
         return False, None, ""
     
-    # Check if previous candles have small bodies (body is small relative to their range)
-    # UPDATED: Now using SMALL_BODY_THRESHOLD = 0.25 (25%)
-    for c in prev_candles:
-        if body_pct_of_range(c) >= SMALL_BODY_THRESHOLD:
-            return False, None, ""
+    # Check: Body ≥ 3× average body
+    if current_body < avg_body * VOL_EXP_MIN_BODY_MULTIPLIER:
+        return False, None, ""
     
-    # Current candle must be bullish (GREEN) for long
+    # Check: Body ≥ 75% of total range
+    if current_body / current_range < VOL_EXP_MIN_BODY_RATIO:
+        return False, None, ""
+    
+    # Check: Upper wick ≤ 10% of total range
+    if upper_wick(current) / current_range > VOL_EXP_MAX_WICK_RATIO:
+        return False, None, ""
+    
+    # Check: Current candle is bullish (GREEN)
     if not is_bullish(current):
+        return False, None, ""
+    
+    # Check: Candle closes above the highest high of previous 7 candles
+    prev_high = max(c["high"] for c in prev_candles)
+    if current["close"] <= prev_high:
         return False, None, ""
     
     # Set stop loss at current candle's low
     current_copy = current.copy()
     current_copy["pattern_low"] = current["low"]
-    current_copy["small_body_lookback"] = lookback
-    current_copy["avg_body"] = avg_body
+    current_copy["breakout_level"] = prev_high
     
-    _log("info", "SMALL_TO_LARGE_LONG", 
-         f"Small body avg {smart_fmt(avg_body)} → large body {smart_fmt(current_body)} "
-         f"({current_body/avg_body:.1f}x) - GREEN candle")
-    return True, current_copy, "SMALL_TO_LARGE_LONG"
+    _log("info", "VOL_EXPANSION_LONG", 
+         f"Body {smart_fmt(current_body)} (x{current_body/avg_body:.1f} avg) | "
+         f"Close {smart_fmt(current['close'])} > prev high {smart_fmt(prev_high)}")
+    return True, current_copy, "VOL_EXPANSION_LONG"
 
 
 # ================================================================
-#  13c. SIGNAL CHECKERS
+#  13c. SUPPORT/RESISTANCE WITH STRENGTH RANKING
+# ================================================================
+
+class SRLevelManager:
+    """
+    Manages persistent Support/Resistance levels with Strength Ranking.
+    Levels are only added/removed when significant swing points occur.
+    Strength increases when price respects the level multiple times.
+    Only levels with Strength >= 2 can be traded.
+    """
+    
+    def __init__(self, symbol: str, lookback: int = SR_LOOKBACK, 
+                 merge_threshold: float = SR_MERGE_THRESHOLD,
+                 min_age: int = SR_MIN_LEVEL_AGE,
+                 max_age: int = SR_MAX_LEVEL_AGE,
+                 min_strength: int = SR_MIN_STRENGTH):
+        self.symbol = symbol
+        self.lookback = lookback
+        self.merge_threshold = merge_threshold
+        self.min_age = min_age
+        self.max_age = max_age
+        self.min_strength = min_strength
+        
+        # Persistent level storage with strength tracking
+        self.resistance_levels: List[Dict] = []  # Each: {"price": float, "age": int, "strength": int, "touches": int}
+        self.support_levels: List[Dict] = []     # Each: {"price": float, "age": int, "strength": int, "touches": int}
+        
+        # Track swing points for level creation
+        self.pending_swing_highs: List[float] = []
+        self.pending_swing_lows: List[float] = []
+        
+        # Last processed candle index
+        self.last_processed_index = 0
+        
+        # Cache for recent price touches
+        self.recent_touches: Dict[float, List[float]] = {}
+        
+        self._lock = threading.Lock()
+        
+    def update_levels(self, candles: List[dict]) -> None:
+        """
+        Update support/resistance levels based on new candles.
+        Only creates new levels when significant swing points form.
+        Updates strength when price respects levels.
+        """
+        with self._lock:
+            if len(candles) < self.lookback + self.min_age:
+                return
+            
+            # Get the latest candle index
+            current_idx = len(candles) - 1
+            
+            # Don't process if we've already processed this candle
+            if current_idx == self.last_processed_index:
+                return
+            
+            # Detect new swing highs and lows from the last few candles
+            new_swing_highs, new_swing_lows = self._detect_new_swings(candles)
+            
+            # Add new swing points to pending lists
+            self.pending_swing_highs.extend(new_swing_highs)
+            self.pending_swing_lows.extend(new_swing_lows)
+            
+            # Process pending swings to create/update levels
+            self._process_pending_swings()
+            
+            # Check for price touching existing levels (strength update)
+            self._update_level_strength(candles)
+            
+            # Age existing levels and remove expired ones
+            self._age_levels()
+            
+            # Update last processed index
+            self.last_processed_index = current_idx
+            
+            # Log current levels
+            self._log_levels()
+    
+    def _detect_new_swings(self, candles: List[dict]) -> Tuple[List[float], List[float]]:
+        """
+        Detect only NEW swing points that have just formed.
+        Returns (new_highs, new_lows)
+        """
+        n = len(candles)
+        if n < self.lookback:
+            return [], []
+        
+        new_highs = []
+        new_lows = []
+        
+        # Check the last few candles for new swing points
+        check_range = min(10, n - 1)
+        sensitivity = SR_SWING_SENSITIVITY
+        
+        for i in range(n - check_range, n - sensitivity):
+            if i < sensitivity or i >= n - sensitivity:
+                continue
+            
+            # Check for swing high (potential RESISTANCE for LONG breakouts)
+            is_high = True
+            for j in range(1, sensitivity + 1):
+                if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
+                    is_high = False
+                    break
+            if is_high:
+                price = candles[i]["high"]
+                if not self._is_level_already_present(price, self.resistance_levels, self.support_levels):
+                    new_highs.append(price)
+                    _log("info", f"S/R [{self.symbol}]", 
+                         f"New RESISTANCE level detected: {smart_fmt(price)}")
+            
+            # Check for swing low (potential SUPPORT for SHORT breakouts)
+            is_low = True
+            for j in range(1, sensitivity + 1):
+                if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
+                    is_low = False
+                    break
+            if is_low:
+                price = candles[i]["low"]
+                if not self._is_level_already_present(price, self.resistance_levels, self.support_levels):
+                    new_lows.append(price)
+                    _log("info", f"S/R [{self.symbol}]", 
+                         f"New SUPPORT level detected: {smart_fmt(price)}")
+        
+        return new_highs, new_lows
+    
+    def _is_level_already_present(self, price: float, resistances: List[Dict], supports: List[Dict]) -> bool:
+        """Check if a price is already near an existing level."""
+        threshold = price * self.merge_threshold
+        
+        for level in resistances + supports:
+            if abs(level["price"] - price) <= threshold:
+                # Strengthen the existing level
+                level["strength"] = min(5, level["strength"] + 1)
+                level["touches"] += 1
+                level["age"] = 0  # Reset age when level is reinforced
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"Level {smart_fmt(level['price'])} strengthened to ★{'★' * (level['strength'] - 1)} "
+                     f"({level['touches']} touches)")
+                return True
+        return False
+    
+    def _process_pending_swings(self) -> None:
+        """Process pending swing points and add them as levels."""
+        # Process pending highs as RESISTANCE (for LONG breakouts)
+        for high in self.pending_swing_highs:
+            merged = False
+            threshold = high * self.merge_threshold
+            
+            for level in self.resistance_levels:
+                if abs(level["price"] - high) <= threshold:
+                    level["price"] = (level["price"] + high) / 2
+                    level["strength"] = min(5, level["strength"] + 1)
+                    level["touches"] += 1
+                    level["age"] = 0
+                    merged = True
+                    break
+            
+            if not merged:
+                self.resistance_levels.append({
+                    "price": high,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1
+                })
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"New RESISTANCE level added: {smart_fmt(high)} (★)")
+        
+        # Process pending lows as SUPPORT (for SHORT breakouts)
+        for low in self.pending_swing_lows:
+            merged = False
+            threshold = low * self.merge_threshold
+            
+            for level in self.support_levels:
+                if abs(level["price"] - low) <= threshold:
+                    level["price"] = (level["price"] + low) / 2
+                    level["strength"] = min(5, level["strength"] + 1)
+                    level["touches"] += 1
+                    level["age"] = 0
+                    merged = True
+                    break
+            
+            if not merged:
+                self.support_levels.append({
+                    "price": low,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1
+                })
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"New SUPPORT level added: {smart_fmt(low)} (★)")
+        
+        # Clear pending swings after processing
+        self.pending_swing_highs.clear()
+        self.pending_swing_lows.clear()
+    
+    def _update_level_strength(self, candles: List[dict]) -> None:
+        """
+        Check if price has touched existing levels and update strength.
+        A level is "touched" when price comes within threshold of the level.
+        """
+        if not candles:
+            return
+        
+        current_price = candles[-1]["close"]
+        threshold = current_price * SR_PRICE_TOUCH_THRESHOLD
+        
+        # Check resistance levels
+        for level in self.resistance_levels:
+            if abs(level["price"] - current_price) <= threshold:
+                # Price touched resistance - it's being respected
+                level["strength"] = min(5, level["strength"] + 1)
+                level["touches"] += 1
+                level["age"] = 0
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"RESISTANCE {smart_fmt(level['price'])} touched! "
+                     f"Strength: ★{'★' * (level['strength'] - 1)} ({level['touches']} touches)")
+        
+        # Check support levels
+        for level in self.support_levels:
+            if abs(level["price"] - current_price) <= threshold:
+                # Price touched support - it's being respected
+                level["strength"] = min(5, level["strength"] + 1)
+                level["touches"] += 1
+                level["age"] = 0
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"SUPPORT {smart_fmt(level['price'])} touched! "
+                     f"Strength: ★{'★' * (level['strength'] - 1)} ({level['touches']} touches)")
+    
+    def _age_levels(self) -> None:
+        """Age existing levels and remove expired ones."""
+        # Age resistance levels
+        self.resistance_levels = [
+            level for level in self.resistance_levels
+            if self._should_keep_level(level)
+        ]
+        
+        # Age support levels
+        self.support_levels = [
+            level for level in self.support_levels
+            if self._should_keep_level(level)
+        ]
+    
+    def _should_keep_level(self, level: Dict) -> bool:
+        """Determine if a level should be kept based on age, strength, and touches."""
+        level["age"] += 1
+        
+        # Strong levels (strength >= 3) can stay longer
+        max_age = self.max_age * 2 if level["strength"] >= 3 else self.max_age
+        
+        # Remove if too old
+        if level["age"] > max_age:
+            return False
+        
+        # Remove if too young and weak (prevent noise)
+        if level["age"] < self.min_age and level["strength"] < 2:
+            return False
+        
+        return True
+    
+    def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Get relevant support and resistance levels near the current price.
+        Returns: (support_levels, resistance_levels) as lists of dicts with metadata
+        """
+        with self._lock:
+            # Get only levels that are within a reasonable range of current price
+            price_range = current_price * 0.10  # 10% range
+            
+            supports = [l for l in self.support_levels 
+                       if abs(l["price"] - current_price) <= price_range
+                       and l["age"] >= self.min_age
+                       and l["strength"] >= self.min_strength]  # Only strong enough levels
+            
+            resistances = [l for l in self.resistance_levels 
+                          if abs(l["price"] - current_price) <= price_range
+                          and l["age"] >= self.min_age
+                          and l["strength"] >= self.min_strength]  # Only strong enough levels
+            
+            return supports, resistances
+    
+    def get_strong_levels(self) -> Tuple[List[Dict], List[Dict]]:
+        """Get all levels with strength >= min_strength."""
+        with self._lock:
+            supports = [l for l in self.support_levels if l["strength"] >= self.min_strength]
+            resistances = [l for l in self.resistance_levels if l["strength"] >= self.min_strength]
+            return supports, resistances
+    
+    def get_levels_for_display(self) -> Tuple[List[Dict], List[Dict]]:
+        """Get all levels with their metadata for display purposes."""
+        with self._lock:
+            return self.support_levels.copy(), self.resistance_levels.copy()
+    
+    def _log_levels(self) -> None:
+        """Log current levels with their strength ratings."""
+        with self._lock:
+            if self.support_levels or self.resistance_levels:
+                support_str = ", ".join([
+                    f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)})" 
+                    for l in self.support_levels[-5:]  # Show last 5
+                ])
+                resistance_str = ", ".join([
+                    f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)})" 
+                    for l in self.resistance_levels[-5:]  # Show last 5
+                ])
+                
+                if support_str:
+                    _log("info", f"S/R [{self.symbol}]", f"SUPPORT levels: {support_str}")
+                if resistance_str:
+                    _log("info", f"S/R [{self.symbol}]", f"RESISTANCE levels: {resistance_str}")
+    
+    def reset(self) -> None:
+        """Reset all levels (useful on timeframe change or symbol change)."""
+        with self._lock:
+            self.resistance_levels.clear()
+            self.support_levels.clear()
+            self.pending_swing_highs.clear()
+            self.pending_swing_lows.clear()
+            self.last_processed_index = 0
+            self.recent_touches.clear()
+            _log("info", f"S/R [{self.symbol}]", "Levels reset")
+
+
+# ─── S/R SIGNAL CHECKERS WITH STRENGTH FILTER ──────────────────
+
+def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
+    """
+    SUPPORT BREAKOUT SHORT Strategy using persistent level manager (NO RSI):
+    1. Get persistent SUPPORT levels from SRLevelManager (must have strength >= 2)
+    2. Current candle must close BELOW a support zone
+    3. Current candle must be bearish (RED)
+    """
+    if len(candles) < SR_MIN_LEVEL_AGE + 2:
+        return False, None, ""
+    
+    support_levels, _ = sr_manager.get_relevant_levels(candles[-1]["close"])
+    
+    if not support_levels:
+        return False, None, ""
+    
+    current = candles[-1]
+    
+    # Check: Current candle is bearish (RED) - required for SHORT
+    if not is_bearish(current):
+        return False, None, ""
+    
+    # Check: Candle closes BELOW a support level (breaking support)
+    # Sort supports descending (highest support near price)
+    support_levels_sorted = sorted(support_levels, key=lambda x: x["price"], reverse=True)
+    best_level = None
+    
+    for level_dict in support_levels_sorted:
+        support = level_dict["price"]
+        if current["close"] < support:
+            best_level = level_dict
+            break
+    
+    if best_level is None:
+        return False, None, ""
+    
+    # Set stop loss at current candle's HIGH (for SHORT)
+    current_copy = current.copy()
+    current_copy["pattern_high"] = current["high"]
+    current_copy["breakout_level"] = best_level["price"]
+    current_copy["level_strength"] = best_level["strength"]
+    current_copy["level_touches"] = best_level["touches"]
+    current_copy["breakout_type"] = "SUPPORT_BREAKDOWN"  # SHORT
+    
+    stars = "★" * best_level["strength"]
+    
+    _log("info", "SUPPORT_BREAKDOWN_SHORT", 
+         f"SHORT: Price broke BELOW SUPPORT {smart_fmt(best_level['price'])} "
+         f"(Strength: {stars}, {best_level['touches']} touches) | "
+         f"Close {smart_fmt(current['close'])} < Support {smart_fmt(best_level['price'])}")
+    
+    return True, current_copy, "SUPPORT_BREAKDOWN_SHORT"
+
+
+def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
+    """
+    RESISTANCE BREAKOUT LONG Strategy using persistent level manager (NO RSI):
+    1. Get persistent RESISTANCE levels from SRLevelManager (must have strength >= 2)
+    2. Current candle must close ABOVE a resistance zone
+    3. Current candle must be bullish (GREEN)
+    """
+    if len(candles) < SR_MIN_LEVEL_AGE + 2:
+        return False, None, ""
+    
+    _, resistance_levels = sr_manager.get_relevant_levels(candles[-1]["close"])
+    
+    if not resistance_levels:
+        return False, None, ""
+    
+    current = candles[-1]
+    
+    # Check: Current candle is bullish (GREEN) - required for LONG
+    if not is_bullish(current):
+        return False, None, ""
+    
+    # Check: Candle closes ABOVE a resistance level (breaking resistance)
+    # Sort resistances ascending (lowest resistance near price)
+    resistance_levels_sorted = sorted(resistance_levels, key=lambda x: x["price"])
+    best_level = None
+    
+    for level_dict in resistance_levels_sorted:
+        resistance = level_dict["price"]
+        if current["close"] > resistance:
+            best_level = level_dict
+            break
+    
+    if best_level is None:
+        return False, None, ""
+    
+    # Set stop loss at current candle's LOW (for LONG)
+    current_copy = current.copy()
+    current_copy["pattern_low"] = current["low"]
+    current_copy["breakout_level"] = best_level["price"]
+    current_copy["level_strength"] = best_level["strength"]
+    current_copy["level_touches"] = best_level["touches"]
+    current_copy["breakout_type"] = "RESISTANCE_BREAKOUT"  # LONG
+    
+    stars = "★" * best_level["strength"]
+    
+    _log("info", "RESISTANCE_BREAKOUT_LONG", 
+         f"LONG: Price broke ABOVE RESISTANCE {smart_fmt(best_level['price'])} "
+         f"(Strength: {stars}, {best_level['touches']} touches) | "
+         f"Close {smart_fmt(current['close'])} > Resistance {smart_fmt(best_level['price'])}")
+    
+    return True, current_copy, "RESISTANCE_BREAKOUT_LONG"
+
+
+# ================================================================
+#  13d. SIGNAL CHECKERS
 # ================================================================
 
 def check_short_signal(
@@ -1509,22 +1982,30 @@ def check_short_signal(
     return False, None, "", rsi_value
 
 
-def check_short_signal_no_rsi(
-    candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
+def check_short_signal_no_rsi_with_sr(
+    candles: List[dict], sr_manager: SRLevelManager, symbol: str = "", 
+    harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    Check short signals WITHOUT RSI filter.
-    Strategies: Range Break, Small→Large Body
+    Check SHORT signals WITHOUT RSI filter using persistent S/R levels.
+    Strategies: Range Break, Volatility Expansion, Support Breakdown
     """
-    # Check Range Break first (no RSI required)
+    # Check Range Break (no RSI required)
     triggered, signal_candle, strategy = check_short_signal_range_break(candles)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Small→Large Body (no RSI required)
-    triggered, signal_candle, strategy = check_short_signal_small_to_large_body(candles)
+    # Check Volatility Expansion (no RSI required)
+    triggered, signal_candle, strategy = check_short_signal_vol_expansion(candles)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
+        return True, signal_candle, strategy, None
+    
+    # Check Support Breakdown (no RSI required) - SHORT direction
+    triggered, signal_candle, strategy = check_short_signal_support_resistance_manager(candles, sr_manager)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
@@ -1568,22 +2049,30 @@ def check_long_signal(
     return False, None, "", rsi
 
 
-def check_long_signal_no_rsi(
-    candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
+def check_long_signal_no_rsi_with_sr(
+    candles: List[dict], sr_manager: SRLevelManager, symbol: str = "",
+    harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
-    Check long signals WITHOUT RSI filter.
-    Strategies: Range Break, Small→Large Body
+    Check LONG signals WITHOUT RSI filter using persistent S/R levels.
+    Strategies: Range Break, Volatility Expansion, Resistance Breakout
     """
-    # Check Range Break first (no RSI required)
+    # Check Range Break (no RSI required)
     triggered, signal_candle, strategy = check_long_signal_range_break(candles)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Small→Large Body (no RSI required)
-    triggered, signal_candle, strategy = check_long_signal_small_to_large_body(candles)
+    # Check Volatility Expansion (no RSI required)
+    triggered, signal_candle, strategy = check_long_signal_vol_expansion(candles)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
+        return True, signal_candle, strategy, None
+    
+    # Check Resistance Breakout (no RSI required) - LONG direction
+    triggered, signal_candle, strategy = check_long_signal_support_resistance_manager(candles, sr_manager)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
@@ -2056,15 +2545,14 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT  (v12.2 — Added Range Break & Small→Large Body)
+#  21. TRADING BOT (v12.4 — Added S/R Strength Ranking)
 # ================================================================
 
 class TradingBot:
     """
-    v12.2: Added Range Break strategy (with close-based confirmation) and
-    Small Body → Large Body strategy. Updated Doji strategy to use close
-    vs doji low/high. Both new strategies have NO RSI filter.
-    Small Body threshold updated to 25%.
+    v12.4: Added Strength Ranking for Support/Resistance levels.
+    Only levels with Strength >= 2 can be traded.
+    Levels strengthen when price respects them.
     """
 
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
@@ -2111,6 +2599,9 @@ class TradingBot:
 
         self.running     = False
         self.ws_manager: Optional[DeltaWebSocket] = None
+        
+        # S/R Managers for each symbol
+        self.sr_managers: Dict[str, SRLevelManager] = {}
 
         self.on_signal_callback = None
         self.on_trade_callback  = None
@@ -2359,6 +2850,7 @@ class TradingBot:
 
         for sym in self.symbols:
             self.candle_store[sym] = deque(maxlen=500)
+            self.sr_managers[sym] = SRLevelManager(symbol=sym)
 
         if not self.paper:
             for sym in self.symbols:
@@ -2461,6 +2953,10 @@ class TradingBot:
                       f"L={smart_fmt(closed_candle['low'])} "
                       f"C={smart_fmt(closed_candle['close'])}")
 
+            # Update S/R levels for this symbol
+            if symbol in self.sr_managers:
+                self.sr_managers[symbol].update_levels(list(store))
+
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
                 if trade and not trade.get("_reserved"):
@@ -2481,13 +2977,14 @@ class TradingBot:
 
                     # Check SHORT signals
                     if self.enable_short:
-                        # First check no-RSI strategies (Range Break, Small→Large Body)
-                        triggered, signal_candle, strategy_name, rsi_value = check_short_signal_no_rsi(
-                            candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
+                        # First check no-RSI strategies (Range Break, Vol Expansion, S/R)
+                        triggered, signal_candle, strategy_name, rsi_value = check_short_signal_no_rsi_with_sr(
+                            candle_list, self.sr_managers[symbol], symbol=symbol, 
+                            harami_tolerance=self.harami_tolerance
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
-                                            rsi_value, "SHORT", no_rsi=True)
+                                          rsi_value, "SHORT", no_rsi=True)
                         else:
                             # If no-RSI didn't trigger, check regular strategies with RSI
                             triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
@@ -2495,17 +2992,18 @@ class TradingBot:
                             )
                             if triggered and signal_candle is not None:
                                 self._on_signal(symbol, signal_candle, strategy_name,
-                                                rsi_value, "SHORT", no_rsi=False)
+                                              rsi_value, "SHORT", no_rsi=False)
 
                     # Check LONG signals
                     if self.enable_long and symbol not in self.active_trades:
-                        # First check no-RSI strategies (Range Break, Small→Large Body)
-                        triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi(
-                            candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
+                        # First check no-RSI strategies (Range Break, Vol Expansion, S/R)
+                        triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi_with_sr(
+                            candle_list, self.sr_managers[symbol], symbol=symbol,
+                            harami_tolerance=self.harami_tolerance
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
-                                            rsi_value, "LONG", no_rsi=True)
+                                          rsi_value, "LONG", no_rsi=True)
                         else:
                             # If no-RSI didn't trigger, check regular strategies with RSI
                             triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
@@ -2513,7 +3011,7 @@ class TradingBot:
                             )
                             if triggered and signal_candle is not None:
                                 self._on_signal(symbol, signal_candle, strategy_name,
-                                                rsi_value, "LONG", no_rsi=False)
+                                              rsi_value, "LONG", no_rsi=False)
 
         store.append(candle)
 
@@ -2573,7 +3071,7 @@ class TradingBot:
                 sl = signal_candle["doji_low"]
             elif strategy_name in ("STRATEGY_1_SHORT", "STRATEGY_3_SHORT",
                                     "BEARISH_HARAMI", "RANGE_BREAK_SHORT",
-                                    "SMALL_TO_LARGE_SHORT") and "pattern_high" in signal_candle:
+                                    "VOL_EXPANSION_SHORT", "SUPPORT_BREAKDOWN_SHORT") and "pattern_high" in signal_candle:
                 sl = signal_candle["pattern_high"]
             else:
                 store = self.candle_store.get(symbol)
@@ -2584,7 +3082,7 @@ class TradingBot:
                 sl = signal_candle["doji_high"]
             elif strategy_name in ("STRATEGY_1_LONG", "BULLISH_ENGULFING",
                                     "BULLISH_HARAMI", "RANGE_BREAK_LONG",
-                                    "SMALL_TO_LARGE_LONG") and "pattern_low" in signal_candle:
+                                    "VOL_EXPANSION_LONG", "RESISTANCE_BREAKOUT_LONG") and "pattern_low" in signal_candle:
                 sl = signal_candle["pattern_low"]
             else:
                 store = self.candle_store.get(symbol)
@@ -2619,6 +3117,9 @@ class TradingBot:
                 "rsi":             rsi_value,
                 "no_rsi":          no_rsi,
                 "harami_tolerance": self.harami_tolerance if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI") else None,
+                "breakout_level":  signal_candle.get("breakout_level", None),
+                "level_strength":  signal_candle.get("level_strength", None),
+                "level_touches":   signal_candle.get("level_touches", None),
             }
             self.signals.append(signal)
 
@@ -2649,15 +3150,18 @@ class TradingBot:
         print(f"           RSI(14)     : {rsi_str}")
         if no_rsi:
             print(f"           RSI Filter  : DISABLED")
+        if signal.get("breakout_level"):
+            stars = "★" * (signal.get("level_strength", 0) or 0)
+            print(f"           Breakout Lvl: {smart_fmt(signal['breakout_level'])}")
+            if signal.get("level_strength"):
+                print(f"           Level Strength: {stars} ({signal.get('level_touches', 0)} touches)")
         print(f"           Mode        : {signal['mode']}")
         print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
         if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
             print(f"           Harami Tol : {self.harami_tolerance*100:.2f}%")
-        if strategy_name in ("SMALL_TO_LARGE_SHORT", "SMALL_TO_LARGE_LONG"):
-            avg_body = signal_candle.get("avg_body", 0)
-            if avg_body > 0:
-                print(f"           Avg Body    : {smart_fmt(avg_body)}")
-                print(f"           Body Ratio  : {candle_body(signal_candle) / avg_body:.1f}x")
+        if strategy_name in ("VOL_EXPANSION_SHORT", "VOL_EXPANSION_LONG"):
+            body_ratio = candle_body(signal_candle) / candle_range(signal_candle) if candle_range(signal_candle) > 0 else 0
+            print(f"           Body Ratio  : {body_ratio*100:.1f}% of range")
         print()
 
         if self.notifier:
@@ -2779,10 +3283,10 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.2           |")
-        print("|   ADDED: RANGE BREAK (close-based) & SMALL→LARGE BODY  |")
-        print("|   UPDATED: DOJI uses close vs doji low/high           |")
-        print("|   UPDATED: Small body threshold → 25%                 |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.4           |")
+        print("|   ADDED: S/R STRENGTH RANKING SYSTEM                  |")
+        print("|   ONLY STRONG LEVELS (★★ or higher) CAN BE TRADED     |")
+        print("|   Levels strengthen when price respects them           |")
         print("|                                                        |")
         print("|   STOP LOSS : Triggers ONLY on CANDLE CLOSE            |")
         print("|   TAKE PROFIT (normal)  : 2:1 R:R on price touch       |")
@@ -2794,11 +3298,13 @@ class TradingBot:
         print("|   RSI SHORT filter : RSI(14) > 55                      |")
         print("|   RSI LONG  filter : RSI(14) < 40                      |")
         print("|   RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold)  |")
-        print("|   NO RSI FILTER    : Range Break, Small→Large Body     |")
+        print("|   NO RSI FILTER    : Range Break, Vol Expansion, S/R   |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
         print("|   Precision        : auto dp — altcoin micro-prices OK  |")
         print(f"|   Harami Tolerance : {self.harami_tolerance*100:.2f}% body tolerance  |")
-        print(f"|   Small→Large Body  : 7 small bodies (≤25%) → 1 large body    |")
+        print("|   Vol Expansion   : Body ≥3x avg, ≥75% range, wick≤10%|")
+        print("|   S/R Breakout    : 100-candle S/R, Strength ≥2       |")
+        print("|   S/R Strength    : ★ = 1, ★★ = 2, ★★★ = 3, etc.   |")
         print("+========================================================+")
         print()
 
@@ -2822,15 +3328,15 @@ class TradingBot:
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
-        print(f"  NO RSI FILTER     : Range Break, Small→Large Body")
+        print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout")
         print(f"  Doji confirmation : close vs doji low/high")
         print(f"  Range Break conf  : close vs break candle close")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
         print(f"  Harami Tolerance  : {self.harami_tolerance*100:.2f}% body tolerance")
-        print(f"  Small Body lookback: {SMALL_BODY_LOOKBACK} candles")
-        print(f"  Small Body threshold: {SMALL_BODY_THRESHOLD*100:.0f}% of range")
-        print(f"  Large Body factor : {LARGE_BODY_MULTIPLIER}x avg")
+        print(f"  Vol Expansion     : Body ≥3x avg, ≥75% range, wick≤10%")
+        print(f"  S/R Detection     : {SR_LOOKBACK} candles, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
+        print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★★ or higher required for trades)")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
@@ -3073,14 +3579,14 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.2       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.4       |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
     print("  |   Short + Long  |  RSI(14) filter  |  GMAIL         |")
     print("  |   RSI LONG BLOCK: < 24 (extreme oversold)           |")
-    print("  |   NO RSI FILTER: Range Break, Small→Large Body      |")
-    print("  |   Small Body Threshold: 25% of range                |")
+    print("  |   NO RSI FILTER: Range Break, Vol Expansion, S/R    |")
+    print("  |   S/R STRENGTH RANKING: Only ★★ or higher           |")
     print("  |   CONFIGURABLE HARAMI TOLERANCE                     |")
     print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
@@ -3147,12 +3653,12 @@ def main() -> None:
     print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print(f"  RSI LONG BLOCK    : RSI(14) < 24 (prevents trades in extreme oversold)")
-    print(f"  NO RSI FILTER     : Range Break, Small→Large Body")
+    print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout")
     print(f"  Doji Confirmation : close vs doji low/high")
     print(f"  Range Break Conf  : close vs break candle close")
-    print(f"  Small Body Lookback: {SMALL_BODY_LOOKBACK} candles")
-    print(f"  Small Body Threshold: {SMALL_BODY_THRESHOLD*100:.0f}% of range")
-    print(f"  Large Body Factor : {LARGE_BODY_MULTIPLIER}x avg body")
+    print(f"  Vol Expansion     : Body ≥3x avg, ≥75% range, wick≤10%")
+    print(f"  S/R Breakout      : 100-candle S/R, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
+    print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★★ or higher required for trades)")
     print(f"  Harami Tolerance  : {harami_tolerance*100:.2f}% body tolerance")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
