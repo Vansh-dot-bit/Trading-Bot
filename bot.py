@@ -433,7 +433,7 @@ SuperTrend 2   : Length=21, Factor=1.0
 Harami Tolerance: {harami_tolerance*100:.2f}%
 Vol Expansion  : Body ≥ 3x avg, Body ≥75% of range, Wick ≤10%
 S/R Detection  : 100 candles, merge within 0.5%
-S/R Strength   : Minimum Strength 2 (★★ or higher)
+S/R Strength   : Minimum Strength 1 (★ or higher)
 
 S/R BREAKOUT STRATEGY
 ─────────────────────────────
@@ -441,14 +441,13 @@ Breakout       : Price closes beyond S/R level
 Confirmation   : NEXT candle closes beyond break candle close
 Entry          : On confirmation candle close
 
-S/R REVERSAL STRATEGY (NEW)
+S/R REVERSAL STRATEGY (UPDATED)
 ─────────────────────────────
-False Breakout : Price breaks S/R, same candle reverses back
-Direct Rejection: Price rejects S/R without breaking
-Reversal Candle: Bearish at Resistance, Bullish at Support
-Confirmation   : NEXT candle closes beyond reversal candle close
-Entry          : On confirmation candle close
-Stop Loss      : High/Low of Reversal Candle
+ZONE-BASED     : S/R levels treated as zones (not exact prices)
+MONITOR WINDOW : 25 candles after first reaching an S/R zone
+ENTRY          : Immediate execution on valid rejection candle close (NO confirmation)
+NO PRICE RESTRICTIONS: Price can move anywhere within the 25-candle window
+WINDOW EXPIRE  : Discard setup if no valid rejection within 25 candles
 
 MONITORED SYMBOLS ({len(symbols)})
 ─────────────────────────────
@@ -742,8 +741,12 @@ SR_SWING_SENSITIVITY = 5          # Number of candles to check for swing highs/l
 SR_MERGE_THRESHOLD = 0.005        # 0.5% threshold to merge nearby levels
 SR_MIN_LEVEL_AGE = 3              # Minimum candles before a level is "valid"
 SR_MAX_LEVEL_AGE = 50             # Maximum candles before a level expires
-SR_MIN_STRENGTH = 2               # Minimum strength score required for trades (★ = 1, ★★ = 2, etc.)
+SR_MIN_STRENGTH = 1               # Minimum strength score required for trades (★ = 1, ★★ = 2, etc.)
 SR_PRICE_TOUCH_THRESHOLD = 0.002  # 0.2% threshold for price touching a level
+
+# ── S/R Reversal Strategy Constants ────────────────────────────
+SR_REVERSAL_MONITOR_WINDOW = 25   # Number of candles to monitor for rejection after first reaching zone
+SR_ZONE_TOLERANCE = 0.005         # 0.5% tolerance for S/R zones (not exact levels)
 
 # ── SuperTrend parameters ─────────────────────────────────────
 ST1_LENGTH = 14    # Accurate SuperTrend
@@ -1543,7 +1546,7 @@ class SRLevelManager:
     Manages persistent Support/Resistance levels with Strength Ranking.
     Levels are only added/removed when significant swing points occur.
     Strength increases when price respects the level multiple times.
-    Only levels with Strength >= 2 can be traded.
+    Only levels with Strength >= 1 can be traded.
     """
     
     def __init__(self, symbol: str, lookback: int = SR_LOOKBACK, 
@@ -1790,7 +1793,7 @@ class SRLevelManager:
             return False
         
         # Remove if too young and weak (prevent noise)
-        if level["age"] < self.min_age and level["strength"] < 2:
+        if level["age"] < self.min_age and level["strength"] < 1:
             return False
         
         return True
@@ -1884,7 +1887,7 @@ class SRLevelManager:
 def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
     """
     SUPPORT BREAKOUT SHORT Strategy using persistent level manager (NO RSI):
-    1. Get persistent SUPPORT levels from SRLevelManager (must have strength >= 2)
+    1. Get persistent SUPPORT levels from SRLevelManager (must have strength >= 1)
     2. Look for a break candle that closes BELOW support (this is the break)
     3. Then wait for the NEXT candle (confirmation) to also close BELOW the break candle's close
     4. Execute trade on the confirmation candle
@@ -1957,7 +1960,7 @@ def check_short_signal_support_resistance_manager(candles: List[dict], sr_manage
 def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
     """
     RESISTANCE BREAKOUT LONG Strategy using persistent level manager (NO RSI):
-    1. Get persistent RESISTANCE levels from SRLevelManager (must have strength >= 2)
+    1. Get persistent RESISTANCE levels from SRLevelManager (must have strength >= 1)
     2. Look for a break candle that closes ABOVE resistance (this is the break)
     3. Then wait for the NEXT candle (confirmation) to also close ABOVE the break candle's close
     4. Execute trade on the confirmation candle
@@ -2027,11 +2030,192 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
     return False, None, ""
 
 
-# ─── NEW: S/R REVERSAL STRATEGY (INDEPENDENT) ───────────────────
+# ─── UPDATED: S/R REVERSAL STRATEGY (ZONE-BASED WITH MONITOR WINDOW) ──
+
+class SRReversalMonitor:
+    """
+    Monitors S/R zones for reversal setups using a 25-candle monitoring window.
+    Once price first reaches an S/R zone, start monitoring for 25 candles.
+    If a valid rejection candle appears at any time within the window, execute immediately.
+    If no rejection appears within 25 candles, discard the setup.
+    """
+    
+    def __init__(self, symbol: str, sr_manager: SRLevelManager):
+        self.symbol = symbol
+        self.sr_manager = sr_manager
+        self.monitoring_setups: Dict[str, Dict] = {}  # Key: level_price_str, Value: setup data
+        self._lock = threading.Lock()
+        
+    def check_for_rejection(self, candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+        """
+        Check for valid rejection setups in the monitoring window.
+        Returns: (triggered, signal_candle, strategy_name)
+        """
+        with self._lock:
+            if len(candles) < 2:
+                return False, None, ""
+            
+            # Check if any monitoring setup triggers on this candle
+            if not self.monitoring_setups:
+                return False, None, ""
+            
+            current_candle = candles[-1]
+            
+            # Check each monitored level for rejection
+            for key, setup in list(self.monitoring_setups.items()):
+                # Increment the candle counter
+                setup["candles_monitored"] += 1
+                
+                # Check if we've exceeded the monitoring window
+                if setup["candles_monitored"] > SR_REVERSAL_MONITOR_WINDOW:
+                    _log("info", f"S/R-REV [{self.symbol}]", 
+                         f"Reversal window expired for {setup['direction']} at {smart_fmt(setup['level_price'])} "
+                         f"({setup['candles_monitored']}/{SR_REVERSAL_MONITOR_WINDOW})")
+                    del self.monitoring_setups[key]
+                    continue
+                
+                # Check for valid rejection candle
+                direction = setup["direction"]
+                is_short = direction == "SHORT"
+                
+                # SHORT: Need bearish rejection at resistance
+                if is_short:
+                    # Candle must be bearish
+                    if not is_bearish(current_candle):
+                        continue
+                    
+                    # Candle must close below its high (rejection)
+                    if current_candle["close"] >= current_candle["high"] * 0.998:
+                        continue
+                    
+                    # If we get here, we have a valid rejection!
+                    signal_candle = current_candle.copy()
+                    signal_candle["pattern_high"] = current_candle["high"]  # Stop Loss at rejection high
+                    signal_candle["breakout_level"] = setup["level_price"]
+                    signal_candle["level_strength"] = setup["strength"]
+                    signal_candle["level_touches"] = setup["touches"]
+                    signal_candle["reversal_candle_close"] = current_candle["close"]
+                    signal_candle["setup_type"] = "DIRECT_REJECTION"
+                    signal_candle["candles_waited"] = setup["candles_monitored"]
+                    
+                    # Remove this setup from monitoring
+                    del self.monitoring_setups[key]
+                    
+                    stars = "★" * setup["strength"]
+                    _log("info", "RESISTANCE_REJECTION_SHORT", 
+                         f"SHORT: Resistance rejection at {smart_fmt(setup['level_price'])} "
+                         f"(Rejection candle close {smart_fmt(current_candle['close'])} < high {smart_fmt(current_candle['high'])}) "
+                         f"EXECUTED IMMEDIATELY after {setup['candles_monitored']} candles "
+                         f"(Strength: {stars}, {setup['touches']} touches)")
+                    
+                    return True, signal_candle, "RESISTANCE_REJECTION_SHORT"
+                
+                # LONG: Need bullish rejection at support
+                else:
+                    # Candle must be bullish
+                    if not is_bullish(current_candle):
+                        continue
+                    
+                    # Candle must close above its low (rejection)
+                    if current_candle["close"] <= current_candle["low"] * 1.002:
+                        continue
+                    
+                    # If we get here, we have a valid rejection!
+                    signal_candle = current_candle.copy()
+                    signal_candle["pattern_low"] = current_candle["low"]  # Stop Loss at rejection low
+                    signal_candle["breakout_level"] = setup["level_price"]
+                    signal_candle["level_strength"] = setup["strength"]
+                    signal_candle["level_touches"] = setup["touches"]
+                    signal_candle["reversal_candle_close"] = current_candle["close"]
+                    signal_candle["setup_type"] = "DIRECT_REJECTION"
+                    signal_candle["candles_waited"] = setup["candles_monitored"]
+                    
+                    # Remove this setup from monitoring
+                    del self.monitoring_setups[key]
+                    
+                    stars = "★" * setup["strength"]
+                    _log("info", "SUPPORT_REJECTION_LONG", 
+                         f"LONG: Support rejection at {smart_fmt(setup['level_price'])} "
+                         f"(Rejection candle close {smart_fmt(current_candle['close'])} > low {smart_fmt(current_candle['low'])}) "
+                         f"EXECUTED IMMEDIATELY after {setup['candles_monitored']} candles "
+                         f"(Strength: {stars}, {setup['touches']} touches)")
+                    
+                    return True, signal_candle, "SUPPORT_REJECTION_LONG"
+            
+            return False, None, ""
+    
+    def check_new_zone_reached(self, candles: List[dict]) -> None:
+        """
+        Check if price has reached a new S/R zone and start monitoring.
+        """
+        with self._lock:
+            if len(candles) < 2:
+                return
+            
+            current_candle = candles[-1]
+            current_price = current_candle["close"]
+            
+            # Get levels near current price (zone-based)
+            supports, resistances = self.sr_manager.get_levels_near_price(
+                current_price, tolerance=SR_ZONE_TOLERANCE
+            )
+            
+            # Check SHORT setups: Resistance zones (for rejection)
+            for level in resistances:
+                key = f"RESISTANCE_{level['price']:.10f}"
+                if key not in self.monitoring_setups:
+                    self.monitoring_setups[key] = {
+                        "level_price": level["price"],
+                        "direction": "SHORT",
+                        "strength": level["strength"],
+                        "touches": level["touches"],
+                        "candles_monitored": 0,
+                        "start_price": current_price,
+                        "start_time": datetime.now(timezone.utc).isoformat(),
+                    }
+                    stars = "★" * level["strength"]
+                    _log("info", f"S/R-REV [{self.symbol}]", 
+                         f"Started monitoring RESISTANCE zone at {smart_fmt(level['price'])} for SHORT rejection "
+                         f"(Strength: {stars}, {level['touches']} touches)")
+            
+            # Check LONG setups: Support zones (for rejection)
+            for level in supports:
+                key = f"SUPPORT_{level['price']:.10f}"
+                if key not in self.monitoring_setups:
+                    self.monitoring_setups[key] = {
+                        "level_price": level["price"],
+                        "direction": "LONG",
+                        "strength": level["strength"],
+                        "touches": level["touches"],
+                        "candles_monitored": 0,
+                        "start_price": current_price,
+                        "start_time": datetime.now(timezone.utc).isoformat(),
+                    }
+                    stars = "★" * level["strength"]
+                    _log("info", f"S/R-REV [{self.symbol}]", 
+                         f"Started monitoring SUPPORT zone at {smart_fmt(level['price'])} for LONG rejection "
+                         f"(Strength: {stars}, {level['touches']} touches)")
+    
+    def cleanup_expired(self) -> None:
+        """Remove expired monitoring setups."""
+        with self._lock:
+            expired_keys = [
+                key for key, setup in self.monitoring_setups.items()
+                if setup["candles_monitored"] > SR_REVERSAL_MONITOR_WINDOW
+            ]
+            for key in expired_keys:
+                setup = self.monitoring_setups[key]
+                _log("info", f"S/R-REV [{self.symbol}]", 
+                     f"Expired: {setup['direction']} at {smart_fmt(setup['level_price'])} "
+                     f"({setup['candles_monitored']}/{SR_REVERSAL_MONITOR_WINDOW})")
+                del self.monitoring_setups[key]
+
+
+# ─── NEW: FALSE BREAKOUT STRATEGY (RETAINED WITH CONFIRMATION) ──
 
 def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
     """
-    SHORT SETUP 1: FALSE BREAKOUT AT RESISTANCE
+    SHORT SETUP 1: FALSE BREAKOUT AT RESISTANCE (RETAINED - with confirmation)
     1. Price breaks ABOVE a valid Resistance level.
     2. The same completed candle closes BACK BELOW the Resistance.
     3. The candle must be bearish (Red) - this is the Reversal Candle.
@@ -2095,75 +2279,9 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
     return False, None, ""
 
 
-def check_short_signal_resistance_rejection(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
-    """
-    SHORT SETUP 2: DIRECT RESISTANCE REJECTION
-    1. Price reaches or comes within tolerance of a valid Resistance level.
-    2. A bearish reversal candle forms at the Resistance.
-    3. Wait for the immediately next completed candle.
-    4. If the next candle closes BELOW the Reversal Candle's close, execute SHORT.
-    5. Stop Loss = High of the Reversal Candle.
-    """
-    if len(candles) < SR_MIN_LEVEL_AGE + 3:
-        return False, None, ""
-    
-    # Get the last 2 candles: reversal candle and confirmation candle
-    reversal_candle = candles[-2]
-    confirm_candle = candles[-1]
-    
-    # Check if reversal candle is bearish (required for SHORT)
-    if not is_bearish(reversal_candle):
-        return False, None, ""
-    
-    # Check if reversal candle high is near a resistance level
-    resistances, _ = sr_manager.get_levels_near_price(reversal_candle["high"], tolerance=0.005)
-    
-    if not resistances:
-        return False, None, ""
-    
-    # Check each resistance level for rejection pattern
-    for level_dict in resistances:
-        resistance = level_dict["price"]
-        
-        # Check: Price reached or came within tolerance of resistance
-        # The reversal candle high should be near resistance
-        if abs(reversal_candle["high"] - resistance) / resistance > 0.005:
-            continue
-        
-        # Check: Reversal candle closed below its high (bearish rejection)
-        if reversal_candle["close"] >= reversal_candle["high"] * 0.998:
-            continue
-        
-        # Check: Confirmation candle closes BELOW reversal candle's close
-        if confirm_candle["close"] >= reversal_candle["close"]:
-            continue
-        
-        # Valid resistance rejection - execute on confirmation
-        signal_candle = confirm_candle.copy()
-        signal_candle["pattern_high"] = reversal_candle["high"]  # Stop Loss at Reversal Candle High
-        signal_candle["breakout_level"] = resistance
-        signal_candle["level_strength"] = level_dict["strength"]
-        signal_candle["level_touches"] = level_dict["touches"]
-        signal_candle["reversal_candle_close"] = reversal_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
-        signal_candle["setup_type"] = "DIRECT_REJECTION"
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "RESISTANCE_REJECTION_SHORT", 
-             f"SHORT: Resistance rejection at {smart_fmt(resistance)} "
-             f"(Reversal high {smart_fmt(reversal_candle['high'])} near resistance) "
-             f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} < Reversal close "
-             f"(Strength: {stars}, {level_dict['touches']} touches)")
-        
-        return True, signal_candle, "RESISTANCE_REJECTION_SHORT"
-    
-    return False, None, ""
-
-
 def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
     """
-    LONG SETUP 1: FALSE BREAKOUT AT SUPPORT
+    LONG SETUP 1: FALSE BREAKOUT AT SUPPORT (RETAINED - with confirmation)
     1. Price breaks BELOW a valid Support level.
     2. The same completed candle closes BACK ABOVE the Support.
     3. The candle must be bullish (Green) - this is the Reversal Candle.
@@ -2227,71 +2345,6 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: SR
     return False, None, ""
 
 
-def check_long_signal_support_rejection(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
-    """
-    LONG SETUP 2: DIRECT SUPPORT REJECTION
-    1. Price reaches or comes within tolerance of a valid Support level.
-    2. A bullish reversal candle forms at the Support.
-    3. Wait for the immediately next completed candle.
-    4. If the next candle closes ABOVE the Reversal Candle's close, execute LONG.
-    5. Stop Loss = Low of the Reversal Candle.
-    """
-    if len(candles) < SR_MIN_LEVEL_AGE + 3:
-        return False, None, ""
-    
-    # Get the last 2 candles: reversal candle and confirmation candle
-    reversal_candle = candles[-2]
-    confirm_candle = candles[-1]
-    
-    # Check if reversal candle is bullish (required for LONG)
-    if not is_bullish(reversal_candle):
-        return False, None, ""
-    
-    # Check if reversal candle low is near a support level
-    _, supports = sr_manager.get_levels_near_price(reversal_candle["low"], tolerance=0.005)
-    
-    if not supports:
-        return False, None, ""
-    
-    # Check each support level for rejection pattern
-    for level_dict in supports:
-        support = level_dict["price"]
-        
-        # Check: Price reached or came within tolerance of support
-        # The reversal candle low should be near support
-        if abs(reversal_candle["low"] - support) / support > 0.005:
-            continue
-        
-        # Check: Reversal candle closed above its low (bullish rejection)
-        if reversal_candle["close"] <= reversal_candle["low"] * 1.002:
-            continue        
-        # Check: Confirmation candle closes ABOVE reversal candle's close
-        if confirm_candle["close"] <= reversal_candle["close"]:
-            continue
-        
-        # Valid support rejection - execute on confirmation
-        signal_candle = confirm_candle.copy()
-        signal_candle["pattern_low"] = reversal_candle["low"]  # Stop Loss at Reversal Candle Low
-        signal_candle["breakout_level"] = support
-        signal_candle["level_strength"] = level_dict["strength"]
-        signal_candle["level_touches"] = level_dict["touches"]
-        signal_candle["reversal_candle_close"] = reversal_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
-        signal_candle["setup_type"] = "DIRECT_REJECTION"
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "SUPPORT_REJECTION_LONG", 
-             f"LONG: Support rejection at {smart_fmt(support)} "
-             f"(Reversal low {smart_fmt(reversal_candle['low'])} near support) "
-             f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} > Reversal close "
-             f"(Strength: {stars}, {level_dict['touches']} touches)")
-        
-        return True, signal_candle, "SUPPORT_REJECTION_LONG"
-    
-    return False, None, ""
-
-
 # ================================================================
 #  13d. SIGNAL CHECKERS
 # ================================================================
@@ -2327,7 +2380,8 @@ def check_short_signal(
 
 def check_short_signal_no_rsi(
     candles: List[dict], sr_manager: SRLevelManager, symbol: str = "", 
-    harami_tolerance: float = HARAMI_BODY_TOLERANCE
+    harami_tolerance: float = HARAMI_BODY_TOLERANCE,
+    reversal_monitor: Optional[SRReversalMonitor] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
     Check SHORT signals WITHOUT RSI filter.
@@ -2354,19 +2408,20 @@ def check_short_signal_no_rsi(
              f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Resistance False Breakout (no RSI required) - NEW S/R Reversal Strategy
+    # Check Resistance False Breakout (no RSI required) - S/R Reversal False Breakout
     triggered, signal_candle, strategy = check_short_signal_resistance_false_breakout(candles, sr_manager)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Resistance Rejection (no RSI required) - NEW S/R Reversal Strategy
-    triggered, signal_candle, strategy = check_short_signal_resistance_rejection(candles, sr_manager)
-    if triggered:
-        _log("info", "SIGNAL",
-             f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
-        return True, signal_candle, strategy, None
+    # Check S/R Rejection via monitoring (UPDATED - immediate execution)
+    if reversal_monitor:
+        triggered, signal_candle, strategy = reversal_monitor.check_for_rejection(candles)
+        if triggered:
+            _log("info", "SIGNAL",
+                 f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED (IMMEDIATE EXECUTION)")
+            return True, signal_candle, strategy, None
     
     return False, None, "", None
 
@@ -2407,7 +2462,8 @@ def check_long_signal(
 
 def check_long_signal_no_rsi(
     candles: List[dict], sr_manager: SRLevelManager, symbol: str = "",
-    harami_tolerance: float = HARAMI_BODY_TOLERANCE
+    harami_tolerance: float = HARAMI_BODY_TOLERANCE,
+    reversal_monitor: Optional[SRReversalMonitor] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     """
     Check LONG signals WITHOUT RSI filter.
@@ -2434,25 +2490,26 @@ def check_long_signal_no_rsi(
              f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Support False Breakout (no RSI required) - NEW S/R Reversal Strategy
+    # Check Support False Breakout (no RSI required) - S/R Reversal False Breakout
     triggered, signal_candle, strategy = check_long_signal_support_false_breakout(candles, sr_manager)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Support Rejection (no RSI required) - NEW S/R Reversal Strategy
-    triggered, signal_candle, strategy = check_long_signal_support_rejection(candles, sr_manager)
-    if triggered:
-        _log("info", "SIGNAL",
-             f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
-        return True, signal_candle, strategy, None
+    # Check S/R Rejection via monitoring (UPDATED - immediate execution)
+    if reversal_monitor:
+        triggered, signal_candle, strategy = reversal_monitor.check_for_rejection(candles)
+        if triggered:
+            _log("info", "SIGNAL",
+                 f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED (IMMEDIATE EXECUTION)")
+            return True, signal_candle, strategy, None
     
     return False, None, "", None
 
 
 # ================================================================
-#  14-24. REMAINING CODE (SymbolValidator, DeltaREST, etc.)
+#  14-24. REMAINING CODE
 # ================================================================
 
 # [All the remaining code from sections 14-24 remains exactly the same]
@@ -2924,15 +2981,13 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT (v12.5 — Added S/R Reversal Strategy)
+#  21. TRADING BOT (v12.6 — Updated S/R Strength to 1)
 # ================================================================
 
 class TradingBot:
     """
-    v12.5: Added independent S/R Reversal Strategy.
-    - False Breakout at Support/Resistance
-    - Direct Rejection at Support/Resistance
-    Both strategies coexist with existing S/R Breakout Strategy.
+    v12.6: Updated S/R strength requirement from 2 to 1.
+    Now levels with ★ (strength 1) can be traded.
     """
 
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
@@ -2982,6 +3037,9 @@ class TradingBot:
         
         # S/R Managers for each symbol
         self.sr_managers: Dict[str, SRLevelManager] = {}
+        
+        # S/R Reversal Monitors for each symbol
+        self.reversal_monitors: Dict[str, SRReversalMonitor] = {}
 
         self.on_signal_callback = None
         self.on_trade_callback  = None
@@ -3231,6 +3289,7 @@ class TradingBot:
         for sym in self.symbols:
             self.candle_store[sym] = deque(maxlen=500)
             self.sr_managers[sym] = SRLevelManager(symbol=sym)
+            self.reversal_monitors[sym] = SRReversalMonitor(symbol=sym, sr_manager=self.sr_managers[sym])
 
         if not self.paper:
             for sym in self.symbols:
@@ -3336,6 +3395,12 @@ class TradingBot:
             # Update S/R levels for this symbol
             if symbol in self.sr_managers:
                 self.sr_managers[symbol].update_levels(list(store))
+                
+                # Check for new S/R zones reached (for reversal monitoring)
+                if symbol in self.reversal_monitors:
+                    self.reversal_monitors[symbol].check_new_zone_reached(list(store))
+                    # Clean up expired monitoring setups
+                    self.reversal_monitors[symbol].cleanup_expired()
 
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
@@ -3360,7 +3425,8 @@ class TradingBot:
                         # Check no-RSI strategies (Range Break, Vol Expansion, S/R Breakout, S/R Reversal)
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal_no_rsi(
                             candle_list, self.sr_managers[symbol], symbol=symbol, 
-                            harami_tolerance=self.harami_tolerance
+                            harami_tolerance=self.harami_tolerance,
+                            reversal_monitor=self.reversal_monitors.get(symbol)
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
@@ -3379,7 +3445,8 @@ class TradingBot:
                         # Check no-RSI strategies (Range Break, Vol Expansion, S/R Breakout, S/R Reversal)
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi(
                             candle_list, self.sr_managers[symbol], symbol=symbol,
-                            harami_tolerance=self.harami_tolerance
+                            harami_tolerance=self.harami_tolerance,
+                            reversal_monitor=self.reversal_monitors.get(symbol)
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
@@ -3448,8 +3515,11 @@ class TradingBot:
 
         # Determine stop loss based on strategy type
         if direction == "SHORT":
-            if strategy_name in ("RESISTANCE_FALSE_BREAKOUT_SHORT", "RESISTANCE_REJECTION_SHORT"):
-                # Use Reversal Candle High as stop loss
+            if strategy_name in ("RESISTANCE_REJECTION_SHORT",):
+                # Use Rejection Candle High as stop loss (immediate execution)
+                sl = signal_candle.get("pattern_high", signal_candle["high"])
+            elif strategy_name == "RESISTANCE_FALSE_BREAKOUT_SHORT":
+                # Use Reversal Candle High as stop loss (confirmation required)
                 sl = signal_candle.get("pattern_high", signal_candle["high"])
             elif strategy_name == "BEARISH_DOJI" and "doji_low" in signal_candle:
                 sl = signal_candle["doji_low"]
@@ -3462,8 +3532,11 @@ class TradingBot:
                 sl    = list(store)[-2]["high"] if store and len(store) >= 2 \
                         else signal_candle["high"]
         else:
-            if strategy_name in ("SUPPORT_FALSE_BREAKOUT_LONG", "SUPPORT_REJECTION_LONG"):
-                # Use Reversal Candle Low as stop loss
+            if strategy_name in ("SUPPORT_REJECTION_LONG",):
+                # Use Rejection Candle Low as stop loss (immediate execution)
+                sl = signal_candle.get("pattern_low", signal_candle["low"])
+            elif strategy_name == "SUPPORT_FALSE_BREAKOUT_LONG":
+                # Use Reversal Candle Low as stop loss (confirmation required)
                 sl = signal_candle.get("pattern_low", signal_candle["low"])
             elif strategy_name == "BULLISH_DOJI" and "doji_high" in signal_candle:
                 sl = signal_candle["doji_high"]
@@ -3511,6 +3584,7 @@ class TradingBot:
                 "confirmation_close": signal_candle.get("confirmation_close", None),
                 "reversal_candle_close": signal_candle.get("reversal_candle_close", None),
                 "setup_type": signal_candle.get("setup_type", None),
+                "candles_waited": signal_candle.get("candles_waited", None),  # For rejection monitoring
             }
             self.signals.append(signal)
 
@@ -3532,13 +3606,12 @@ class TradingBot:
         
         # Determine strategy category for display
         strategy_category = ""
-        if strategy_name in ("RESISTANCE_FALSE_BREAKOUT_SHORT", "RESISTANCE_REJECTION_SHORT",
-                            "SUPPORT_FALSE_BREAKOUT_LONG", "SUPPORT_REJECTION_LONG"):
-            strategy_category = " [S/R REVERSAL]"
-            if signal_candle.get("setup_type") == "FALSE_BREAKOUT":
-                strategy_category += " - FALSE BREAKOUT"
-            else:
-                strategy_category += " - DIRECT REJECTION"
+        if strategy_name in ("RESISTANCE_REJECTION_SHORT", "SUPPORT_REJECTION_LONG"):
+            strategy_category = " [S/R REJECTION - IMMEDIATE EXECUTION]"
+            if signal_candle.get("candles_waited") is not None:
+                strategy_category += f" (waited {signal_candle['candles_waited']} candles)"
+        elif strategy_name in ("RESISTANCE_FALSE_BREAKOUT_SHORT", "SUPPORT_FALSE_BREAKOUT_LONG"):
+            strategy_category = " [S/R FALSE BREAKOUT - CONFIRMATION REQUIRED]"
 
         print()
         print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] — {strategy_name}{strategy_category}")
@@ -3560,6 +3633,8 @@ class TradingBot:
                 print(f"           Reversal Close: {smart_fmt(signal['reversal_candle_close'])}")
             if signal.get("confirmation_close"):
                 print(f"           Confirm Close: {smart_fmt(signal['confirmation_close'])}")
+            if signal.get("candles_waited") is not None:
+                print(f"           Candles Waited: {signal['candles_waited']} within {SR_REVERSAL_MONITOR_WINDOW}-candle window")
         print(f"           Mode        : {signal['mode']}")
         print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
         if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
@@ -3688,10 +3763,15 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.5           |")
-        print("|   ADDED: S/R REVERSAL STRATEGY (INDEPENDENT)          |")
-        print("|   - False Breakout at Support/Resistance              |")
-        print("|   - Direct Rejection at Support/Resistance            |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.6           |")
+        print("|   UPDATED: S/R STRENGTH REQUIREMENT REDUCED TO 1      |")
+        print("|   Now levels with ★ (strength 1) can be traded        |")
+        print("|   UPDATED: S/R REJECTION STRATEGY                     |")
+        print("|   - ZONE-BASED (levels treated as zones)              |")
+        print("|   - 25-CANDLE MONITOR WINDOW                          |")
+        print("|   - IMMEDIATE EXECUTION on valid rejection candle      |")
+        print("|   - NO CONFIRMATION CANDLE REQUIRED                   |")
+        print("|   False Breakout strategy retained with confirmation   |")
         print("|   Coexists with existing S/R Breakout Strategy        |")
         print("|                                                        |")
         print("|   STOP LOSS : Triggers ONLY on CANDLE CLOSE            |")
@@ -3710,8 +3790,8 @@ class TradingBot:
         print("|   Precision        : auto dp — altcoin micro-prices OK  |")
         print(f"|   Harami Tolerance : {self.harami_tolerance*100:.2f}% body tolerance  |")
         print("|   Vol Expansion   : Body ≥3x avg, ≥75% range, wick≤10%|")
-        print("|   S/R Breakout    : 100-candle S/R, Strength ≥2       |")
-        print("|   S/R Reversal    : False Breakout or Direct Rejection |")
+        print("|   S/R Breakout    : 100-candle S/R, Strength ≥1       |")
+        print("|   S/R Rejection   : Zone-based, 25-candle monitoring   |")
         print("|   S/R Strength    : ★ = 1, ★★ = 2, ★★★ = 3, etc.   |")
         print("+========================================================+")
         print()
@@ -3744,9 +3824,10 @@ class TradingBot:
         print(f"  Harami Tolerance  : {self.harami_tolerance*100:.2f}% body tolerance")
         print(f"  Vol Expansion     : Body ≥3x avg, ≥75% range, wick≤10%")
         print(f"  S/R Detection     : {SR_LOOKBACK} candles, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
-        print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★★ or higher required for trades)")
+        print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
         print(f"  S/R Breakout      : Break + confirmation candle")
-        print(f"  S/R Reversal      : False Breakout or Direct Rejection + confirmation")
+        print(f"  S/R Rejection     : Zone-based + 25-candle window + immediate execution")
+        print(f"  S/R False Breakout: Requires confirmation candle (retained)")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
@@ -3989,10 +4070,15 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.5       |")
-    print("  |   ADDED: S/R REVERSAL STRATEGY                      |")
-    print("  |   - False Breakout at Support/Resistance            |")
-    print("  |   - Direct Rejection at Support/Resistance          |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.6       |")
+    print("  |   UPDATED: S/R STRENGTH REQUIREMENT REDUCED TO 1    |")
+    print("  |   Now levels with ★ (strength 1) can be traded      |")
+    print("  |   UPDATED: S/R REJECTION STRATEGY                   |")
+    print("  |   - ZONE-BASED (levels treated as zones)            |")
+    print("  |   - 25-CANDLE MONITOR WINDOW                        |")
+    print("  |   - IMMEDIATE EXECUTION on valid rejection candle    |")
+    print("  |   - NO CONFIRMATION CANDLE REQUIRED                 |")
+    print("  |   False Breakout retained with confirmation          |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
@@ -4000,7 +4086,7 @@ def main() -> None:
     print("  |   RSI LONG BLOCK: < 24 (extreme oversold)           |")
     print("  |   NO RSI FILTER: Range Break, Vol Expansion,        |")
     print("  |                  S/R Breakout, S/R Reversal          |")
-    print("  |   S/R STRENGTH RANKING: Only ★★ or higher           |")
+    print("  |   S/R STRENGTH RANKING: Only ★ or higher            |")
     print("  |   CONFIGURABLE HARAMI TOLERANCE                     |")
     print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
@@ -4072,8 +4158,9 @@ def main() -> None:
     print(f"  Range Break Conf  : close vs break candle close")
     print(f"  Vol Expansion     : Body ≥3x avg, ≥75% range, wick≤10%")
     print(f"  S/R Breakout      : 100-candle S/R, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
-    print(f"  S/R Reversal      : False Breakout or Direct Rejection at S/R levels")
-    print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★★ or higher required for trades)")
+    print(f"  S/R Rejection     : Zone-based + 25-candle window + immediate execution")
+    print(f"  S/R False Breakout: Confirmation required (retained)")
+    print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
     print(f"  Harami Tolerance  : {harami_tolerance*100:.2f}% body tolerance")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
