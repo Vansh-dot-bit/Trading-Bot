@@ -430,8 +430,9 @@ Take Profit    : 2:1 R:R (or SuperTrend exit if both ST confirm)
 Stop Loss      : Triggers on CANDLE CLOSE
 SuperTrend 1   : Length=14, Factor=2.0
 SuperTrend 2   : Length=21, Factor=1.0
-Harami Tolerance: {harami_tolerance*100:.2f}%
-Vol Expansion  : Body ≥ 3x avg, Body ≥75% of range, Wick ≤10%
+Doji Strategy  : 2 candle breakout + Doji + Confirmation
+Vol Expansion  : 21-candle range break + wick ≤ 10%
+Range Break    : Rolling 7-candle range, recalculated each candle
 S/R Detection  : 100 candles, merge within 0.5%
 S/R Strength   : Minimum Strength 1 (★ or higher)
 
@@ -441,11 +442,11 @@ Breakout       : Price closes beyond S/R level
 Confirmation   : NEXT candle closes beyond break candle close
 Entry          : On confirmation candle close
 
-S/R REVERSAL STRATEGY (UPDATED)
+S/R REVERSAL STRATEGY
 ─────────────────────────────
 ZONE-BASED     : S/R levels treated as zones (not exact prices)
 MONITOR WINDOW : 25 candles after first reaching an S/R zone
-ENTRY          : Immediate execution on valid rejection candle close (NO confirmation)
+ENTRY          : Immediate execution on valid rejection candle close
 NO PRICE RESTRICTIONS: Price can move anywhere within the 25-candle window
 WINDOW EXPIRE  : Discard setup if no valid rejection within 25 candles
 
@@ -730,9 +731,7 @@ HARAMI_BODY_TOLERANCE = 0.001   # 0.1% default
 RANGE_BREAK_LOOKBACK = 7          # Number of candles to identify range
 
 # ── Volatility Expansion Strategy Constants ────────────────────
-VOL_EXP_LOOKBACK = 7              # Number of candles to check for low volatility
-VOL_EXP_MIN_BODY_MULTIPLIER = 3.0 # Body must be at least 3x average
-VOL_EXP_MIN_BODY_RATIO = 0.75     # Body must be at least 75% of total range
+VOL_EXP_LOOKBACK = 21            # Number of candles for range calculation
 VOL_EXP_MAX_WICK_RATIO = 0.10     # Wick must be at most 10% of total range
 
 # ── Support/Resistance Strategy Constants ─────────────────────
@@ -785,7 +784,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/12.5",
+            "User-Agent":   "python-DeltaBot/12.8",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -1120,110 +1119,106 @@ def body_pct_of_range(c: dict) -> float:
 
 
 # ================================================================
-#  13a. SHORT STRATEGIES
+#  13a. SHORT STRATEGIES - UPDATED
 # ================================================================
 
 def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 5: return False, None, ""
-    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]
-    i3     = candles[-4]; i4 = candles[-5]
-    if not (i3["close"] > i4["high"] and i2["close"] > i3["high"]): return False, None, ""
-    i1_body_top    = max(i1["open"], i1["close"])
-    i1_body_bottom = min(i1["open"], i1["close"])
-    i2_body_top    = max(i2["open"], i2["close"])
-    i2_body_bottom = min(i2["open"], i2["close"])
-    overlap        = max(0.0, min(i1_body_top, i2_body_top) - max(i1_body_bottom, i2_body_bottom))
-    i1_body_size   = candle_body(i1)
-    if i1_body_size <= 0 or (overlap / i1_body_size) < BREAKOUT_BODY_OVERLAP_MIN_PCT:
+    """
+    SHORT Strategy 1: Bullish → Bearish → Bearish Signal
+    Signal candle must close BELOW the LOW of the first Bullish Candle.
+    """
+    if len(candles) < 3:
         return False, None, ""
-    if not is_bearish(i1):     return False, None, ""
-    if not is_bearish(signal): return False, None, ""
-    if signal["close"] >= i1["close"]: return False, None, ""
+    
+    signal = candles[-1]
+    bearish_c = candles[-2]
+    bullish_c = candles[-3]
+    
+    # Pattern: Bullish Candle → Bearish Candle → Bearish Signal Candle
+    if not is_bullish(bullish_c):
+        return False, None, ""
+    
+    if not is_bearish(bearish_c):
+        return False, None, ""
+    
+    if not is_bearish(signal):
+        return False, None, ""
+    
+    # Signal candle must close BELOW the LOW of the first Bullish Candle
+    if signal["close"] >= bullish_c["low"]:
+        return False, None, ""
+    
     sc = signal.copy()
-    sc["pattern_high"] = max(i2["high"], i1["high"], signal["high"])
-    _log("info", "STRATEGY_1_SHORT", "Double Breakout + reversal")
+    sc["pattern_high"] = max(bullish_c["high"], bearish_c["high"], signal["high"])
+    
+    _log("info", "STRATEGY_1_SHORT", 
+         f"Signal close {signal['close']} < bullish low {bullish_c['low']}")
     return True, sc, "STRATEGY_1_SHORT"
-
-
-def check_short_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4: return False, None, ""
-    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
-    if i2["close"] <= i3["close"]: return False, None, ""
-    if not is_bullish(i2):         return False, None, ""
-    if not is_bearish(i1):         return False, None, ""
-    if body_pct_of_range(i1) < MIN_ENGULF_BODY_PCT: return False, None, ""
-    if not (i1["open"] > i2["close"] and i1["close"] < i2["open"]): return False, None, ""
-    if not is_bearish(signal):              return False, None, ""
-    if signal["close"] >= i1["close"]:     return False, None, ""
-    sc = signal.copy()
-    sc["pattern_high"] = max(i1["high"], signal["high"])
-    _log("info", "STRATEGY_3_SHORT", "Bearish Engulfing confirmed")
-    return True, sc, "STRATEGY_3_SHORT"
 
 
 def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
     Doji Short Strategy - UPDATED:
-    Signal candle must close BELOW the doji candle's LOW.
+    Pattern: 2 Bullish Candles (breakout pattern) → Doji → Bearish Confirmation Candle
+    - Candle 2 must close ABOVE Candle 1's close (bullish breakout)
+    - Confirmation candle must close BELOW the doji candle's LOW
     """
-    if len(candles) < 4: return False, None, ""
-    signal_c = candles[-1]; doji_c = candles[-2]; i1 = candles[-3]; i2 = candles[-4]
-    if not is_bullish(i2):             return False, None, ""
-    if not is_bullish(i1):             return False, None, ""
-    if not is_doji(doji_c):            return False, None, ""
-    if doji_c["high"] <= i1["high"]:   return False, None, ""
-    if not is_bearish(signal_c):       return False, None, ""
-    # UPDATED: Signal candle must close BELOW doji low
-    if signal_c["close"] >= doji_c["low"]: return False, None, ""
+    if len(candles) < 4: 
+        return False, None, ""
+    
+    signal_c = candles[-1]      # Confirmation candle
+    doji_c = candles[-2]        # Doji candle
+    bullish_2 = candles[-3]     # Second bullish candle
+    bullish_1 = candles[-4]     # First bullish candle
+    
+    # Pattern: 2 Bullish Candles with breakout → Doji → Bearish Confirmation
+    if not is_bullish(bullish_1):
+        return False, None, ""
+    
+    if not is_bullish(bullish_2):
+        return False, None, ""
+    
+    # Candle 2 must close ABOVE Candle 1's close (bullish breakout)
+    if bullish_2["close"] <= bullish_1["close"]:
+        return False, None, ""
+    
+    if not is_doji(doji_c):
+        return False, None, ""
+    
+    if not is_bearish(signal_c):
+        return False, None, ""
+    
+    # Signal candle must close BELOW doji low
+    if signal_c["close"] >= doji_c["low"]:
+        return False, None, ""
+    
     result = signal_c.copy()
-    result["doji_low"] = doji_c["low"]      # Use doji low as reference
-    _log("info", "BEARISH_DOJI", f"Signal close {signal_c['close']} < doji low {doji_c['low']}")
+    result["doji_low"] = doji_c["low"]
+    result["pattern_high"] = doji_c["high"]  # Stop Loss = Doji High
+    
+    _log("info", "BEARISH_DOJI", 
+         f"Bullish breakout: C2 close {smart_fmt(bullish_2['close'])} > C1 close {smart_fmt(bullish_1['close'])} | "
+         f"Doji → Bearish confirmation: Signal close {smart_fmt(signal_c['close'])} < doji low {smart_fmt(doji_c['low'])}")
     return True, result, "BEARISH_DOJI"
 
 
-def check_short_signal_strategy_6(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4: return False, None, ""
-    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
-    if not is_bullish(i3):             return False, None, ""
-    if not is_bullish(i2):             return False, None, ""
-    if i2["close"] <= i3["close"]:     return False, None, ""
-    if not is_bearish(i1):             return False, None, ""
-    i2_body_top    = max(i2["open"], i2["close"])
-    i2_body_bottom = min(i2["open"], i2["close"])
-    i1_body_top    = max(i1["open"], i1["close"])
-    i1_body_bottom = min(i1["open"], i1["close"])
-    
-    i1_body_size = candle_body(i1)
-    tolerance = max(i1_body_size * harami_tolerance, 0.0001)
-    
-    if not (i1_body_top >= i2_body_top - tolerance and i1_body_bottom <= i2_body_bottom + tolerance):
-        return False, None, ""
-    
-    if not is_bearish(signal):             return False, None, ""
-    if signal["close"] >= i1["close"]:     return False, None, ""
-    sc = signal.copy()
-    sc["pattern_high"] = max(i2["high"], i1["high"])
-    _log("info", "BEARISH_HARAMI", f"Bearish Harami with {harami_tolerance*100:.1f}% tolerance")
-    return True, sc, "BEARISH_HARAMI"
-
-
-# ─── RANGE BREAK SHORT STRATEGY ────────────────────────────────
-
 def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Range Break Short Strategy - UPDATED:
-    Signal candle must close BELOW the break candle's CLOSE.
+    Range Break Short Strategy - ROLLING 7-CANDLE RANGE:
+    Always use the latest 7 completed candles.
+    Break candle closes below Range Low.
+    Next Bearish Confirmation candle closes below Break candle's close.
     """
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 2:
         return False, None, ""
     
-    # Look at lookback candles for range (excluding the break candle)
+    # Use the latest 7 completed candles (excluding the break and signal candles)
     range_candles = candles[-(lookback + 2):-2]
-    if len(range_candles) < lookback:
+    if len(range_candles) != lookback:
         return False, None, ""
     
-    # Calculate range high and low
+    # Calculate Range High and Range Low from latest 7 candles
     range_high = max(c["high"] for c in range_candles)
     range_low = min(c["low"] for c in range_candles)
     range_size = range_high - range_low
@@ -1235,11 +1230,7 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     break_candle = candles[-2]
     signal_candle = candles[-1]
     
-    # Check if break candle broke below the range
-    if break_candle["low"] >= range_low:
-        return False, None, ""
-    
-    # Check if break candle's close is below range low (confirmation of break)
+    # Break candle must close BELOW Range Low
     if break_candle["close"] >= range_low:
         return False, None, ""
     
@@ -1247,192 +1238,175 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     if not is_bearish(signal_candle):
         return False, None, ""
     
-    # UPDATED: Signal candle must close BELOW break candle's CLOSE
+    # Signal candle must close BELOW Break candle's close
     if signal_candle["close"] >= break_candle["close"]:
         return False, None, ""
     
-    # Set stop loss at the break candle's high (or range high if higher)
+    # Stop Loss = Break Candle High
     signal_candle_copy = signal_candle.copy()
-    signal_candle_copy["pattern_high"] = max(break_candle["high"], range_high)
+    signal_candle_copy["pattern_high"] = break_candle["high"]
     
     _log("info", "RANGE_BREAK_SHORT", 
-         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} broken below at {smart_fmt(break_candle['low'])}, "
-         f"signal close {signal_candle['close']} < break close {break_candle['close']}")
+         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
+         f"Break close {smart_fmt(break_candle['close'])} < range low | "
+         f"Signal close {signal_candle['close']} < break close")
     return True, signal_candle_copy, "RANGE_BREAK_SHORT"
 
 
-# ─── VOLATILITY EXPANSION SHORT STRATEGY ────────────────────────
-
 def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Volatility Expansion Short Strategy (NO RSI):
-    1. Previous 7 candles have small bodies (low volatility)
-    2. Current candle body ≥ 3× average body
-    3. Current candle body ≥ 75% of total range
-    4. Current candle lower wick ≤ 10% of total range
-    5. Current candle is bearish (RED)
-    6. Candle closes below the lowest low of previous 7 candles
+    Volatility Expansion Short Strategy - UPDATED:
+    1. Look back 21 candles, find LOWEST LOW
+    2. Current candle breaks below that lowest low
+    3. Current candle is bearish (RED)
+    4. Current candle's upper wick ≤ 10% of total range
+    Execute immediately at candle close.
+    Stop Loss = Current Candle High.
     """
     lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 1:
         return False, None, ""
     
-    # Get the previous lookback candles (excluding current)
+    # Get the previous 21 candles (excluding current)
     prev_candles = candles[-(lookback + 1):-1]
     if len(prev_candles) < lookback:
         return False, None, ""
     
     current = candles[-1]
     
-    # Calculate average body size of previous candles
-    avg_body = sum(candle_body(c) for c in prev_candles) / lookback
+    # Find the lowest low of the 21 candles
+    lowest_low = min(c["low"] for c in prev_candles)
     
-    if avg_body <= 0:
-        return False, None, ""
-    
-    current_body = candle_body(current)
     current_range = candle_range(current)
     
     if current_range <= 0:
         return False, None, ""
     
-    # Check: Body ≥ 3× average body
-    if current_body < avg_body * VOL_EXP_MIN_BODY_MULTIPLIER:
+    # Check: Current candle breaks below the lowest low
+    if current["close"] >= lowest_low:
         return False, None, ""
     
-    # Check: Body ≥ 75% of total range
-    if current_body / current_range < VOL_EXP_MIN_BODY_RATIO:
-        return False, None, ""
-    
-    # Check: Lower wick ≤ 10% of total range
-    if lower_wick(current) / current_range > VOL_EXP_MAX_WICK_RATIO:
-        return False, None, ""
-    
-    # Check: Current candle is bearish (RED)
+    # Check: Bearish candle
     if not is_bearish(current):
         return False, None, ""
     
-    # Check: Candle closes below the lowest low of previous 7 candles
-    prev_low = min(c["low"] for c in prev_candles)
-    if current["close"] >= prev_low:
+    # Check: Upper wick ≤ 10% of total range
+    if upper_wick(current) / current_range > VOL_EXP_MAX_WICK_RATIO:
         return False, None, ""
     
-    # Set stop loss at current candle's high
+    # Stop Loss = Current Candle High
     current_copy = current.copy()
     current_copy["pattern_high"] = current["high"]
-    current_copy["breakout_level"] = prev_low
+    current_copy["breakout_level"] = lowest_low
     
     _log("info", "VOL_EXPANSION_SHORT", 
-         f"Body {smart_fmt(current_body)} (x{current_body/avg_body:.1f} avg) | "
-         f"Close {smart_fmt(current['close'])} < prev low {smart_fmt(prev_low)}")
+         f"Break below 21-candle low {smart_fmt(lowest_low)} | "
+         f"Close {smart_fmt(current['close'])} < low | "
+         f"Upper wick {upper_wick(current)/current_range*100:.1f}%")
     return True, current_copy, "VOL_EXPANSION_SHORT"
 
 
 # ================================================================
-#  13b. LONG STRATEGIES
+#  13b. LONG STRATEGIES - UPDATED
 # ================================================================
 
 def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 5: return False, None, ""
-    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]
-    i3     = candles[-4]; i4 = candles[-5]
-    if not (i3["close"] < i4["low"] and i2["close"] < i3["low"]): return False, None, ""
-    i1_body_top    = max(i1["open"], i1["close"])
-    i1_body_bottom = min(i1["open"], i1["close"])
-    i2_body_top    = max(i2["open"], i2["close"])
-    i2_body_bottom = min(i2["open"], i2["close"])
-    overlap        = max(0.0, min(i1_body_top, i2_body_top) - max(i1_body_bottom, i2_body_bottom))
-    i1_body_size   = candle_body(i1)
-    if i1_body_size <= 0 or (overlap / i1_body_size) < BREAKOUT_BODY_OVERLAP_MIN_PCT:
+    """
+    LONG Strategy 1: Bearish → Bullish → Bullish Signal
+    Signal candle must close ABOVE the HIGH of the first Bearish Candle.
+    """
+    if len(candles) < 3:
         return False, None, ""
-    if not is_bullish(i1):              return False, None, ""
-    if not is_bullish(signal):          return False, None, ""
-    if signal["close"] <= i1["close"]:  return False, None, ""
+    
+    signal = candles[-1]
+    bullish_c = candles[-2]
+    bearish_c = candles[-3]
+    
+    # Pattern: Bearish Candle → Bullish Candle → Bullish Signal Candle
+    if not is_bearish(bearish_c):
+        return False, None, ""
+    
+    if not is_bullish(bullish_c):
+        return False, None, ""
+    
+    if not is_bullish(signal):
+        return False, None, ""
+    
+    # Signal candle must close ABOVE the HIGH of the first Bearish Candle
+    if signal["close"] <= bearish_c["high"]:
+        return False, None, ""
+    
     sc = signal.copy()
-    sc["pattern_low"] = min(i2["low"], i1["low"], signal["low"])
-    _log("info", "STRATEGY_1_LONG", "Double Downward Breakout + bullish reversal")
+    sc["pattern_low"] = min(bearish_c["low"], bullish_c["low"], signal["low"])
+    
+    _log("info", "STRATEGY_1_LONG", 
+         f"Signal close {signal['close']} > bearish high {bearish_c['high']}")
     return True, sc, "STRATEGY_1_LONG"
-
-
-def check_long_signal_strategy_3(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4: return False, None, ""
-    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
-    if i2["close"] >= i3["close"]:     return False, None, ""
-    if not is_bearish(i2):             return False, None, ""
-    if not is_bullish(i1):             return False, None, ""
-    if body_pct_of_range(i1) < MIN_ENGULF_BODY_PCT: return False, None, ""
-    if not (i1["open"] < i2["close"] and i1["close"] > i2["open"]): return False, None, ""
-    if not is_bullish(signal):             return False, None, ""
-    if signal["close"] <= i1["close"]:    return False, None, ""
-    sc = signal.copy()
-    sc["pattern_low"] = min(i1["low"], signal["low"])
-    _log("info", "STRATEGY_3_LONG", "Bullish Engulfing confirmed")
-    return True, sc, "BULLISH_ENGULFING"
 
 
 def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
     Doji Long Strategy - UPDATED:
-    Signal candle must close ABOVE the doji candle's HIGH.
+    Pattern: 2 Bearish Candles (breakout pattern) → Doji → Bullish Confirmation Candle
+    - Candle 2 must close BELOW Candle 1's close (bearish breakout)
+    - Confirmation candle must close ABOVE the doji candle's HIGH
     """
-    if len(candles) < 4: return False, None, ""
-    signal_c = candles[-1]; doji_c = candles[-2]; i1 = candles[-3]; i2 = candles[-4]
-    if not is_bearish(i2):             return False, None, ""
-    if not is_bearish(i1):             return False, None, ""
-    if not is_doji(doji_c):            return False, None, ""
-    if doji_c["low"] >= i1["low"]:     return False, None, ""
-    if not is_bullish(signal_c):       return False, None, ""
-    # UPDATED: Signal candle must close ABOVE doji high
-    if signal_c["close"] <= doji_c["high"]: return False, None, ""
+    if len(candles) < 4:
+        return False, None, ""
+    
+    signal_c = candles[-1]      # Confirmation candle
+    doji_c = candles[-2]        # Doji candle
+    bearish_2 = candles[-3]     # Second bearish candle
+    bearish_1 = candles[-4]     # First bearish candle
+    
+    # Pattern: 2 Bearish Candles with breakout → Doji → Bullish Confirmation
+    if not is_bearish(bearish_1):
+        return False, None, ""
+    
+    if not is_bearish(bearish_2):
+        return False, None, ""
+    
+    # Candle 2 must close BELOW Candle 1's close (bearish breakout)
+    if bearish_2["close"] >= bearish_1["close"]:
+        return False, None, ""
+    
+    if not is_doji(doji_c):
+        return False, None, ""
+    
+    if not is_bullish(signal_c):
+        return False, None, ""
+    
+    # Signal candle must close ABOVE doji high
+    if signal_c["close"] <= doji_c["high"]:
+        return False, None, ""
+    
     result = signal_c.copy()
-    result["doji_high"] = doji_c["high"]    # Use doji high as reference
-    _log("info", "BULLISH_DOJI", f"Signal close {signal_c['close']} > doji high {doji_c['high']}")
+    result["doji_high"] = doji_c["high"]
+    result["pattern_low"] = doji_c["low"]  # Stop Loss = Doji Low
+    
+    _log("info", "BULLISH_DOJI", 
+         f"Bearish breakout: C2 close {smart_fmt(bearish_2['close'])} < C1 close {smart_fmt(bearish_1['close'])} | "
+         f"Doji → Bullish confirmation: Signal close {smart_fmt(signal_c['close'])} > doji high {smart_fmt(doji_c['high'])}")
     return True, result, "BULLISH_DOJI"
 
 
-def check_long_signal_strategy_6(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4: return False, None, ""
-    signal = candles[-1]; i1 = candles[-2]; i2 = candles[-3]; i3 = candles[-4]
-    if not is_bearish(i3):             return False, None, ""
-    if not is_bearish(i2):             return False, None, ""
-    if i2["close"] >= i3["close"]:     return False, None, ""
-    if not is_bullish(i1):             return False, None, ""
-    i2_body_top    = max(i2["open"], i2["close"])
-    i2_body_bottom = min(i2["open"], i2["close"])
-    i1_body_top    = max(i1["open"], i1["close"])
-    i1_body_bottom = min(i1["open"], i1["close"])
-    
-    i1_body_size = candle_body(i1)
-    tolerance = max(i1_body_size * harami_tolerance, 0.0001)
-    
-    if not (i1_body_top >= i2_body_top - tolerance and i1_body_bottom <= i2_body_bottom + tolerance):
-        return False, None, ""
-    
-    if not is_bullish(signal):             return False, None, ""
-    if signal["close"] <= i1["close"]:     return False, None, ""
-    sc = signal.copy()
-    sc["pattern_low"] = min(i2["low"], i1["low"])
-    _log("info", "BULLISH_HARAMI", f"Bullish Harami with {harami_tolerance*100:.1f}% tolerance")
-    return True, sc, "BULLISH_HARAMI"
-
-
-# ─── RANGE BREAK LONG STRATEGY ────────────────────────────────
-
 def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Range Break Long Strategy - UPDATED:
-    Signal candle must close ABOVE the break candle's CLOSE.
+    Range Break Long Strategy - ROLLING 7-CANDLE RANGE:
+    Always use the latest 7 completed candles.
+    Break candle closes above Range High.
+    Next Bullish Confirmation candle closes above Break candle's close.
     """
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 2:
         return False, None, ""
     
-    # Look at lookback candles for range (excluding the break candle)
+    # Use the latest 7 completed candles (excluding the break and signal candles)
     range_candles = candles[-(lookback + 2):-2]
-    if len(range_candles) < lookback:
+    if len(range_candles) != lookback:
         return False, None, ""
     
-    # Calculate range high and low
+    # Calculate Range High and Range Low from latest 7 candles
     range_high = max(c["high"] for c in range_candles)
     range_low = min(c["low"] for c in range_candles)
     range_size = range_high - range_low
@@ -1444,11 +1418,7 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     break_candle = candles[-2]
     signal_candle = candles[-1]
     
-    # Check if break candle broke above the range
-    if break_candle["high"] <= range_high:
-        return False, None, ""
-    
-    # Check if break candle's close is above range high (confirmation of break)
+    # Break candle must close ABOVE Range High
     if break_candle["close"] <= range_high:
         return False, None, ""
     
@@ -1456,89 +1426,76 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     if not is_bullish(signal_candle):
         return False, None, ""
     
-    # UPDATED: Signal candle must close ABOVE break candle's CLOSE
+    # Signal candle must close ABOVE Break candle's close
     if signal_candle["close"] <= break_candle["close"]:
         return False, None, ""
     
-    # Set stop loss at the break candle's low (or range low if lower)
+    # Stop Loss = Break Candle Low
     signal_candle_copy = signal_candle.copy()
-    signal_candle_copy["pattern_low"] = min(break_candle["low"], range_low)
+    signal_candle_copy["pattern_low"] = break_candle["low"]
     
     _log("info", "RANGE_BREAK_LONG", 
-         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} broken above at {smart_fmt(break_candle['high'])}, "
-         f"signal close {signal_candle['close']} > break close {break_candle['close']}")
+         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
+         f"Break close {smart_fmt(break_candle['close'])} > range high | "
+         f"Signal close {signal_candle['close']} > break close")
     return True, signal_candle_copy, "RANGE_BREAK_LONG"
 
 
-# ─── VOLATILITY EXPANSION LONG STRATEGY ────────────────────────
-
 def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Volatility Expansion Long Strategy (NO RSI):
-    1. Previous 7 candles have small bodies (low volatility)
-    2. Current candle body ≥ 3× average body
-    3. Current candle body ≥ 75% of total range
-    4. Current candle upper wick ≤ 10% of total range
-    5. Current candle is bullish (GREEN)
-    6. Candle closes above the highest high of previous 7 candles
+    Volatility Expansion Long Strategy - UPDATED:
+    1. Look back 21 candles, find HIGHEST HIGH
+    2. Current candle breaks above that highest high
+    3. Current candle is bullish (GREEN)
+    4. Current candle's lower wick ≤ 10% of total range
+    Execute immediately at candle close.
+    Stop Loss = Current Candle Low.
     """
     lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 1:
         return False, None, ""
     
-    # Get the previous lookback candles (excluding current)
+    # Get the previous 21 candles (excluding current)
     prev_candles = candles[-(lookback + 1):-1]
     if len(prev_candles) < lookback:
         return False, None, ""
     
     current = candles[-1]
     
-    # Calculate average body size of previous candles
-    avg_body = sum(candle_body(c) for c in prev_candles) / lookback
+    # Find the highest high of the 21 candles
+    highest_high = max(c["high"] for c in prev_candles)
     
-    if avg_body <= 0:
-        return False, None, ""
-    
-    current_body = candle_body(current)
     current_range = candle_range(current)
     
     if current_range <= 0:
         return False, None, ""
     
-    # Check: Body ≥ 3× average body
-    if current_body < avg_body * VOL_EXP_MIN_BODY_MULTIPLIER:
+    # Check: Current candle breaks above the highest high
+    if current["close"] <= highest_high:
         return False, None, ""
     
-    # Check: Body ≥ 75% of total range
-    if current_body / current_range < VOL_EXP_MIN_BODY_RATIO:
-        return False, None, ""
-    
-    # Check: Upper wick ≤ 10% of total range
-    if upper_wick(current) / current_range > VOL_EXP_MAX_WICK_RATIO:
-        return False, None, ""
-    
-    # Check: Current candle is bullish (GREEN)
+    # Check: Bullish candle
     if not is_bullish(current):
         return False, None, ""
     
-    # Check: Candle closes above the highest high of previous 7 candles
-    prev_high = max(c["high"] for c in prev_candles)
-    if current["close"] <= prev_high:
+    # Check: Lower wick ≤ 10% of total range
+    if lower_wick(current) / current_range > VOL_EXP_MAX_WICK_RATIO:
         return False, None, ""
     
-    # Set stop loss at current candle's low
+    # Stop Loss = Current Candle Low
     current_copy = current.copy()
     current_copy["pattern_low"] = current["low"]
-    current_copy["breakout_level"] = prev_high
+    current_copy["breakout_level"] = highest_high
     
     _log("info", "VOL_EXPANSION_LONG", 
-         f"Body {smart_fmt(current_body)} (x{current_body/avg_body:.1f} avg) | "
-         f"Close {smart_fmt(current['close'])} > prev high {smart_fmt(prev_high)}")
+         f"Break above 21-candle high {smart_fmt(highest_high)} | "
+         f"Close {smart_fmt(current['close'])} > high | "
+         f"Lower wick {lower_wick(current)/current_range*100:.1f}%")
     return True, current_copy, "VOL_EXPANSION_LONG"
 
 
 # ================================================================
-#  13c. SUPPORT/RESISTANCE WITH STRENGTH RANKING - UPDATED
+#  13c. SUPPORT/RESISTANCE WITH STRENGTH RANKING
 # ================================================================
 
 class SRLevelManager:
@@ -1810,12 +1767,12 @@ class SRLevelManager:
             supports = [l for l in self.support_levels 
                        if abs(l["price"] - current_price) <= price_range
                        and l["age"] >= self.min_age
-                       and l["strength"] >= self.min_strength]  # Only strong enough levels
+                       and l["strength"] >= self.min_strength]
             
             resistances = [l for l in self.resistance_levels 
                           if abs(l["price"] - current_price) <= price_range
                           and l["age"] >= self.min_age
-                          and l["strength"] >= self.min_strength]  # Only strong enough levels
+                          and l["strength"] >= self.min_strength]
             
             return supports, resistances
     
@@ -1858,11 +1815,11 @@ class SRLevelManager:
             if self.support_levels or self.resistance_levels:
                 support_str = ", ".join([
                     f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)})" 
-                    for l in self.support_levels[-5:]  # Show last 5
+                    for l in self.support_levels[-5:]
                 ])
                 resistance_str = ", ".join([
                     f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)})" 
-                    for l in self.resistance_levels[-5:]  # Show last 5
+                    for l in self.resistance_levels[-5:]
                 ])
                 
                 if support_str:
@@ -1937,11 +1894,11 @@ def check_short_signal_support_resistance_manager(candles: List[dict], sr_manage
             # If we're here, we have a valid breakdown with confirmation
             # Use the confirmation candle as the signal
             signal_candle = confirm_candle.copy()
-            signal_candle["pattern_high"] = confirm_candle["high"]  # Stop loss at confirmation high
+            signal_candle["pattern_high"] = confirm_candle["high"]
             signal_candle["breakout_level"] = support
             signal_candle["level_strength"] = level_dict["strength"]
             signal_candle["level_touches"] = level_dict["touches"]
-            signal_candle["breakout_type"] = "SUPPORT_BREAKDOWN"  # SHORT
+            signal_candle["breakout_type"] = "SUPPORT_BREAKDOWN"
             signal_candle["break_candle_close"] = break_candle["close"]
             signal_candle["confirmation_close"] = confirm_candle["close"]
             
@@ -2010,11 +1967,11 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
             # If we're here, we have a valid breakout with confirmation
             # Use the confirmation candle as the signal
             signal_candle = confirm_candle.copy()
-            signal_candle["pattern_low"] = confirm_candle["low"]  # Stop loss at confirmation low
+            signal_candle["pattern_low"] = confirm_candle["low"]
             signal_candle["breakout_level"] = resistance
             signal_candle["level_strength"] = level_dict["strength"]
             signal_candle["level_touches"] = level_dict["touches"]
-            signal_candle["breakout_type"] = "RESISTANCE_BREAKOUT"  # LONG
+            signal_candle["breakout_type"] = "RESISTANCE_BREAKOUT"
             signal_candle["break_candle_close"] = break_candle["close"]
             signal_candle["confirmation_close"] = confirm_candle["close"]
             
@@ -2030,7 +1987,7 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
     return False, None, ""
 
 
-# ─── UPDATED: S/R REVERSAL STRATEGY (ZONE-BASED WITH MONITOR WINDOW) ──
+# ─── S/R REVERSAL STRATEGY (ZONE-BASED WITH MONITOR WINDOW) ──
 
 class SRReversalMonitor:
     """
@@ -2043,7 +2000,7 @@ class SRReversalMonitor:
     def __init__(self, symbol: str, sr_manager: SRLevelManager):
         self.symbol = symbol
         self.sr_manager = sr_manager
-        self.monitoring_setups: Dict[str, Dict] = {}  # Key: level_price_str, Value: setup data
+        self.monitoring_setups: Dict[str, Dict] = {}
         self._lock = threading.Lock()
         
     def check_for_rejection(self, candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
@@ -2090,7 +2047,7 @@ class SRReversalMonitor:
                     
                     # If we get here, we have a valid rejection!
                     signal_candle = current_candle.copy()
-                    signal_candle["pattern_high"] = current_candle["high"]  # Stop Loss at rejection high
+                    signal_candle["pattern_high"] = current_candle["high"]
                     signal_candle["breakout_level"] = setup["level_price"]
                     signal_candle["level_strength"] = setup["strength"]
                     signal_candle["level_touches"] = setup["touches"]
@@ -2122,7 +2079,7 @@ class SRReversalMonitor:
                     
                     # If we get here, we have a valid rejection!
                     signal_candle = current_candle.copy()
-                    signal_candle["pattern_low"] = current_candle["low"]  # Stop Loss at rejection low
+                    signal_candle["pattern_low"] = current_candle["low"]
                     signal_candle["breakout_level"] = setup["level_price"]
                     signal_candle["level_strength"] = setup["strength"]
                     signal_candle["level_touches"] = setup["touches"]
@@ -2211,7 +2168,7 @@ class SRReversalMonitor:
                 del self.monitoring_setups[key]
 
 
-# ─── NEW: FALSE BREAKOUT STRATEGY (RETAINED WITH CONFIRMATION) ──
+# ─── FALSE BREAKOUT STRATEGY (RETAINED WITH CONFIRMATION) ──
 
 def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: SRLevelManager) -> Tuple[bool, Optional[dict], str]:
     """
@@ -2258,7 +2215,7 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         
         # Valid false breakout at resistance - execute on confirmation
         signal_candle = confirm_candle.copy()
-        signal_candle["pattern_high"] = reversal_candle["high"]  # Stop Loss at Reversal Candle High
+        signal_candle["pattern_high"] = reversal_candle["high"]
         signal_candle["breakout_level"] = resistance
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
@@ -2324,7 +2281,7 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: SR
         
         # Valid false breakout at support - execute on confirmation
         signal_candle = confirm_candle.copy()
-        signal_candle["pattern_low"] = reversal_candle["low"]  # Stop Loss at Reversal Candle Low
+        signal_candle["pattern_low"] = reversal_candle["low"]
         signal_candle["breakout_level"] = support
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
@@ -2346,7 +2303,7 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: SR
 
 
 # ================================================================
-#  13d. SIGNAL CHECKERS
+#  13d. SIGNAL CHECKERS - UPDATED
 # ================================================================
 
 def check_short_signal(
@@ -2358,18 +2315,16 @@ def check_short_signal(
     )
     if not rsi_passes:
         return False, None, "", rsi_value
-    for checker in (
-        check_short_signal_strategy_1,
-        check_short_signal_strategy_3,
-        check_short_signal_strategy_5,
-    ):
-        triggered, signal_candle, strategy = checker(candles)
-        if triggered:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
-            return True, signal_candle, strategy, rsi_value
     
-    triggered, signal_candle, strategy = check_short_signal_strategy_6(candles, harami_tolerance)
+    # Check Strategy 1 (RSI-based)
+    triggered, signal_candle, strategy = check_short_signal_strategy_1(candles)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+        return True, signal_candle, strategy, rsi_value
+    
+    # Check Strategy 5 (Doji - RSI-based) - UPDATED with 2 bullish breakout candles
+    triggered, signal_candle, strategy = check_short_signal_strategy_5(candles)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
@@ -2394,7 +2349,7 @@ def check_short_signal_no_rsi(
              f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Volatility Expansion (no RSI required)
+    # Check Volatility Expansion (no RSI required) - UPDATED with 21-candle lookback
     triggered, signal_candle, strategy = check_short_signal_vol_expansion(candles)
     if triggered:
         _log("info", "SIGNAL",
@@ -2440,18 +2395,16 @@ def check_long_signal(
     if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
     _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
-    for checker in (
-        check_long_signal_strategy_1,
-        check_long_signal_strategy_3,
-        check_long_signal_strategy_5,
-    ):
-        triggered, signal_candle, strategy = checker(candles)
-        if triggered:
-            _log("info", "SIGNAL",
-                 f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
-            return True, signal_candle, strategy, rsi
     
-    triggered, signal_candle, strategy = check_long_signal_strategy_6(candles, harami_tolerance)
+    # Check Strategy 1 (RSI-based)
+    triggered, signal_candle, strategy = check_long_signal_strategy_1(candles)
+    if triggered:
+        _log("info", "SIGNAL",
+             f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
+        return True, signal_candle, strategy, rsi
+    
+    # Check Strategy 5 (Doji - RSI-based) - UPDATED with 2 bearish breakout candles
+    triggered, signal_candle, strategy = check_long_signal_strategy_5(candles)
     if triggered:
         _log("info", "SIGNAL",
              f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
@@ -2476,7 +2429,7 @@ def check_long_signal_no_rsi(
              f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    # Check Volatility Expansion (no RSI required)
+    # Check Volatility Expansion (no RSI required) - UPDATED with 21-candle lookback
     triggered, signal_candle, strategy = check_long_signal_vol_expansion(candles)
     if triggered:
         _log("info", "SIGNAL",
@@ -2507,15 +2460,6 @@ def check_long_signal_no_rsi(
     
     return False, None, "", None
 
-
-# ================================================================
-#  14-24. REMAINING CODE
-# ================================================================
-
-# [All the remaining code from sections 14-24 remains exactly the same]
-# Including: SymbolValidator, get_time_range, DeltaREST, 
-# compute_position_size, compute_take_profit, DailyLossTracker,
-# TradingBot, user input helpers, test_gmail, main()
 
 # ================================================================
 #  14. SYMBOL VALIDATOR
@@ -2981,13 +2925,14 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  21. TRADING BOT (v12.6 — Updated S/R Strength to 1)
+#  21. TRADING BOT (v12.8 — Updated Doji & Vol Expansion)
 # ================================================================
 
 class TradingBot:
     """
-    v12.6: Updated S/R strength requirement from 2 to 1.
-    Now levels with ★ (strength 1) can be traded.
+    v12.8: Updated strategies:
+    - Doji: 2 candle breakout + Doji + Confirmation
+    - Vol Expansion: 21-candle range break + wick check
     """
 
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
@@ -3521,10 +3466,9 @@ class TradingBot:
             elif strategy_name == "RESISTANCE_FALSE_BREAKOUT_SHORT":
                 # Use Reversal Candle High as stop loss (confirmation required)
                 sl = signal_candle.get("pattern_high", signal_candle["high"])
-            elif strategy_name == "BEARISH_DOJI" and "doji_low" in signal_candle:
-                sl = signal_candle["doji_low"]
-            elif strategy_name in ("STRATEGY_1_SHORT", "STRATEGY_3_SHORT",
-                                    "BEARISH_HARAMI", "RANGE_BREAK_SHORT",
+            elif strategy_name == "BEARISH_DOJI":
+                sl = signal_candle.get("pattern_high", signal_candle["high"])
+            elif strategy_name in ("STRATEGY_1_SHORT", "RANGE_BREAK_SHORT",
                                     "VOL_EXPANSION_SHORT", "SUPPORT_BREAKDOWN_SHORT") and "pattern_high" in signal_candle:
                 sl = signal_candle["pattern_high"]
             else:
@@ -3538,10 +3482,9 @@ class TradingBot:
             elif strategy_name == "SUPPORT_FALSE_BREAKOUT_LONG":
                 # Use Reversal Candle Low as stop loss (confirmation required)
                 sl = signal_candle.get("pattern_low", signal_candle["low"])
-            elif strategy_name == "BULLISH_DOJI" and "doji_high" in signal_candle:
-                sl = signal_candle["doji_high"]
-            elif strategy_name in ("STRATEGY_1_LONG", "BULLISH_ENGULFING",
-                                    "BULLISH_HARAMI", "RANGE_BREAK_LONG",
+            elif strategy_name == "BULLISH_DOJI":
+                sl = signal_candle.get("pattern_low", signal_candle["low"])
+            elif strategy_name in ("STRATEGY_1_LONG", "RANGE_BREAK_LONG",
                                     "VOL_EXPANSION_LONG", "RESISTANCE_BREAKOUT_LONG") and "pattern_low" in signal_candle:
                 sl = signal_candle["pattern_low"]
             else:
@@ -3584,7 +3527,7 @@ class TradingBot:
                 "confirmation_close": signal_candle.get("confirmation_close", None),
                 "reversal_candle_close": signal_candle.get("reversal_candle_close", None),
                 "setup_type": signal_candle.get("setup_type", None),
-                "candles_waited": signal_candle.get("candles_waited", None),  # For rejection monitoring
+                "candles_waited": signal_candle.get("candles_waited", None),
             }
             self.signals.append(signal)
 
@@ -3640,8 +3583,8 @@ class TradingBot:
         if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
             print(f"           Harami Tol : {self.harami_tolerance*100:.2f}%")
         if strategy_name in ("VOL_EXPANSION_SHORT", "VOL_EXPANSION_LONG"):
-            body_ratio = candle_body(signal_candle) / candle_range(signal_candle) if candle_range(signal_candle) > 0 else 0
-            print(f"           Body Ratio  : {body_ratio*100:.1f}% of range")
+            wick_ratio = upper_wick(signal_candle) / candle_range(signal_candle) if candle_range(signal_candle) > 0 else 0
+            print(f"           Wick Ratio  : {wick_ratio*100:.1f}%")
         print()
 
         if self.notifier:
@@ -3763,16 +3706,22 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.6           |")
-        print("|   UPDATED: S/R STRENGTH REQUIREMENT REDUCED TO 1      |")
-        print("|   Now levels with ★ (strength 1) can be traded        |")
-        print("|   UPDATED: S/R REJECTION STRATEGY                     |")
-        print("|   - ZONE-BASED (levels treated as zones)              |")
-        print("|   - 25-CANDLE MONITOR WINDOW                          |")
-        print("|   - IMMEDIATE EXECUTION on valid rejection candle      |")
-        print("|   - NO CONFIRMATION CANDLE REQUIRED                   |")
-        print("|   False Breakout strategy retained with confirmation   |")
-        print("|   Coexists with existing S/R Breakout Strategy        |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v12.8           |")
+        print("|   UPDATED: DOJI & VOLATILITY EXPANSION STRATEGIES     |")
+        print("|                                                        |")
+        print("|   DOJI STRATEGY:                                       |")
+        print("|   • 2 candle breakout pattern before Doji              |")
+        print("|   • SHORT: 2 Bullish candles (breakout) → Doji → Bear |")
+        print("|   • LONG:  2 Bearish candles (breakout) → Doji → Bull |")
+        print("|   • Entry on confirmation candle close                |")
+        print("|   • Stop Loss = Doji High/Low                         |")
+        print("|                                                        |")
+        print("|   VOLATILITY EXPANSION STRATEGY:                      |")
+        print("|   • 21-candle lookback for range                      |")
+        print("|   • SHORT: Break below 21-candle low                  |")
+        print("|   • LONG:  Break above 21-candle high                 |")
+        print("|   • Wick must be ≤ 10% of total range                 |")
+        print("|   • Immediate execution on candle close               |")
         print("|                                                        |")
         print("|   STOP LOSS : Triggers ONLY on CANDLE CLOSE            |")
         print("|   TAKE PROFIT (normal)  : 2:1 R:R on price touch       |")
@@ -3788,8 +3737,7 @@ class TradingBot:
         print("|                      S/R Breakout, S/R Reversal        |")
         print("|   Daily loss limit : based on REALIZED PnL             |")
         print("|   Precision        : auto dp — altcoin micro-prices OK  |")
-        print(f"|   Harami Tolerance : {self.harami_tolerance*100:.2f}% body tolerance  |")
-        print("|   Vol Expansion   : Body ≥3x avg, ≥75% range, wick≤10%|")
+        print("|   Range Break      : Rolling 7-candle range            |")
         print("|   S/R Breakout    : 100-candle S/R, Strength ≥1       |")
         print("|   S/R Rejection   : Zone-based, 25-candle monitoring   |")
         print("|   S/R Strength    : ★ = 1, ★★ = 2, ★★★ = 3, etc.   |")
@@ -3817,12 +3765,11 @@ class TradingBot:
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
-        print(f"  Doji confirmation : close vs doji low/high")
-        print(f"  Range Break conf  : close vs break candle close")
+        print(f"  Doji Strategy     : 2 candle breakout + Doji + Confirmation")
+        print(f"  Vol Expansion     : 21-candle range break + wick ≤ 10%")
+        print(f"  Range Break       : Rolling 7-candle range")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
-        print(f"  Harami Tolerance  : {self.harami_tolerance*100:.2f}% body tolerance")
-        print(f"  Vol Expansion     : Body ≥3x avg, ≥75% range, wick≤10%")
         print(f"  S/R Detection     : {SR_LOOKBACK} candles, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
         print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
         print(f"  S/R Breakout      : Break + confirmation candle")
@@ -4070,15 +4017,20 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.6       |")
-    print("  |   UPDATED: S/R STRENGTH REQUIREMENT REDUCED TO 1    |")
-    print("  |   Now levels with ★ (strength 1) can be traded      |")
-    print("  |   UPDATED: S/R REJECTION STRATEGY                   |")
-    print("  |   - ZONE-BASED (levels treated as zones)            |")
-    print("  |   - 25-CANDLE MONITOR WINDOW                        |")
-    print("  |   - IMMEDIATE EXECUTION on valid rejection candle    |")
-    print("  |   - NO CONFIRMATION CANDLE REQUIRED                 |")
-    print("  |   False Breakout retained with confirmation          |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v12.8       |")
+    print("  |   UPDATED: DOJI & VOLATILITY EXPANSION STRATEGIES   |")
+    print("  |                                                        |")
+    print("  |   DOJI STRATEGY:                                       |")
+    print("  |   • 2 candle breakout pattern before Doji              |")
+    print("  |   • SHORT: 2 Bullish candles (breakout) → Doji → Bear |")
+    print("  |   • LONG:  2 Bearish candles (breakout) → Doji → Bull |")
+    print("  |                                                        |")
+    print("  |   VOLATILITY EXPANSION STRATEGY:                      |")
+    print("  |   • 21-candle lookback for range                      |")
+    print("  |   • SHORT: Break below 21-candle low                  |")
+    print("  |   • LONG:  Break above 21-candle high                 |")
+    print("  |   • Wick must be ≤ 10% of total range                 |")
+    print("  |                                                        |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
@@ -4087,7 +4039,6 @@ def main() -> None:
     print("  |   NO RSI FILTER: Range Break, Vol Expansion,        |")
     print("  |                  S/R Breakout, S/R Reversal          |")
     print("  |   S/R STRENGTH RANKING: Only ★ or higher            |")
-    print("  |   CONFIGURABLE HARAMI TOLERANCE                     |")
     print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
 
@@ -4154,14 +4105,13 @@ def main() -> None:
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print(f"  RSI LONG BLOCK    : RSI(14) < 24 (prevents trades in extreme oversold)")
     print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
-    print(f"  Doji Confirmation : close vs doji low/high")
-    print(f"  Range Break Conf  : close vs break candle close")
-    print(f"  Vol Expansion     : Body ≥3x avg, ≥75% range, wick≤10%")
+    print(f"  Doji Strategy     : 2 candle breakout + Doji + Confirmation")
+    print(f"  Vol Expansion     : 21-candle range break + wick ≤ 10%")
+    print(f"  Range Break       : Rolling 7-candle range")
     print(f"  S/R Breakout      : 100-candle S/R, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
     print(f"  S/R Rejection     : Zone-based + 25-candle window + immediate execution")
     print(f"  S/R False Breakout: Confirmation required (retained)")
     print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
-    print(f"  Harami Tolerance  : {harami_tolerance*100:.2f}% body tolerance")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
