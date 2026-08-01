@@ -126,6 +126,7 @@ class GmailNotifier:
         self.gmail_app_password = gmail_app_password
         self.recipient_emails   = recipient_emails
         self.enabled            = enabled
+        self._last_sr_alert: Dict[str, str] = {}  # Track last alert per symbol to avoid duplicates
 
     def _send_email(self, subject: str, body: str) -> bool:
         if not self.enabled:
@@ -453,6 +454,123 @@ WINDOW EXPIRE  : Discard setup if no valid rejection within 25 candles
 MONITORED SYMBOLS ({len(symbols)})
 ─────────────────────────────
 {symbols_list}"""
+        
+        return self._send_email(subject, body)
+
+    def send_sr_level_event(self, symbol: str, event_type: str, level_data: dict, 
+                            all_supports: List[dict], all_resistances: List[dict]) -> bool:
+        """
+        Send email notification for S/R level events (new level detected or level expired).
+        Only called for NEW level detection or EXPIRED levels.
+        Does NOT send for strength, touch, or age updates.
+        """
+        if not self.enabled:
+            return False
+        
+        # Create a unique key for this symbol and event
+        event_key = f"{symbol}_{event_type}_{level_data.get('price', 0):.10f}"
+        
+        # Check if we already sent this exact event recently (prevent duplicates)
+        if self._last_sr_alert.get(event_key) == event_type:
+            return False
+        
+        # Store the event key
+        self._last_sr_alert[event_key] = event_type
+        
+        # Clean up old entries (keep last 100)
+        if len(self._last_sr_alert) > 100:
+            keys = list(self._last_sr_alert.keys())
+            for k in keys[:-100]:
+                del self._last_sr_alert[k]
+        
+        # Build the email
+        if event_type == "NEW":
+            event_emoji = "🆕"
+            event_desc = "NEW SUPPORT/RESISTANCE LEVEL DETECTED"
+        elif event_type == "EXPIRED":
+            event_emoji = "⏰"
+            event_desc = "SUPPORT/RESISTANCE LEVEL EXPIRED"
+        else:
+            return False
+        
+        # Determine if it's a support or resistance level
+        level_type = "SUPPORT" if "SUPPORT" in str(level_data.get("type", "")) else "RESISTANCE"
+        level_emoji = "🔵" if level_type == "SUPPORT" else "🔴"
+        
+        price = level_data.get("price", 0)
+        strength = level_data.get("strength", 1)
+        touches = level_data.get("touches", 0)
+        age = level_data.get("age", 0)
+        
+        stars = "★" * strength
+        
+        subject = f"[S/R-ALERT] {event_emoji} {symbol} - {level_type} {smart_fmt(price)} - {event_type}"
+        
+        # Build the complete level list
+        def format_level_list(levels: List[dict], level_type_str: str) -> str:
+            if not levels:
+                return "  (none)"
+            
+            # Sort by price
+            sorted_levels = sorted(levels, key=lambda x: x.get("price", 0))
+            
+            lines = []
+            for lv in sorted_levels:
+                lv_price = lv.get("price", 0)
+                lv_strength = lv.get("strength", 1)
+                lv_touches = lv.get("touches", 0)
+                lv_age = lv.get("age", 0)
+                lv_stars = "★" * lv_strength
+                lines.append(f"  • {smart_fmt(lv_price):>15}  {lv_stars:>5}  Touches: {lv_touches:>3}  Age: {lv_age:>3}")
+            
+            return "\n".join(lines)
+        
+        # Format the full level lists (limit to 50 levels to keep email readable)
+        supports_display = all_supports[-50:] if len(all_supports) > 50 else all_supports
+        resistances_display = all_resistances[-50:] if len(all_resistances) > 50 else all_resistances
+        
+        support_lines = format_level_list(supports_display, "SUPPORT")
+        resistance_lines = format_level_list(resistances_display, "RESISTANCE")
+        
+        total_supports = len(all_supports)
+        total_resistances = len(all_resistances)
+        truncated_s = " (showing last 50)" if len(all_supports) > 50 else ""
+        truncated_r = " (showing last 50)" if len(all_resistances) > 50 else ""
+        
+        body = f"""S/R LEVEL EVENT
+─────────────────────────────
+Event       : {event_desc}
+Symbol      : {symbol}
+Time        : {datetime.now(timezone.utc).isoformat()}
+
+AFFECTED LEVEL
+─────────────────────────────
+Type        : {level_type}
+Price       : {smart_fmt(price)}
+Strength    : {stars} ({strength})
+Touches     : {touches}
+Age         : {age} candles"""
+        
+        if event_type == "EXPIRED":
+            body += f"""
+Reason      : Level aged out (max age reached)"""
+        
+        body += f"""
+
+CURRENT SUPPORT LEVELS{truncated_s} ({total_supports} total)
+─────────────────────────────
+{support_lines}
+
+CURRENT RESISTANCE LEVELS{truncated_r} ({total_resistances} total)
+─────────────────────────────
+{resistance_lines}
+
+LEGEND
+─────────────────────────────
+★ = Strength (more ★ = stronger level)
+Touches = Number of times price has touched this level
+Age = Candles since level was created
+Max Age = {SR_MAX_LEVEL_AGE} candles (levels age out)"""
         
         return self._send_email(subject, body)
 
@@ -1510,13 +1628,15 @@ class SRLevelManager:
                  merge_threshold: float = SR_MERGE_THRESHOLD,
                  min_age: int = SR_MIN_LEVEL_AGE,
                  max_age: int = SR_MAX_LEVEL_AGE,
-                 min_strength: int = SR_MIN_STRENGTH):
+                 min_strength: int = SR_MIN_STRENGTH,
+                 notifier: Optional[GmailNotifier] = None):
         self.symbol = symbol
         self.lookback = lookback
         self.merge_threshold = merge_threshold
         self.min_age = min_age
         self.max_age = max_age
         self.min_strength = min_strength
+        self.notifier = notifier
         
         # Persistent level storage with strength tracking
         self.resistance_levels: List[Dict] = []  # Each: {"price": float, "age": int, "strength": int, "touches": int}
@@ -1559,13 +1679,16 @@ class SRLevelManager:
             self.pending_swing_lows.extend(new_swing_lows)
             
             # Process pending swings to create/update levels
-            self._process_pending_swings()
+            new_levels_created = self._process_pending_swings()
             
             # Check for price touching existing levels (strength update)
             self._update_level_strength(candles)
             
             # Age existing levels and remove expired ones
-            self._age_levels()
+            expired_levels = self._age_levels()
+            
+            # Send email notifications for new and expired levels
+            self._send_level_notifications(new_levels_created, expired_levels)
             
             # Update last processed index
             self.last_processed_index = current_idx
@@ -1637,8 +1760,11 @@ class SRLevelManager:
                 return True
         return False
     
-    def _process_pending_swings(self) -> None:
-        """Process pending swing points and add them as levels."""
+    def _process_pending_swings(self) -> List[Dict]:
+        """Process pending swing points and add them as levels.
+        Returns list of new levels created."""
+        new_levels = []
+        
         # Process pending highs as RESISTANCE (for LONG breakouts)
         for high in self.pending_swing_highs:
             merged = False
@@ -1654,12 +1780,15 @@ class SRLevelManager:
                     break
             
             if not merged:
-                self.resistance_levels.append({
+                new_level = {
                     "price": high,
                     "age": 0,
                     "strength": 1,
-                    "touches": 1
-                })
+                    "touches": 1,
+                    "type": "RESISTANCE"
+                }
+                self.resistance_levels.append(new_level)
+                new_levels.append(new_level)
                 _log("info", f"S/R [{self.symbol}]", 
                      f"New RESISTANCE level added: {smart_fmt(high)} (★)")
         
@@ -1678,18 +1807,23 @@ class SRLevelManager:
                     break
             
             if not merged:
-                self.support_levels.append({
+                new_level = {
                     "price": low,
                     "age": 0,
                     "strength": 1,
-                    "touches": 1
-                })
+                    "touches": 1,
+                    "type": "SUPPORT"
+                }
+                self.support_levels.append(new_level)
+                new_levels.append(new_level)
                 _log("info", f"S/R [{self.symbol}]", 
                      f"New SUPPORT level added: {smart_fmt(low)} (★)")
         
         # Clear pending swings after processing
         self.pending_swing_highs.clear()
         self.pending_swing_lows.clear()
+        
+        return new_levels
     
     def _update_level_strength(self, candles: List[dict]) -> None:
         """
@@ -1724,24 +1858,35 @@ class SRLevelManager:
                      f"SUPPORT {smart_fmt(level['price'])} touched! "
                      f"Strength: ★{'★' * (level['strength'] - 1)} ({level['touches']} touches)")
     
-    def _age_levels(self) -> None:
-        """Age existing levels and remove expired ones."""
-        # Age resistance levels
-        self.resistance_levels = [
-            level for level in self.resistance_levels
-            if self._should_keep_level(level)
-        ]
+    def _age_levels(self) -> List[Dict]:
+        """Age existing levels and remove expired ones.
+        Returns list of expired levels."""
+        expired_levels = []
         
-        # Age support levels
-        self.support_levels = [
-            level for level in self.support_levels
-            if self._should_keep_level(level)
-        ]
+        # Age and filter resistance levels
+        new_resistances = []
+        for level in self.resistance_levels:
+            level["age"] += 1
+            if self._should_keep_level(level):
+                new_resistances.append(level)
+            else:
+                expired_levels.append(level)
+        self.resistance_levels = new_resistances
+        
+        # Age and filter support levels
+        new_supports = []
+        for level in self.support_levels:
+            level["age"] += 1
+            if self._should_keep_level(level):
+                new_supports.append(level)
+            else:
+                expired_levels.append(level)
+        self.support_levels = new_supports
+        
+        return expired_levels
     
     def _should_keep_level(self, level: Dict) -> bool:
         """Determine if a level should be kept based on age, strength, and touches."""
-        level["age"] += 1
-        
         # Strong levels (strength >= 3) can stay longer
         max_age = self.max_age * 2 if level["strength"] >= 3 else self.max_age
         
@@ -1754,6 +1899,31 @@ class SRLevelManager:
             return False
         
         return True
+    
+    def _send_level_notifications(self, new_levels: List[Dict], expired_levels: List[Dict]) -> None:
+        """Send email notifications for new and expired levels."""
+        if not self.notifier:
+            return
+        
+        # Send notification for each new level
+        for level in new_levels:
+            self.notifier.send_sr_level_event(
+                symbol=self.symbol,
+                event_type="NEW",
+                level_data=level,
+                all_supports=self.support_levels,
+                all_resistances=self.resistance_levels
+            )
+        
+        # Send notification for each expired level
+        for level in expired_levels:
+            self.notifier.send_sr_level_event(
+                symbol=self.symbol,
+                event_type="EXPIRED",
+                level_data=level,
+                all_supports=self.support_levels,
+                all_resistances=self.resistance_levels
+            )
     
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
         """
@@ -3233,7 +3403,7 @@ class TradingBot:
 
         for sym in self.symbols:
             self.candle_store[sym] = deque(maxlen=500)
-            self.sr_managers[sym] = SRLevelManager(symbol=sym)
+            self.sr_managers[sym] = SRLevelManager(symbol=sym, notifier=self.notifier)
             self.reversal_monitors[sym] = SRReversalMonitor(symbol=sym, sr_manager=self.sr_managers[sym])
 
         if not self.paper:
@@ -3775,6 +3945,7 @@ class TradingBot:
         print(f"  S/R Breakout      : Break + confirmation candle")
         print(f"  S/R Rejection     : Zone-based + 25-candle window + immediate execution")
         print(f"  S/R False Breakout: Requires confirmation candle (retained)")
+        print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  PnL Fetch         : order_id → product_id (5 retries, 1s delay)")
@@ -4006,6 +4177,21 @@ def test_gmail():
             new_tp=0.0, st1=64200.0, st2=63800.0, timeframe="1h", mode="PAPER",
         )
         print("  ✅ SuperTrend test email sent!")
+        print("\n  📤 Sending test S/R level notification...")
+        notifier.send_sr_level_event(
+            symbol="BTCUSD_PERP",
+            event_type="NEW",
+            level_data={"price": 64800.0, "strength": 2, "touches": 3, "age": 5, "type": "RESISTANCE"},
+            all_supports=[
+                {"price": 62000.0, "strength": 3, "touches": 8, "age": 10},
+                {"price": 63500.0, "strength": 1, "touches": 2, "age": 3},
+            ],
+            all_resistances=[
+                {"price": 64800.0, "strength": 2, "touches": 3, "age": 5},
+                {"price": 66000.0, "strength": 4, "touches": 12, "age": 20},
+            ]
+        )
+        print("  ✅ S/R test email sent!")
     else:
         print("  ❌ Failed to send email. Check your App Password and settings.")
 
@@ -4039,6 +4225,7 @@ def main() -> None:
     print("  |   NO RSI FILTER: Range Break, Vol Expansion,        |")
     print("  |                  S/R Breakout, S/R Reversal          |")
     print("  |   S/R STRENGTH RANKING: Only ★ or higher            |")
+    print("  |   S/R EMAIL ALERTS: New levels & expired levels     |")
     print("  |   Auto-precision prices: BTC→2dp, altcoin→up to 10dp|")
     print("  +======================================================+")
 
@@ -4112,6 +4299,7 @@ def main() -> None:
     print(f"  S/R Rejection     : Zone-based + 25-candle window + immediate execution")
     print(f"  S/R False Breakout: Confirmation required (retained)")
     print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
+    print(f"  S/R Email Alerts  : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported up to 10 dp")
     print()
     confirm = input("  Type YES to start the bot : ").strip().upper()
