@@ -55,7 +55,7 @@ def _build_logger() -> logging.Logger:
     log.addHandler(ch)
     try:
         fh = logging.handlers.RotatingFileHandler(
-            "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+            "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
@@ -441,6 +441,7 @@ Vol Expansion  : 21-candle range break (NO wick conditions)
 Range Break    : Rolling 7-candle range
 S/R Detection  : 100 candles, merge within 0.5%
 S/R Strength   : Minimum Strength 1 (★ or higher)
+S/R Max Age    : 100 candles base (extends based on strength)
 
 S/R BREAKOUT STRATEGY
 ─────────────────────────────
@@ -564,7 +565,7 @@ LEGEND
 ★ = Strength (more ★ = stronger level)
 Touches = Number of times price has touched this level
 Age = Candles since level was created
-Max Age = {SR_MAX_LEVEL_AGE} candles (levels age out)"""
+Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
         
         return self._send_email(subject, body)
 
@@ -848,8 +849,8 @@ VOL_EXP_LOOKBACK = 21
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
 SR_MERGE_THRESHOLD = 0.005
-SR_MIN_LEVEL_AGE = 3
-SR_MAX_LEVEL_AGE = 50
+SR_MIN_LEVEL_AGE = 0  # No aging requirement - use immediately
+SR_MAX_LEVEL_AGE = 100  # Max age in candles
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
 
@@ -1356,7 +1357,7 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
 
 
 def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < SR_MIN_LEVEL_AGE + 3:
+    if len(candles) < 3:
         return False, None, ""
     
     current_price = candles[-1]["close"]
@@ -1412,9 +1413,6 @@ def check_short_signal_support_resistance_manager(candles: List[dict], sr_manage
 
 
 def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < SR_MIN_LEVEL_AGE + 3:
-        return False, None, ""
-    
     if len(candles) < 4:
         return False, None, ""
     
@@ -1603,7 +1601,7 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
 
 
 def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < SR_MIN_LEVEL_AGE + 3:
+    if len(candles) < 3:
         return False, None, ""
     
     current_price = candles[-1]["close"]
@@ -1659,9 +1657,6 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
 
 
 def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < SR_MIN_LEVEL_AGE + 3:
-        return False, None, ""
-    
     if len(candles) < 4:
         return False, None, ""
     
@@ -1992,7 +1987,7 @@ def check_long_signal_no_rsi(
 
 
 # ================================================================
-#  14. SUPPORT/RESISTANCE LEVEL MANAGER
+#  14. SUPPORT/RESISTANCE LEVEL MANAGER (ENHANCED - NO AGING)
 # ================================================================
 
 class SRLevelManager:
@@ -2005,7 +2000,7 @@ class SRLevelManager:
         self.symbol = symbol
         self.lookback = lookback
         self.merge_threshold = merge_threshold
-        self.min_age = min_age
+        self.min_age = 0  # No aging requirement - use immediately
         self.max_age = max_age
         self.min_strength = min_strength
         self.notifier = notifier
@@ -2019,7 +2014,7 @@ class SRLevelManager:
         
     def update_levels(self, candles: List[dict]) -> None:
         with self._lock:
-            if len(candles) < self.lookback + self.min_age:
+            if len(candles) < self.lookback:
                 return
             
             current_idx = len(candles) - 1
@@ -2052,6 +2047,7 @@ class SRLevelManager:
             if i < sensitivity or i >= n - sensitivity:
                 continue
             
+            # Detect swing high
             is_high = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
@@ -2059,10 +2055,11 @@ class SRLevelManager:
                     break
             if is_high:
                 price = candles[i]["high"]
-                if not self._is_level_already_present(price, self.resistance_levels, self.support_levels):
+                if not self._level_exists(price, self.resistance_levels):
                     new_highs.append(price)
                     _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level detected: {smart_fmt(price)}")
             
+            # Detect swing low
             is_low = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
@@ -2070,16 +2067,18 @@ class SRLevelManager:
                     break
             if is_low:
                 price = candles[i]["low"]
-                if not self._is_level_already_present(price, self.resistance_levels, self.support_levels):
+                if not self._level_exists(price, self.support_levels):
                     new_lows.append(price)
                     _log("info", f"S/R [{self.symbol}]", f"New SUPPORT level detected: {smart_fmt(price)}")
         
         return new_highs, new_lows
     
-    def _is_level_already_present(self, price: float, resistances: List[Dict], supports: List[Dict]) -> bool:
+    def _level_exists(self, price: float, existing_levels: List[Dict]) -> bool:
+        """Check if a level already exists within tolerance - if yes, strengthen it"""
         threshold = price * self.merge_threshold
-        for level in resistances + supports:
+        for level in existing_levels:
             if abs(level["price"] - price) <= threshold:
+                # Level exists - strengthen it instead of adding new
                 level["strength"] = min(5, level["strength"] + 1)
                 level["touches"] += 1
                 level["age"] = 0
@@ -2090,27 +2089,42 @@ class SRLevelManager:
         return False
     
     def _process_pending_swings(self) -> List[Dict]:
+        """Process pending swings and add as new levels"""
         new_levels = []
         
+        # Process resistance levels
         for high in self.pending_swing_highs:
-            merged = False
+            # Check if already exists (with tolerance)
+            exists = False
             threshold = high * self.merge_threshold
             for level in self.resistance_levels:
                 if abs(level["price"] - high) <= threshold:
+                    # Update existing level
                     level["price"] = (level["price"] + high) / 2
                     level["strength"] = min(5, level["strength"] + 1)
                     level["touches"] += 1
                     level["age"] = 0
-                    merged = True
+                    exists = True
+                    _log("info", f"S/R [{self.symbol}]", 
+                         f"RESISTANCE updated: {smart_fmt(level['price'])} (★{'★' * (level['strength'] - 1)})")
                     break
-            if not merged:
-                new_level = {"price": high, "age": 0, "strength": 1, "touches": 1, "type": "RESISTANCE"}
+            
+            if not exists:
+                # Add as new level - available for trading immediately!
+                new_level = {
+                    "price": high, 
+                    "age": 0, 
+                    "strength": 1, 
+                    "touches": 1, 
+                    "type": "RESISTANCE"
+                }
                 self.resistance_levels.append(new_level)
                 new_levels.append(new_level)
-                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level added: {smart_fmt(high)} (★)")
+                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level added: {smart_fmt(high)} (★) - READY FOR TRADING")
         
+        # Process support levels
         for low in self.pending_swing_lows:
-            merged = False
+            exists = False
             threshold = low * self.merge_threshold
             for level in self.support_levels:
                 if abs(level["price"] - low) <= threshold:
@@ -2118,13 +2132,22 @@ class SRLevelManager:
                     level["strength"] = min(5, level["strength"] + 1)
                     level["touches"] += 1
                     level["age"] = 0
-                    merged = True
+                    exists = True
+                    _log("info", f"S/R [{self.symbol}]", 
+                         f"SUPPORT updated: {smart_fmt(level['price'])} (★{'★' * (level['strength'] - 1)})")
                     break
-            if not merged:
-                new_level = {"price": low, "age": 0, "strength": 1, "touches": 1, "type": "SUPPORT"}
+            
+            if not exists:
+                new_level = {
+                    "price": low, 
+                    "age": 0, 
+                    "strength": 1, 
+                    "touches": 1, 
+                    "type": "SUPPORT"
+                }
                 self.support_levels.append(new_level)
                 new_levels.append(new_level)
-                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT level added: {smart_fmt(low)} (★)")
+                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT level added: {smart_fmt(low)} (★) - READY FOR TRADING")
         
         self.pending_swing_highs.clear()
         self.pending_swing_lows.clear()
@@ -2153,35 +2176,40 @@ class SRLevelManager:
                      f"SUPPORT {smart_fmt(level['price'])} touched! Strength: ★{'★' * (level['strength'] - 1)}")
     
     def _age_levels(self) -> List[Dict]:
+        """Age levels with extended max age of 100 candles base + strength extension"""
         expired_levels = []
         
+        # Process resistance levels
         new_resistances = []
         for level in self.resistance_levels:
+            # Dynamic max age: stronger levels last longer
+            # Base: 100 candles, +15 per strength level
+            effective_max_age = self.max_age + (level["strength"] * 15)
+            
             level["age"] += 1
-            if self._should_keep_level(level):
+            if level["age"] <= effective_max_age:
                 new_resistances.append(level)
             else:
                 expired_levels.append(level)
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"RESISTANCE at {smart_fmt(level['price'])} expired (age: {level['age']}/{effective_max_age})")
         self.resistance_levels = new_resistances
         
+        # Process support levels
         new_supports = []
         for level in self.support_levels:
+            effective_max_age = self.max_age + (level["strength"] * 15)
+            
             level["age"] += 1
-            if self._should_keep_level(level):
+            if level["age"] <= effective_max_age:
                 new_supports.append(level)
             else:
                 expired_levels.append(level)
+                _log("info", f"S/R [{self.symbol}]", 
+                     f"SUPPORT at {smart_fmt(level['price'])} expired (age: {level['age']}/{effective_max_age})")
         self.support_levels = new_supports
         
         return expired_levels
-    
-    def _should_keep_level(self, level: Dict) -> bool:
-        max_age = self.max_age * 2 if level["strength"] >= 3 else self.max_age
-        if level["age"] > max_age:
-            return False
-        if level["age"] < self.min_age and level["strength"] < 1:
-            return False
-        return True
     
     def _send_level_notifications(self, new_levels: List[Dict], expired_levels: List[Dict]) -> None:
         if not self.notifier:
@@ -2198,38 +2226,46 @@ class SRLevelManager:
             )
     
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
+        """Get all levels near current price - no age filter, use immediately"""
         with self._lock:
             price_range = current_price * 0.10
+            # No min_age filter - use all levels regardless of age
             supports = [l for l in self.support_levels 
                        if abs(l["price"] - current_price) <= price_range
-                       and l["age"] >= self.min_age and l["strength"] >= self.min_strength]
+                       and l["strength"] >= self.min_strength]
             resistances = [l for l in self.resistance_levels 
                           if abs(l["price"] - current_price) <= price_range
-                          and l["age"] >= self.min_age and l["strength"] >= self.min_strength]
+                          and l["strength"] >= self.min_strength]
             return supports, resistances
     
     def get_levels_near_price(self, current_price: float, tolerance: float = 0.02) -> Tuple[List[Dict], List[Dict]]:
+        """Get levels near price - no age filter, use immediately"""
         with self._lock:
             threshold = current_price * tolerance
+            # No min_age filter - use all levels regardless of age
             supports = [l for l in self.support_levels 
                        if abs(l["price"] - current_price) <= threshold
-                       and l["age"] >= self.min_age and l["strength"] >= self.min_strength]
+                       and l["strength"] >= self.min_strength]
             resistances = [l for l in self.resistance_levels 
                           if abs(l["price"] - current_price) <= threshold
-                          and l["age"] >= self.min_age and l["strength"] >= self.min_strength]
+                          and l["strength"] >= self.min_strength]
             return supports, resistances
     
     def _log_levels(self) -> None:
         with self._lock:
             if self.support_levels or self.resistance_levels:
-                support_str = ", ".join([f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)})" 
-                                        for l in self.support_levels[-5:]])
-                resistance_str = ", ".join([f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)})" 
-                                           for l in self.resistance_levels[-5:]])
+                support_str = []
+                for l in self.support_levels[-5:]:
+                    support_str.append(f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)}) [age:{l['age']}]")
+                
+                resistance_str = []
+                for l in self.resistance_levels[-5:]:
+                    resistance_str.append(f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)}) [age:{l['age']}]")
+                
                 if support_str:
-                    _log("info", f"S/R [{self.symbol}]", f"SUPPORT levels: {support_str}")
+                    _log("info", f"S/R [{self.symbol}]", f"SUPPORT levels: {', '.join(support_str)}")
                 if resistance_str:
-                    _log("info", f"S/R [{self.symbol}]", f"RESISTANCE levels: {resistance_str}")
+                    _log("info", f"S/R [{self.symbol}]", f"RESISTANCE levels: {', '.join(resistance_str)}")
     
     def reset(self) -> None:
         with self._lock:
@@ -3416,6 +3452,10 @@ class TradingBot:
         print("|   SHORT: Price above Resistance → Closes below → Bear Confirmation")
         print("|   LONG:  Price below Support → Closes above → Bull Confirmation")
         print("|                                                        |")
+        print("|   S/R LEVELS: Max Age = 100 candles base              |")
+        print("|   S/R STRENGTH EXT: +15 candles per strength level    |")
+        print("|   S/R LEVELS: Ready for trading IMMEDIATELY           |")
+        print("|                                                        |")
         print("|   STOP LOSS: CANDLE CLOSE   |   TP: PRICE TOUCH      |")
         print("|   SUPERTREND: ST(14,2) + ST(21,1) for exit           |")
         print("+========================================================+")
@@ -3454,6 +3494,8 @@ class TradingBot:
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
         print(f"  S/R Detection     : {SR_LOOKBACK} candles, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
         print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
+        print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
+        print(f"  S/R Ready         : IMMEDIATELY (no aging requirement)")
         print(f"  S/R Breakout      : Break + confirmation candle")
         print(f"  S/R Reversal      : False breakout + confirmation candle")
         print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
@@ -3729,6 +3771,9 @@ def main() -> None:
     print("  |   • S/R REVERSAL (RESISTANCE_FALSE_BREAKOUT /        |")
     print("  |     SUPPORT_FALSE_BREAKOUT)                           |")
     print("  |                                                        |")
+    print("  |   S/R LEVELS: Max Age = 100 + (Strength * 15)        |")
+    print("  |   S/R LEVELS: Ready for trading IMMEDIATELY          |")
+    print("  |                                                        |")
     print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
     print("  |   DUAL SUPERTREND TP EXTENSION                       |")
     print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
@@ -3795,6 +3840,8 @@ def main() -> None:
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print(f"  RSI LONG BLOCK    : RSI(14) < 24")
     print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
+    print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
+    print(f"  S/R Ready         : IMMEDIATELY (no aging required)")
     print(f"  CANDLESTICK PATTERNS (RSI-based):")
     print(f"    • Bearish Engulfing: Bullish → Bearish engulf")
     print(f"    • Bullish Engulfing: Bearish → Bullish engulf")
