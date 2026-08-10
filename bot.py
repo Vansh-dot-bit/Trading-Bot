@@ -1221,16 +1221,20 @@ def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
 
 
 # ================================================================
-#  13a. SHORT STRATEGIES
+#  13a. SHORT STRATEGIES (FIXED: USE CLOSED CANDLES ONLY)
 # ================================================================
 
 def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
+    # candles[-1] = current forming candle (not closed)
+    # candles[-2] = last closed candle (signal candle)
+    # candles[-3] = previous closed candle
+    # candles[-4] = next previous closed candle
+    if len(candles) < 4:  # Need 3 closed + 1 forming
         return False, None, ""
     
-    signal = candles[-1]
-    bearish_c = candles[-2]
-    bullish_c = candles[-3]
+    signal = candles[-2]      # Last closed candle
+    bearish_c = candles[-3]   # Previous closed candle
+    bullish_c = candles[-4]   # Next previous closed candle
     
     if not is_bullish(bullish_c):
         return False, None, ""
@@ -1253,13 +1257,18 @@ def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[d
 
 
 def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4: 
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = doji candle
+    # candles[-4] = bullish_2
+    # candles[-5] = bullish_1
+    if len(candles) < 5:
         return False, None, ""
     
-    signal_c = candles[-1]
-    doji_c = candles[-2]
-    bullish_2 = candles[-3]
-    bullish_1 = candles[-4]
+    signal_c = candles[-2]      # Signal candle (last closed)
+    doji_c = candles[-3]        # Doji candle
+    bullish_2 = candles[-4]     # Bullish 2
+    bullish_1 = candles[-5]     # Bullish 1
     
     if not is_bullish(bullish_1):
         return False, None, ""
@@ -1291,11 +1300,17 @@ def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[d
 
 
 def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    # candles[-1] = current forming candle
+    # candles[-2] = confirmation candle (last closed)
+    # candles[-3] = break candle (closed)
+    # candles[-4:-2-lookback] = range candles
     lookback = RANGE_BREAK_LOOKBACK
-    if len(candles) < lookback + 2:
+    if len(candles) < lookback + 3:  # Need lookback + break + confirm + current
         return False, None, ""
     
-    range_candles = candles[-(lookback + 2):-2]
+    confirm_candle = candles[-2]    # Last closed candle
+    break_candle = candles[-3]      # Break candle
+    range_candles = candles[-(lookback + 3):-3]  # Range candles
     if len(range_candles) != lookback:
         return False, None, ""
     
@@ -1306,38 +1321,41 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     if range_size <= 0:
         return False, None, ""
     
-    break_candle = candles[-2]
-    signal_candle = candles[-1]
-    
+    # Break candle must CLOSE below range low
     if break_candle["close"] >= range_low:
         return False, None, ""
     
-    if not is_bearish(signal_candle):
+    # Confirmation candle must be bearish
+    if not is_bearish(confirm_candle):
         return False, None, ""
     
-    if signal_candle["close"] >= break_candle["close"]:
+    # Confirmation candle must CLOSE below break candle close
+    if confirm_candle["close"] >= break_candle["close"]:
         return False, None, ""
     
-    signal_candle_copy = signal_candle.copy()
-    signal_candle_copy["pattern_high"] = break_candle["high"]
+    confirm_candle_copy = confirm_candle.copy()
+    confirm_candle_copy["pattern_high"] = break_candle["high"]
     
     _log("info", "RANGE_BREAK_SHORT", 
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {smart_fmt(break_candle['close'])} < range low | "
-         f"Signal close {signal_candle['close']} < break close")
-    return True, signal_candle_copy, "RANGE_BREAK_SHORT"
+         f"Confirm close {confirm_candle['close']} < break close")
+    return True, confirm_candle_copy, "RANGE_BREAK_SHORT"
 
 
 def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3:-2-lookback] = lookback candles
     lookback = VOL_EXP_LOOKBACK
-    if len(candles) < lookback + 1:
+    if len(candles) < lookback + 2:
         return False, None, ""
     
-    prev_candles = candles[-(lookback + 1):-1]
+    current = candles[-2]  # Last closed candle
+    prev_candles = candles[-(lookback + 2):-2]
     if len(prev_candles) < lookback:
         return False, None, ""
     
-    current = candles[-1]
     lowest_low = min(c["low"] for c in prev_candles)
     
     if current["close"] >= lowest_low:
@@ -1357,67 +1375,76 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
 
 
 def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
+    # candles[-1] = current forming candle
+    # candles[-2] = confirmation candle (last closed)
+    # candles[-3] = break candle (closed)
+    if len(candles) < 4:
         return False, None, ""
     
-    current_price = candles[-1]["close"]
-    support_levels, _ = sr_manager.get_relevant_levels(current_price)
+    confirm_candle = candles[-2]  # Confirmation candle (last closed)
+    break_candle = candles[-3]    # Break candle
     
-    if not support_levels:
+    # Get ALL support levels without 10% price restriction
+    with sr_manager._lock:
+        valid_supports = [l for l in sr_manager.support_levels 
+                         if l["strength"] >= sr_manager.min_strength]
+    
+    if not valid_supports:
         return False, None, ""
     
-    support_levels_sorted = sorted(support_levels, key=lambda x: x["price"], reverse=True)
+    # Sort supports by price (highest first - nearest to current price)
+    valid_supports_sorted = sorted(valid_supports, key=lambda x: x["price"], reverse=True)
     
-    for level_dict in support_levels_sorted:
+    current_price = candles[-1]["close"]  # Current forming candle
+    
+    for level_dict in valid_supports_sorted:
         support = level_dict["price"]
         
-        for i in range(2, min(6, len(candles))):
-            break_candle_idx = len(candles) - i
-            if break_candle_idx < 1:
-                continue
-            
-            break_candle = candles[break_candle_idx]
-            
-            if break_candle["close"] >= support:
-                continue
-            
-            if break_candle_idx + 1 >= len(candles):
-                continue
-            
-            confirm_candle = candles[break_candle_idx + 1]
-            
-            if not is_bearish(confirm_candle):
-                continue
-            
-            if confirm_candle["close"] >= break_candle["close"]:
-                continue
-            
-            signal_candle = confirm_candle.copy()
-            signal_candle["pattern_high"] = confirm_candle["high"]
-            signal_candle["breakout_level"] = support
-            signal_candle["level_strength"] = level_dict["strength"]
-            signal_candle["level_touches"] = level_dict["touches"]
-            signal_candle["break_candle_close"] = break_candle["close"]
-            signal_candle["confirmation_close"] = confirm_candle["close"]
-            
-            stars = "★" * level_dict["strength"]
-            
-            _log("info", "SUPPORT_BREAKDOWN_SHORT", 
-                 f"SHORT: Support {smart_fmt(support)} broken (break close {smart_fmt(break_candle['close'])}) "
-                 f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} < break close "
-                 f"(Strength: {stars}, {level_dict['touches']} touches)")
-            
-            return True, signal_candle, "SUPPORT_BREAKDOWN_SHORT"
+        # Allow up to 50% deviation to catch large breakdowns
+        if abs(support - current_price) > current_price * 0.50:
+            continue
+        
+        # Break candle must CLOSE below support
+        if break_candle["close"] >= support:
+            continue
+        
+        # Confirmation candle must be bearish
+        if not is_bearish(confirm_candle):
+            continue
+        
+        # Confirmation candle must CLOSE below break candle close
+        if confirm_candle["close"] >= break_candle["close"]:
+            continue
+        
+        signal_candle = confirm_candle.copy()
+        signal_candle["pattern_high"] = confirm_candle["high"]
+        signal_candle["breakout_level"] = support
+        signal_candle["level_strength"] = level_dict["strength"]
+        signal_candle["level_touches"] = level_dict["touches"]
+        signal_candle["break_candle_close"] = break_candle["close"]
+        signal_candle["confirmation_close"] = confirm_candle["close"]
+        
+        stars = "★" * level_dict["strength"]
+        
+        _log("info", "SUPPORT_BREAKDOWN_SHORT", 
+             f"SHORT: Support {smart_fmt(support)} broken (break close {smart_fmt(break_candle['close'])}) "
+             f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} < break close "
+             f"(Strength: {stars}, {level_dict['touches']} touches)")
+        
+        return True, signal_candle, "SUPPORT_BREAKDOWN_SHORT"
     
     return False, None, ""
 
 
 def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
+    # candles[-1] = current forming candle
+    # candles[-2] = confirmation candle (last closed)
+    # candles[-3] = false breakout candle (closed)
     if len(candles) < 4:
         return False, None, ""
     
-    false_breakout_candle = candles[-2]
-    confirm_candle = candles[-1]
+    false_breakout_candle = candles[-3]  # False breakout candle
+    confirm_candle = candles[-2]         # Confirmation candle (last closed)
     
     if not is_bearish(false_breakout_candle):
         return False, None, ""
@@ -1465,16 +1492,20 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
 
 
 # ================================================================
-#  13b. LONG STRATEGIES
+#  13b. LONG STRATEGIES (FIXED: USE CLOSED CANDLES ONLY)
 # ================================================================
 
 def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = bullish candle
+    # candles[-4] = bearish candle
+    if len(candles) < 4:
         return False, None, ""
     
-    signal = candles[-1]
-    bullish_c = candles[-2]
-    bearish_c = candles[-3]
+    signal = candles[-2]      # Signal candle (last closed)
+    bullish_c = candles[-3]   # Bullish candle
+    bearish_c = candles[-4]   # Bearish candle
     
     if not is_bearish(bearish_c):
         return False, None, ""
@@ -1497,13 +1528,18 @@ def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[di
 
 
 def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = doji candle
+    # candles[-4] = bearish_2
+    # candles[-5] = bearish_1
+    if len(candles) < 5:
         return False, None, ""
     
-    signal_c = candles[-1]
-    doji_c = candles[-2]
-    bearish_2 = candles[-3]
-    bearish_1 = candles[-4]
+    signal_c = candles[-2]      # Signal candle (last closed)
+    doji_c = candles[-3]        # Doji candle
+    bearish_2 = candles[-4]     # Bearish 2
+    bearish_1 = candles[-5]     # Bearish 1
     
     if not is_bearish(bearish_1):
         return False, None, ""
@@ -1535,11 +1571,17 @@ def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[di
 
 
 def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    # candles[-1] = current forming candle
+    # candles[-2] = confirmation candle (last closed)
+    # candles[-3] = break candle (closed)
+    # candles[-4:-2-lookback] = range candles
     lookback = RANGE_BREAK_LOOKBACK
-    if len(candles) < lookback + 2:
+    if len(candles) < lookback + 3:
         return False, None, ""
     
-    range_candles = candles[-(lookback + 2):-2]
+    confirm_candle = candles[-2]    # Last closed candle
+    break_candle = candles[-3]      # Break candle
+    range_candles = candles[-(lookback + 3):-3]
     if len(range_candles) != lookback:
         return False, None, ""
     
@@ -1550,38 +1592,41 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     if range_size <= 0:
         return False, None, ""
     
-    break_candle = candles[-2]
-    signal_candle = candles[-1]
-    
+    # Break candle must CLOSE above range high
     if break_candle["close"] <= range_high:
         return False, None, ""
     
-    if not is_bullish(signal_candle):
+    # Confirmation candle must be bullish
+    if not is_bullish(confirm_candle):
         return False, None, ""
     
-    if signal_candle["close"] <= break_candle["close"]:
+    # Confirmation candle must CLOSE above break candle close
+    if confirm_candle["close"] <= break_candle["close"]:
         return False, None, ""
     
-    signal_candle_copy = signal_candle.copy()
-    signal_candle_copy["pattern_low"] = break_candle["low"]
+    confirm_candle_copy = confirm_candle.copy()
+    confirm_candle_copy["pattern_low"] = break_candle["low"]
     
     _log("info", "RANGE_BREAK_LONG", 
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {smart_fmt(break_candle['close'])} > range high | "
-         f"Signal close {signal_candle['close']} > break close")
-    return True, signal_candle_copy, "RANGE_BREAK_LONG"
+         f"Confirm close {confirm_candle['close']} > break close")
+    return True, confirm_candle_copy, "RANGE_BREAK_LONG"
 
 
 def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3:-2-lookback] = lookback candles
     lookback = VOL_EXP_LOOKBACK
-    if len(candles) < lookback + 1:
+    if len(candles) < lookback + 2:
         return False, None, ""
     
-    prev_candles = candles[-(lookback + 1):-1]
+    current = candles[-2]  # Last closed candle
+    prev_candles = candles[-(lookback + 2):-2]
     if len(prev_candles) < lookback:
         return False, None, ""
     
-    current = candles[-1]
     highest_high = max(c["high"] for c in prev_candles)
     
     if current["close"] <= highest_high:
@@ -1601,67 +1646,76 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
 
 
 def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
+    # candles[-1] = current forming candle
+    # candles[-2] = confirmation candle (last closed)
+    # candles[-3] = break candle (closed)
+    if len(candles) < 4:
         return False, None, ""
     
-    current_price = candles[-1]["close"]
-    _, resistance_levels = sr_manager.get_relevant_levels(current_price)
+    confirm_candle = candles[-2]  # Confirmation candle (last closed)
+    break_candle = candles[-3]    # Break candle
     
-    if not resistance_levels:
+    # Get ALL resistance levels without 10% price restriction
+    with sr_manager._lock:
+        valid_resistances = [l for l in sr_manager.resistance_levels 
+                            if l["strength"] >= sr_manager.min_strength]
+    
+    if not valid_resistances:
         return False, None, ""
     
-    resistance_levels_sorted = sorted(resistance_levels, key=lambda x: x["price"])
+    # Sort resistances by price (lowest first - nearest to current price)
+    valid_resistances_sorted = sorted(valid_resistances, key=lambda x: x["price"])
     
-    for level_dict in resistance_levels_sorted:
+    current_price = candles[-1]["close"]  # Current forming candle
+    
+    for level_dict in valid_resistances_sorted:
         resistance = level_dict["price"]
         
-        for i in range(2, min(6, len(candles))):
-            break_candle_idx = len(candles) - i
-            if break_candle_idx < 1:
-                continue
-            
-            break_candle = candles[break_candle_idx]
-            
-            if break_candle["close"] <= resistance:
-                continue
-            
-            if break_candle_idx + 1 >= len(candles):
-                continue
-            
-            confirm_candle = candles[break_candle_idx + 1]
-            
-            if not is_bullish(confirm_candle):
-                continue
-            
-            if confirm_candle["close"] <= break_candle["close"]:
-                continue
-            
-            signal_candle = confirm_candle.copy()
-            signal_candle["pattern_low"] = confirm_candle["low"]
-            signal_candle["breakout_level"] = resistance
-            signal_candle["level_strength"] = level_dict["strength"]
-            signal_candle["level_touches"] = level_dict["touches"]
-            signal_candle["break_candle_close"] = break_candle["close"]
-            signal_candle["confirmation_close"] = confirm_candle["close"]
-            
-            stars = "★" * level_dict["strength"]
-            
-            _log("info", "RESISTANCE_BREAKOUT_LONG", 
-                 f"LONG: Resistance {smart_fmt(resistance)} broken (break close {smart_fmt(break_candle['close'])}) "
-                 f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} > break close "
-                 f"(Strength: {stars}, {level_dict['touches']} touches)")
-            
-            return True, signal_candle, "RESISTANCE_BREAKOUT_LONG"
+        # Allow up to 50% deviation to catch large breakdowns
+        if abs(resistance - current_price) > current_price * 0.50:
+            continue
+        
+        # Break candle must CLOSE above resistance
+        if break_candle["close"] <= resistance:
+            continue
+        
+        # Confirmation candle must be bullish
+        if not is_bullish(confirm_candle):
+            continue
+        
+        # Confirmation candle must CLOSE above break candle close
+        if confirm_candle["close"] <= break_candle["close"]:
+            continue
+        
+        signal_candle = confirm_candle.copy()
+        signal_candle["pattern_low"] = confirm_candle["low"]
+        signal_candle["breakout_level"] = resistance
+        signal_candle["level_strength"] = level_dict["strength"]
+        signal_candle["level_touches"] = level_dict["touches"]
+        signal_candle["break_candle_close"] = break_candle["close"]
+        signal_candle["confirmation_close"] = confirm_candle["close"]
+        
+        stars = "★" * level_dict["strength"]
+        
+        _log("info", "RESISTANCE_BREAKOUT_LONG", 
+             f"LONG: Resistance {smart_fmt(resistance)} broken (break close {smart_fmt(break_candle['close'])}) "
+             f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} > break close "
+             f"(Strength: {stars}, {level_dict['touches']} touches)")
+        
+        return True, signal_candle, "RESISTANCE_BREAKOUT_LONG"
     
     return False, None, ""
 
 
 def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
+    # candles[-1] = current forming candle
+    # candles[-2] = confirmation candle (last closed)
+    # candles[-3] = false breakout candle (closed)
     if len(candles) < 4:
         return False, None, ""
     
-    false_breakout_candle = candles[-2]
-    confirm_candle = candles[-1]
+    false_breakout_candle = candles[-3]  # False breakout candle
+    confirm_candle = candles[-2]         # Confirmation candle (last closed)
     
     if not is_bullish(false_breakout_candle):
         return False, None, ""
@@ -1709,15 +1763,18 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
 
 
 # ================================================================
-#  13c. ENGULFING STRATEGIES
+#  13c. ENGULFING STRATEGIES (FIXED: USE CLOSED CANDLES ONLY)
 # ================================================================
 
 def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 2:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = previous candle (closed)
+    if len(candles) < 3:
         return False, None, ""
     
-    signal = candles[-1]
-    prev = candles[-2]
+    signal = candles[-2]  # Signal candle (last closed)
+    prev = candles[-3]    # Previous candle
     
     if not is_bullish(prev):
         return False, None, ""
@@ -1744,11 +1801,14 @@ def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Opt
 
 
 def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 2:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = previous candle (closed)
+    if len(candles) < 3:
         return False, None, ""
     
-    signal = candles[-1]
-    prev = candles[-2]
+    signal = candles[-2]  # Signal candle (last closed)
+    prev = candles[-3]    # Previous candle
     
     if not is_bearish(prev):
         return False, None, ""
@@ -1775,15 +1835,18 @@ def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Opti
 
 
 # ================================================================
-#  13d. HARAMI STRATEGIES
+#  13d. HARAMI STRATEGIES (FIXED: USE CLOSED CANDLES ONLY)
 # ================================================================
 
 def check_short_signal_bearish_harami(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 2:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = previous candle (closed)
+    if len(candles) < 3:
         return False, None, ""
     
-    signal = candles[-1]
-    prev = candles[-2]
+    signal = candles[-2]  # Signal candle (last closed)
+    prev = candles[-3]    # Previous candle
     
     if not is_bullish(prev):
         return False, None, ""
@@ -1817,11 +1880,14 @@ def check_short_signal_bearish_harami(candles: List[dict], harami_tolerance: flo
 
 
 def check_long_signal_bullish_harami(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 2:
+    # candles[-1] = current forming candle
+    # candles[-2] = signal candle (last closed)
+    # candles[-3] = previous candle (closed)
+    if len(candles) < 3:
         return False, None, ""
     
-    signal = candles[-1]
-    prev = candles[-2]
+    signal = candles[-2]  # Signal candle (last closed)
+    prev = candles[-3]    # Previous candle
     
     if not is_bearish(prev):
         return False, None, ""
@@ -1855,13 +1921,13 @@ def check_long_signal_bullish_harami(candles: List[dict], harami_tolerance: floa
 
 
 # ================================================================
-#  13e. SIGNAL CHECKERS
+#  13e. SIGNAL CHECKERS (UNCHANGED)
 # ================================================================
 
 def check_short_signal(
     candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
-    closed_candles = candles[:-1]
+    closed_candles = candles[:-1]  # All closed candles
     rsi_passes, rsi_value = check_rsi_filter(
         closed_candles, symbol=symbol, period=RSI_PERIOD, threshold=RSI_OVERBOUGHT
     )
@@ -1923,7 +1989,7 @@ def check_short_signal_no_rsi(
 def check_long_signal(
     candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
-    closed_candles = candles[:-1]
+    closed_candles = candles[:-1]  # All closed candles
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
     if rsi is None:
         return False, None, "", None
@@ -1987,7 +2053,7 @@ def check_long_signal_no_rsi(
 
 
 # ================================================================
-#  14. SUPPORT/RESISTANCE LEVEL MANAGER (ENHANCED - NO AGING)
+#  14. SUPPORT/RESISTANCE LEVEL MANAGER (UNCHANGED)
 # ================================================================
 
 class SRLevelManager:
@@ -2000,7 +2066,7 @@ class SRLevelManager:
         self.symbol = symbol
         self.lookback = lookback
         self.merge_threshold = merge_threshold
-        self.min_age = 0  # No aging requirement - use immediately
+        self.min_age = 0
         self.max_age = max_age
         self.min_strength = min_strength
         self.notifier = notifier
@@ -2047,7 +2113,6 @@ class SRLevelManager:
             if i < sensitivity or i >= n - sensitivity:
                 continue
             
-            # Detect swing high
             is_high = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
@@ -2059,7 +2124,6 @@ class SRLevelManager:
                     new_highs.append(price)
                     _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level detected: {smart_fmt(price)}")
             
-            # Detect swing low
             is_low = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
@@ -2074,11 +2138,9 @@ class SRLevelManager:
         return new_highs, new_lows
     
     def _level_exists(self, price: float, existing_levels: List[Dict]) -> bool:
-        """Check if a level already exists within tolerance - if yes, strengthen it"""
         threshold = price * self.merge_threshold
         for level in existing_levels:
             if abs(level["price"] - price) <= threshold:
-                # Level exists - strengthen it instead of adding new
                 level["strength"] = min(5, level["strength"] + 1)
                 level["touches"] += 1
                 level["age"] = 0
@@ -2089,17 +2151,13 @@ class SRLevelManager:
         return False
     
     def _process_pending_swings(self) -> List[Dict]:
-        """Process pending swings and add as new levels"""
         new_levels = []
         
-        # Process resistance levels
         for high in self.pending_swing_highs:
-            # Check if already exists (with tolerance)
             exists = False
             threshold = high * self.merge_threshold
             for level in self.resistance_levels:
                 if abs(level["price"] - high) <= threshold:
-                    # Update existing level
                     level["price"] = (level["price"] + high) / 2
                     level["strength"] = min(5, level["strength"] + 1)
                     level["touches"] += 1
@@ -2110,7 +2168,6 @@ class SRLevelManager:
                     break
             
             if not exists:
-                # Add as new level - available for trading immediately!
                 new_level = {
                     "price": high, 
                     "age": 0, 
@@ -2122,7 +2179,6 @@ class SRLevelManager:
                 new_levels.append(new_level)
                 _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level added: {smart_fmt(high)} (★) - READY FOR TRADING")
         
-        # Process support levels
         for low in self.pending_swing_lows:
             exists = False
             threshold = low * self.merge_threshold
@@ -2176,16 +2232,11 @@ class SRLevelManager:
                      f"SUPPORT {smart_fmt(level['price'])} touched! Strength: ★{'★' * (level['strength'] - 1)}")
     
     def _age_levels(self) -> List[Dict]:
-        """Age levels with extended max age of 100 candles base + strength extension"""
         expired_levels = []
         
-        # Process resistance levels
         new_resistances = []
         for level in self.resistance_levels:
-            # Dynamic max age: stronger levels last longer
-            # Base: 100 candles, +15 per strength level
             effective_max_age = self.max_age + (level["strength"] * 15)
-            
             level["age"] += 1
             if level["age"] <= effective_max_age:
                 new_resistances.append(level)
@@ -2195,11 +2246,9 @@ class SRLevelManager:
                      f"RESISTANCE at {smart_fmt(level['price'])} expired (age: {level['age']}/{effective_max_age})")
         self.resistance_levels = new_resistances
         
-        # Process support levels
         new_supports = []
         for level in self.support_levels:
             effective_max_age = self.max_age + (level["strength"] * 15)
-            
             level["age"] += 1
             if level["age"] <= effective_max_age:
                 new_supports.append(level)
@@ -2226,10 +2275,8 @@ class SRLevelManager:
             )
     
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
-        """Get all levels near current price - no age filter, use immediately"""
         with self._lock:
             price_range = current_price * 0.10
-            # No min_age filter - use all levels regardless of age
             supports = [l for l in self.support_levels 
                        if abs(l["price"] - current_price) <= price_range
                        and l["strength"] >= self.min_strength]
@@ -2239,10 +2286,8 @@ class SRLevelManager:
             return supports, resistances
     
     def get_levels_near_price(self, current_price: float, tolerance: float = 0.02) -> Tuple[List[Dict], List[Dict]]:
-        """Get levels near price - no age filter, use immediately"""
         with self._lock:
             threshold = current_price * tolerance
-            # No min_age filter - use all levels regardless of age
             supports = [l for l in self.support_levels 
                        if abs(l["price"] - current_price) <= threshold
                        and l["strength"] >= self.min_strength]
