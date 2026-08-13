@@ -127,6 +127,7 @@ class GmailNotifier:
         self.recipient_emails   = recipient_emails
         self.enabled            = enabled
         self._last_sr_alert: Dict[str, str] = {}
+        self._last_box_alert: Dict[str, str] = {}
 
     def _send_email(self, subject: str, body: str) -> bool:
         if not self.enabled:
@@ -214,10 +215,11 @@ SuperTrend : Monitored post-entry"""
             body += f"\nBreakout Lvl: {smart_fmt(signal['breakout_level'])}"
         if "level_strength" in signal:
             body += f"\nLevel Strength: {signal['level_strength']}x"
-        if "reversal_candle_close" in signal:
-            body += f"\nReversal Close: {smart_fmt(signal['reversal_candle_close'])}"
-        if "confirmation_close" in signal:
-            body += f"\nConfirm Close: {smart_fmt(signal['confirmation_close'])}"
+        if "support_price" in signal and "resistance_price" in signal:
+            body += f"\nBox Support : {smart_fmt(signal['support_price'])}"
+            body += f"\nBox Resistance: {smart_fmt(signal['resistance_price'])}"
+            body += f"\nBox Height  : {smart_fmt(signal.get('box_height', 0))}"
+            body += f"\nBreak Type  : {signal.get('break_type', 'UNKNOWN')}"
         
         return self._send_email(subject, body)
 
@@ -423,7 +425,7 @@ RSI FILTERS
 SHORT RSI      : > 55
 LONG RSI       : < 40
 RSI LONG BLOCK : < 24 (extreme oversold)
-NO RSI         : Range Break, Vol Expansion, S/R Breakout, S/R Reversal
+NO RSI         : Range Break, Vol Expansion, S/R Box
 
 STRATEGY PARAMETERS
 ─────────────────────────────
@@ -442,30 +444,45 @@ Range Break    : Rolling 7-candle range
 S/R Detection  : 100 candles, merge within 0.5%
 S/R Strength   : Minimum Strength 1 (★ or higher)
 S/R Max Age    : 100 candles base (extends based on strength)
+S/R Box Alerts : Email sent when new box forms
 
-S/R BREAKOUT STRATEGY
+S/R BOX STRATEGY (NO RSI FILTER)
 ─────────────────────────────
-Breakout       : Price closes beyond S/R level
-Confirmation   : NEXT candle closes beyond break candle close
-Entry          : On confirmation candle close
+BOX SELECTION: Uses nearest valid Support below price + nearest valid Resistance above price
+MULTIPLE BOXES: All valid Support-Resistance pairs are checked
 
-S/R REVERSAL STRATEGY
-─────────────────────────────
-SHORT (Resistance Reversal):
-  1. Price moves above merged Resistance level
-  2. False breakout candle closes back below Resistance
-  3. Next candle must be Bearish
-  4. Bearish candle closes below false breakout candle close
-  5. Enter SHORT at Bearish candle close
-  6. Stop Loss = False breakout candle High
+BULLISH BREAKOUT (BUY):
+  1. Candle 1 (CLOSED) closes ABOVE resistance (box top)
+  2. Candle 2 (CLOSED) closes ABOVE Candle 1's close
+  3. Enter LONG at Candle 2 close
+  4. Stop Loss = pattern_low (min of Candle 2 low and Candle 1 low)
 
-LONG (Support Reversal):
-  1. Price moves below merged Support level
-  2. False breakout candle closes back above Support
-  3. Next candle must be Bullish
-  4. Bullish candle closes above false breakout candle close
-  5. Enter LONG at Bullish candle close
-  6. Stop Loss = False breakout candle Low
+BEARISH BREAKOUT (SELL):
+  1. Candle 1 (CLOSED) closes BELOW support (box bottom)
+  2. Candle 2 (CLOSED) closes BELOW Candle 1's close
+  3. Enter SHORT at Candle 2 close
+  4. Stop Loss = pattern_high (max of Candle 2 high and Candle 1 high)
+
+FALSE RESISTANCE BREAKOUT → SELL:
+  1. Candle 1 (CLOSED) high goes ABOVE resistance
+  2. Candle 1 (CLOSED) closes BELOW resistance (back inside box)
+  3. Candle 1 close > support (stays inside box)
+  4. Candle 2 (CLOSED) closes BELOW Candle 1's close
+  5. Enter SHORT at Candle 2 close
+  6. Stop Loss = pattern_high (max of Candle 1 high and Resistance)
+
+FALSE SUPPORT BREAKOUT → BUY:
+  1. Candle 1 (CLOSED) low goes BELOW support
+  2. Candle 1 (CLOSED) closes ABOVE support (back inside box)
+  3. Candle 1 close < resistance (stays inside box)
+  4. Candle 2 (CLOSED) closes ABOVE Candle 1's close
+  5. Enter LONG at Candle 2 close
+  6. Stop Loss = pattern_low (min of Candle 1 low and Support)
+
+• Uses CLOSED candles only for confirmation
+• Works with multiple detected S/R levels/boxes
+• NO RSI FILTER anywhere in this strategy
+• Email alerts when new S/R boxes are formed
 
 MONITORED SYMBOLS ({len(symbols)})
 ─────────────────────────────
@@ -473,99 +490,113 @@ MONITORED SYMBOLS ({len(symbols)})
         
         return self._send_email(subject, body)
 
-    def send_sr_level_event(self, symbol: str, event_type: str, level_data: dict, 
-                            all_supports: List[dict], all_resistances: List[dict]) -> bool:
+    def send_sr_box_alert(self, symbol: str, box_data: dict, 
+                          all_supports: List[dict], all_resistances: List[dict]) -> bool:
+        """
+        Send email alert when a new S/R box is formed.
+        """
         if not self.enabled:
             return False
         
-        event_key = f"{symbol}_{event_type}_{level_data.get('price', 0):.10f}"
-        if self._last_sr_alert.get(event_key) == event_type:
+        support_price = box_data.get("support_price", 0)
+        resistance_price = box_data.get("resistance_price", 0)
+        support_strength = box_data.get("support_strength", 1)
+        resistance_strength = box_data.get("resistance_strength", 1)
+        box_height = box_data.get("box_height", 0)
+        box_center = (support_price + resistance_price) / 2
+        box_range_pct = (box_height / box_center) * 100
+        
+        # Create unique key for this box to avoid duplicate alerts
+        box_key = f"{symbol}_{support_price:.10f}_{resistance_price:.10f}"
+        if self._last_box_alert.get(box_key) == box_key:
             return False
         
-        self._last_sr_alert[event_key] = event_type
+        self._last_box_alert[box_key] = box_key
         
-        if len(self._last_sr_alert) > 100:
-            keys = list(self._last_sr_alert.keys())
+        # Clean up old alerts
+        if len(self._last_box_alert) > 100:
+            keys = list(self._last_box_alert.keys())
             for k in keys[:-100]:
-                del self._last_sr_alert[k]
+                del self._last_box_alert[k]
         
-        if event_type == "NEW":
-            event_emoji = "🆕"
-            event_desc = "NEW SUPPORT/RESISTANCE LEVEL DETECTED"
-        elif event_type == "EXPIRED":
-            event_emoji = "⏰"
-            event_desc = "SUPPORT/RESISTANCE LEVEL EXPIRED"
-        else:
-            return False
+        support_stars = "★" * support_strength
+        resistance_stars = "★" * resistance_strength
         
-        level_type = "SUPPORT" if "SUPPORT" in str(level_data.get("type", "")) else "RESISTANCE"
-        price = level_data.get("price", 0)
-        strength = level_data.get("strength", 1)
-        touches = level_data.get("touches", 0)
-        age = level_data.get("age", 0)
-        stars = "★" * strength
+        subject = f"📦 NEW S/R BOX DETECTED - {symbol} [{smart_fmt(support_price)} - {smart_fmt(resistance_price)}]"
         
-        subject = f"[S/R-ALERT] {event_emoji} {symbol} - {level_type} {smart_fmt(price)} - {event_type}"
-        
-        def format_level_list(levels: List[dict], level_type_str: str) -> str:
+        # Format current levels
+        def format_level_list(levels: List[dict], level_type: str) -> str:
             if not levels:
                 return "  (none)"
             sorted_levels = sorted(levels, key=lambda x: x.get("price", 0))
             lines = []
-            for lv in sorted_levels:
+            for lv in sorted_levels[-10:]:  # Show last 10 levels
                 lv_price = lv.get("price", 0)
                 lv_strength = lv.get("strength", 1)
                 lv_touches = lv.get("touches", 0)
                 lv_age = lv.get("age", 0)
                 lv_stars = "★" * lv_strength
-                lines.append(f"  • {smart_fmt(lv_price):>15}  {lv_stars:>5}  Touches: {lv_touches:>3}  Age: {lv_age:>3}")
+                marker = "→" if (level_type == "SUPPORT" and abs(lv_price - support_price) < 0.001) or \
+                              (level_type == "RESISTANCE" and abs(lv_price - resistance_price) < 0.001) else " "
+                lines.append(f"  {marker} {smart_fmt(lv_price):>15}  {lv_stars:>5}  Touches: {lv_touches:>3}  Age: {lv_age:>3}")
             return "\n".join(lines)
         
-        supports_display = all_supports[-50:] if len(all_supports) > 50 else all_supports
-        resistances_display = all_resistances[-50:] if len(all_resistances) > 50 else all_resistances
+        support_lines = format_level_list(all_supports[-20:], "SUPPORT")
+        resistance_lines = format_level_list(all_resistances[-20:], "RESISTANCE")
         
-        support_lines = format_level_list(supports_display, "SUPPORT")
-        resistance_lines = format_level_list(resistances_display, "RESISTANCE")
-        
-        total_supports = len(all_supports)
-        total_resistances = len(all_resistances)
-        truncated_s = " (showing last 50)" if len(all_supports) > 50 else ""
-        truncated_r = " (showing last 50)" if len(all_resistances) > 50 else ""
-        
-        body = f"""S/R LEVEL EVENT
+        body = f"""📦 NEW SUPPORT/RESISTANCE BOX DETECTED
 ─────────────────────────────
-Event       : {event_desc}
 Symbol      : {symbol}
 Time        : {datetime.now(timezone.utc).isoformat()}
 
-AFFECTED LEVEL
+BOX DETAILS
 ─────────────────────────────
-Type        : {level_type}
-Price       : {smart_fmt(price)}
-Strength    : {stars} ({strength})
-Touches     : {touches}
-Age         : {age} candles"""
-        
-        if event_type == "EXPIRED":
-            body += f"""
-Reason      : Level aged out (max age reached)"""
-        
-        body += f"""
+Support     : {smart_fmt(support_price)} {support_stars} ({support_strength}x)
+Resistance  : {smart_fmt(resistance_price)} {resistance_stars} ({resistance_strength}x)
+Box Height  : {smart_fmt(box_height)}
+Box Range   : {box_range_pct:.2f}%
+Box Center  : {smart_fmt(box_center)}
 
-CURRENT SUPPORT LEVELS{truncated_s} ({total_supports} total)
+STRATEGY SIGNALS AVAILABLE
+─────────────────────────────
+📈 BULLISH BREAKOUT (BUY):
+   Candle 1 closes ABOVE {smart_fmt(resistance_price)}
+   Candle 2 closes ABOVE Candle 1's close
+   → Enter LONG
+
+📉 BEARISH BREAKOUT (SELL):
+   Candle 1 closes BELOW {smart_fmt(support_price)}
+   Candle 2 closes BELOW Candle 1's close
+   → Enter SHORT
+
+🔄 FALSE RESISTANCE BREAKOUT → SELL:
+   High > {smart_fmt(resistance_price)}
+   Close < {smart_fmt(resistance_price)} (back inside)
+   Close > {smart_fmt(support_price)} (inside box)
+   Candle 2 closes BELOW Candle 1's close
+   → Enter SHORT
+
+🔄 FALSE SUPPORT BREAKOUT → BUY:
+   Low < {smart_fmt(support_price)}
+   Close > {smart_fmt(support_price)} (back inside)
+   Close < {smart_fmt(resistance_price)} (inside box)
+   Candle 2 closes ABOVE Candle 1's close
+   → Enter LONG
+
+CURRENT SUPPORT LEVELS (last 20)
 ─────────────────────────────
 {support_lines}
 
-CURRENT RESISTANCE LEVELS{truncated_r} ({total_resistances} total)
+CURRENT RESISTANCE LEVELS (last 20)
 ─────────────────────────────
 {resistance_lines}
 
-LEGEND
+BOX LEGEND
 ─────────────────────────────
-★ = Strength (more ★ = stronger level)
-Touches = Number of times price has touched this level
-Age = Candles since level was created
-Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
+★ = Level strength (more ★ = stronger)
+→ = Level used in this box
+Touches = Times price has touched this level
+Age = Candles since level was created"""
         
         return self._send_email(subject, body)
 
@@ -853,6 +884,7 @@ SR_MIN_LEVEL_AGE = 0  # No aging requirement - use immediately
 SR_MAX_LEVEL_AGE = 100  # Max age in candles
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
+SR_BOX_TOLERANCE = 0.01  # 1% tolerance for box detection
 
 # ── SuperTrend parameters ──
 ST1_LENGTH = 14
@@ -1374,123 +1406,6 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     return True, current_copy, "VOL_EXPANSION_SHORT"
 
 
-def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    # candles[-1] = current forming candle
-    # candles[-2] = confirmation candle (last closed)
-    # candles[-3] = break candle (closed)
-    if len(candles) < 4:
-        return False, None, ""
-    
-    confirm_candle = candles[-2]  # Confirmation candle (last closed)
-    break_candle = candles[-3]    # Break candle
-    
-    # Get ALL support levels without 10% price restriction
-    with sr_manager._lock:
-        valid_supports = [l for l in sr_manager.support_levels 
-                         if l["strength"] >= sr_manager.min_strength]
-    
-    if not valid_supports:
-        return False, None, ""
-    
-    # Sort supports by price (highest first - nearest to current price)
-    valid_supports_sorted = sorted(valid_supports, key=lambda x: x["price"], reverse=True)
-    
-    current_price = candles[-1]["close"]  # Current forming candle
-    
-    for level_dict in valid_supports_sorted:
-        support = level_dict["price"]
-        
-        # Allow up to 50% deviation to catch large breakdowns
-        if abs(support - current_price) > current_price * 0.50:
-            continue
-        
-        # Break candle must CLOSE below support
-        if break_candle["close"] >= support:
-            continue
-        
-        # Confirmation candle must be bearish
-        if not is_bearish(confirm_candle):
-            continue
-        
-        # Confirmation candle must CLOSE below break candle close
-        if confirm_candle["close"] >= break_candle["close"]:
-            continue
-        
-        signal_candle = confirm_candle.copy()
-        signal_candle["pattern_high"] = confirm_candle["high"]
-        signal_candle["breakout_level"] = support
-        signal_candle["level_strength"] = level_dict["strength"]
-        signal_candle["level_touches"] = level_dict["touches"]
-        signal_candle["break_candle_close"] = break_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "SUPPORT_BREAKDOWN_SHORT", 
-             f"SHORT: Support {smart_fmt(support)} broken (break close {smart_fmt(break_candle['close'])}) "
-             f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} < break close "
-             f"(Strength: {stars}, {level_dict['touches']} touches)")
-        
-        return True, signal_candle, "SUPPORT_BREAKDOWN_SHORT"
-    
-    return False, None, ""
-
-
-def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    # candles[-1] = current forming candle
-    # candles[-2] = confirmation candle (last closed)
-    # candles[-3] = false breakout candle (closed)
-    if len(candles) < 4:
-        return False, None, ""
-    
-    false_breakout_candle = candles[-3]  # False breakout candle
-    confirm_candle = candles[-2]         # Confirmation candle (last closed)
-    
-    if not is_bearish(false_breakout_candle):
-        return False, None, ""
-    
-    resistances, _ = sr_manager.get_levels_near_price(false_breakout_candle["high"], tolerance=0.02)
-    
-    if not resistances:
-        return False, None, ""
-    
-    for level_dict in resistances:
-        resistance = level_dict["price"]
-        
-        if false_breakout_candle["high"] <= resistance:
-            continue
-        
-        if false_breakout_candle["close"] >= resistance:
-            continue
-        
-        if not is_bearish(confirm_candle):
-            continue
-        
-        if confirm_candle["close"] >= false_breakout_candle["close"]:
-            continue
-        
-        signal_candle = confirm_candle.copy()
-        signal_candle["pattern_high"] = false_breakout_candle["high"]
-        signal_candle["breakout_level"] = resistance
-        signal_candle["level_strength"] = level_dict["strength"]
-        signal_candle["level_touches"] = level_dict["touches"]
-        signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
-        signal_candle["false_breakout_high"] = false_breakout_candle["high"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT", 
-             f"SHORT: Resistance false breakout reversal at {smart_fmt(resistance)} "
-             f"(High {smart_fmt(false_breakout_candle['high'])} > Resistance > Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout close "
-             f"(Strength: {stars}, {level_dict['touches']} touches)")
-        
-        return True, signal_candle, "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-    
-    return False, None, ""
-
-
 # ================================================================
 #  13b. LONG STRATEGIES (FIXED: USE CLOSED CANDLES ONLY)
 # ================================================================
@@ -1643,123 +1558,6 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
          f"Break above 21-candle high {smart_fmt(highest_high)} | "
          f"Close {smart_fmt(current['close'])} > high | NO WICK CONDITION")
     return True, current_copy, "VOL_EXPANSION_LONG"
-
-
-def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    # candles[-1] = current forming candle
-    # candles[-2] = confirmation candle (last closed)
-    # candles[-3] = break candle (closed)
-    if len(candles) < 4:
-        return False, None, ""
-    
-    confirm_candle = candles[-2]  # Confirmation candle (last closed)
-    break_candle = candles[-3]    # Break candle
-    
-    # Get ALL resistance levels without 10% price restriction
-    with sr_manager._lock:
-        valid_resistances = [l for l in sr_manager.resistance_levels 
-                            if l["strength"] >= sr_manager.min_strength]
-    
-    if not valid_resistances:
-        return False, None, ""
-    
-    # Sort resistances by price (lowest first - nearest to current price)
-    valid_resistances_sorted = sorted(valid_resistances, key=lambda x: x["price"])
-    
-    current_price = candles[-1]["close"]  # Current forming candle
-    
-    for level_dict in valid_resistances_sorted:
-        resistance = level_dict["price"]
-        
-        # Allow up to 50% deviation to catch large breakdowns
-        if abs(resistance - current_price) > current_price * 0.50:
-            continue
-        
-        # Break candle must CLOSE above resistance
-        if break_candle["close"] <= resistance:
-            continue
-        
-        # Confirmation candle must be bullish
-        if not is_bullish(confirm_candle):
-            continue
-        
-        # Confirmation candle must CLOSE above break candle close
-        if confirm_candle["close"] <= break_candle["close"]:
-            continue
-        
-        signal_candle = confirm_candle.copy()
-        signal_candle["pattern_low"] = confirm_candle["low"]
-        signal_candle["breakout_level"] = resistance
-        signal_candle["level_strength"] = level_dict["strength"]
-        signal_candle["level_touches"] = level_dict["touches"]
-        signal_candle["break_candle_close"] = break_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "RESISTANCE_BREAKOUT_LONG", 
-             f"LONG: Resistance {smart_fmt(resistance)} broken (break close {smart_fmt(break_candle['close'])}) "
-             f"CONFIRMED by next candle close {smart_fmt(confirm_candle['close'])} > break close "
-             f"(Strength: {stars}, {level_dict['touches']} touches)")
-        
-        return True, signal_candle, "RESISTANCE_BREAKOUT_LONG"
-    
-    return False, None, ""
-
-
-def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    # candles[-1] = current forming candle
-    # candles[-2] = confirmation candle (last closed)
-    # candles[-3] = false breakout candle (closed)
-    if len(candles) < 4:
-        return False, None, ""
-    
-    false_breakout_candle = candles[-3]  # False breakout candle
-    confirm_candle = candles[-2]         # Confirmation candle (last closed)
-    
-    if not is_bullish(false_breakout_candle):
-        return False, None, ""
-    
-    _, supports = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
-    
-    if not supports:
-        return False, None, ""
-    
-    for level_dict in supports:
-        support = level_dict["price"]
-        
-        if false_breakout_candle["low"] >= support:
-            continue
-        
-        if false_breakout_candle["close"] <= support:
-            continue
-        
-        if not is_bullish(confirm_candle):
-            continue
-        
-        if confirm_candle["close"] <= false_breakout_candle["close"]:
-            continue
-        
-        signal_candle = confirm_candle.copy()
-        signal_candle["pattern_low"] = false_breakout_candle["low"]
-        signal_candle["breakout_level"] = support
-        signal_candle["level_strength"] = level_dict["strength"]
-        signal_candle["level_touches"] = level_dict["touches"]
-        signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
-        signal_candle["false_breakout_low"] = false_breakout_candle["low"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG", 
-             f"LONG: Support false breakout reversal at {smart_fmt(support)} "
-             f"(Low {smart_fmt(false_breakout_candle['low'])} < Support < Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout close "
-             f"(Strength: {stars}, {level_dict['touches']} touches)")
-        
-        return True, signal_candle, "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-    
-    return False, None, ""
 
 
 # ================================================================
@@ -1921,7 +1719,232 @@ def check_long_signal_bullish_harami(candles: List[dict], harami_tolerance: floa
 
 
 # ================================================================
-#  13e. SIGNAL CHECKERS (UNCHANGED)
+#  13e. S/R BOX STRATEGY (FIXED - USES CLOSED CANDLE CONTEXT)
+# ================================================================
+
+def check_sr_box_signal(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str, str]:
+    """
+    S/R Box Strategy - NO RSI FILTER
+    
+    Returns: (triggered, signal_candle, strategy_name, direction)
+    Direction is either "LONG" or "SHORT"
+    
+    BOX SELECTION: Uses nearest valid Support below price + nearest valid Resistance above price
+    MULTIPLE BOXES: All valid Support-Resistance pairs are checked
+    
+    Uses CLOSED candles only for confirmation.
+    
+    Bullish Breakout (LONG):
+      - Candle 1 (closed) closes ABOVE resistance (box top)
+      - Candle 2 (closed) closes ABOVE Candle 1's close
+      - Entry at Candle 2 close
+    
+    Bearish Breakout (SHORT):
+      - Candle 1 (closed) closes BELOW support (box bottom)
+      - Candle 2 (closed) closes BELOW Candle 1's close
+      - Entry at Candle 2 close
+    
+    False Resistance Breakout → SHORT:
+      - Candle 1 (closed) high goes ABOVE resistance
+      - Candle 1 (closed) closes BELOW resistance (back inside box)
+      - Candle 1 close > support (stays inside box)
+      - Candle 2 (closed) closes BELOW Candle 1's close
+      - Entry at Candle 2 close
+    
+    False Support Breakout → LONG:
+      - Candle 1 (closed) low goes BELOW support
+      - Candle 1 (closed) closes ABOVE support (back inside box)
+      - Candle 1 close < resistance (stays inside box)
+      - Candle 2 (closed) closes ABOVE Candle 1's close
+      - Entry at Candle 2 close
+    """
+    # candles[-1] = current forming candle (NOT USED for box selection)
+    # candles[-2] = candle 2 (confirmation candle - last closed)
+    # candles[-3] = candle 1 (break/false breakout candle - closed)
+    if len(candles) < 4:
+        return False, None, "", ""
+    
+    candle_1 = candles[-3]  # Break/false breakout candle (CLOSED)
+    candle_2 = candles[-2]  # Confirmation candle (CLOSED - last closed)
+    
+    # Get ALL support and resistance levels
+    with sr_manager._lock:
+        valid_supports = [l for l in sr_manager.support_levels 
+                         if l["strength"] >= sr_manager.min_strength]
+        valid_resistances = [l for l in sr_manager.resistance_levels 
+                            if l["strength"] >= sr_manager.min_strength]
+    
+    if not valid_supports and not valid_resistances:
+        return False, None, "", ""
+    
+    # Use Candle 1 close as the reference price for box selection
+    # This ensures we use closed-candle context, not the forming candle
+    reference_price = candle_1["close"]
+    
+    # Find nearest support below reference price and nearest resistance above
+    supports_below = [s for s in valid_supports if s["price"] < reference_price]
+    resistances_above = [r for r in valid_resistances if r["price"] > reference_price]
+    
+    # Sort by distance from reference price
+    supports_below_sorted = sorted(supports_below, key=lambda x: abs(x["price"] - reference_price))
+    resistances_above_sorted = sorted(resistances_above, key=lambda x: abs(x["price"] - reference_price))
+    
+    # Check each support-resistance pair as a potential box
+    # Start with the closest pairs first
+    for support_level in supports_below_sorted[:5]:  # Limit to 5 closest supports
+        support_price = support_level["price"]
+        
+        # Skip if support is too far from reference price
+        if abs(support_price - reference_price) > reference_price * 0.50:
+            continue
+        
+        for resistance_level in resistances_above_sorted[:5]:  # Limit to 5 closest resistances
+            resistance_price = resistance_level["price"]
+            
+            # Skip if resistance is below support (invalid box)
+            if resistance_price <= support_price:
+                continue
+            
+            # Skip if resistance is too far from reference price
+            if abs(resistance_price - reference_price) > reference_price * 0.50:
+                continue
+            
+            # Skip if box is too narrow (less than 0.1% of price)
+            box_height = resistance_price - support_price
+            if box_height < reference_price * 0.001:
+                continue
+            
+            # --- Check for BULLISH BREAKOUT (LONG) ---
+            # Candle 1 (closed) closes ABOVE resistance
+            if candle_1["close"] > resistance_price:
+                # Candle 2 (closed) closes ABOVE Candle 1's close
+                if candle_2["close"] > candle_1["close"]:
+                    signal_candle = candle_2.copy()
+                    signal_candle["pattern_low"] = min(candle_2["low"], candle_1["low"])
+                    signal_candle["breakout_level"] = resistance_price
+                    signal_candle["support_price"] = support_price
+                    signal_candle["resistance_price"] = resistance_price
+                    signal_candle["level_strength"] = resistance_level["strength"]
+                    signal_candle["support_strength"] = support_level["strength"]
+                    signal_candle["resistance_strength"] = resistance_level["strength"]
+                    signal_candle["box_height"] = box_height
+                    signal_candle["break_type"] = "BULLISH_BREAKOUT"
+                    signal_candle["candle_1_close"] = candle_1["close"]
+                    signal_candle["candle_2_close"] = candle_2["close"]
+                    
+                    stars = "★" * resistance_level["strength"]
+                    stars_s = "★" * support_level["strength"]
+                    
+                    _log("info", "SR_BOX_BULLISH_BREAKOUT", 
+                         f"LONG: Resistance {smart_fmt(resistance_price)} broken (close {smart_fmt(candle_1['close'])}) "
+                         f"CONFIRMED by next candle close {smart_fmt(candle_2['close'])} > break close "
+                         f"(Box: {smart_fmt(support_price)} - {smart_fmt(resistance_price)}, "
+                         f"R Strength: {stars}, S Strength: {stars_s})")
+                    
+                    return True, signal_candle, "SR_BOX_BULLISH_BREAKOUT", "LONG"
+            
+            # --- Check for BEARISH BREAKOUT (SHORT) ---
+            # Candle 1 (closed) closes BELOW support
+            if candle_1["close"] < support_price:
+                # Candle 2 (closed) closes BELOW Candle 1's close
+                if candle_2["close"] < candle_1["close"]:
+                    signal_candle = candle_2.copy()
+                    signal_candle["pattern_high"] = max(candle_2["high"], candle_1["high"])
+                    signal_candle["breakout_level"] = support_price
+                    signal_candle["support_price"] = support_price
+                    signal_candle["resistance_price"] = resistance_price
+                    signal_candle["level_strength"] = support_level["strength"]
+                    signal_candle["support_strength"] = support_level["strength"]
+                    signal_candle["resistance_strength"] = resistance_level["strength"]
+                    signal_candle["box_height"] = box_height
+                    signal_candle["break_type"] = "BEARISH_BREAKOUT"
+                    signal_candle["candle_1_close"] = candle_1["close"]
+                    signal_candle["candle_2_close"] = candle_2["close"]
+                    
+                    stars = "★" * support_level["strength"]
+                    stars_r = "★" * resistance_level["strength"]
+                    
+                    _log("info", "SR_BOX_BEARISH_BREAKOUT", 
+                         f"SHORT: Support {smart_fmt(support_price)} broken (close {smart_fmt(candle_1['close'])}) "
+                         f"CONFIRMED by next candle close {smart_fmt(candle_2['close'])} < break close "
+                         f"(Box: {smart_fmt(support_price)} - {smart_fmt(resistance_price)}, "
+                         f"S Strength: {stars}, R Strength: {stars_r})")
+                    
+                    return True, signal_candle, "SR_BOX_BEARISH_BREAKOUT", "SHORT"
+            
+            # --- Check for FALSE RESISTANCE BREAKOUT → SHORT ---
+            # Candle 1 (closed): high > resistance, close < resistance, close > support
+            # Candle 2 (closed): close < Candle 1 close
+            if (candle_1["high"] > resistance_price and 
+                candle_1["close"] < resistance_price and 
+                candle_1["close"] > support_price):
+                # Candle 2 (closed) closes BELOW Candle 1's close
+                if candle_2["close"] < candle_1["close"]:
+                    signal_candle = candle_2.copy()
+                    signal_candle["pattern_high"] = max(candle_1["high"], resistance_price)
+                    signal_candle["breakout_level"] = resistance_price
+                    signal_candle["support_price"] = support_price
+                    signal_candle["resistance_price"] = resistance_price
+                    signal_candle["level_strength"] = resistance_level["strength"]
+                    signal_candle["support_strength"] = support_level["strength"]
+                    signal_candle["resistance_strength"] = resistance_level["strength"]
+                    signal_candle["box_height"] = box_height
+                    signal_candle["break_type"] = "FALSE_RESISTANCE_BREAKOUT"
+                    signal_candle["candle_1_close"] = candle_1["close"]
+                    signal_candle["candle_2_close"] = candle_2["close"]
+                    signal_candle["candle_1_high"] = candle_1["high"]
+                    
+                    stars = "★" * resistance_level["strength"]
+                    stars_s = "★" * support_level["strength"]
+                    
+                    _log("info", "SR_BOX_FALSE_RESISTANCE_BREAKOUT", 
+                         f"SHORT: False resistance breakout at {smart_fmt(resistance_price)} "
+                         f"(High {smart_fmt(candle_1['high'])} > Resistance > Close {smart_fmt(candle_1['close'])} > Support)"
+                         f"CONFIRMED by bearish candle close {smart_fmt(candle_2['close'])} < break close "
+                         f"(Box: {smart_fmt(support_price)} - {smart_fmt(resistance_price)}, "
+                         f"R Strength: {stars}, S Strength: {stars_s})")
+                    
+                    return True, signal_candle, "SR_BOX_FALSE_RESISTANCE_BREAKOUT", "SHORT"
+            
+            # --- Check for FALSE SUPPORT BREAKOUT → LONG ---
+            # Candle 1 (closed): low < support, close > support, close < resistance
+            # Candle 2 (closed): close > Candle 1 close
+            if (candle_1["low"] < support_price and 
+                candle_1["close"] > support_price and 
+                candle_1["close"] < resistance_price):
+                # Candle 2 (closed) closes ABOVE Candle 1's close
+                if candle_2["close"] > candle_1["close"]:
+                    signal_candle = candle_2.copy()
+                    signal_candle["pattern_low"] = min(candle_1["low"], support_price)
+                    signal_candle["breakout_level"] = support_price
+                    signal_candle["support_price"] = support_price
+                    signal_candle["resistance_price"] = resistance_price
+                    signal_candle["level_strength"] = support_level["strength"]
+                    signal_candle["support_strength"] = support_level["strength"]
+                    signal_candle["resistance_strength"] = resistance_level["strength"]
+                    signal_candle["box_height"] = box_height
+                    signal_candle["break_type"] = "FALSE_SUPPORT_BREAKOUT"
+                    signal_candle["candle_1_close"] = candle_1["close"]
+                    signal_candle["candle_2_close"] = candle_2["close"]
+                    signal_candle["candle_1_low"] = candle_1["low"]
+                    
+                    stars = "★" * support_level["strength"]
+                    stars_r = "★" * resistance_level["strength"]
+                    
+                    _log("info", "SR_BOX_FALSE_SUPPORT_BREAKOUT", 
+                         f"LONG: False support breakout at {smart_fmt(support_price)} "
+                         f"(Low {smart_fmt(candle_1['low'])} < Support < Close {smart_fmt(candle_1['close'])} < Resistance)"
+                         f"CONFIRMED by bullish candle close {smart_fmt(candle_2['close'])} > break close "
+                         f"(Box: {smart_fmt(support_price)} - {smart_fmt(resistance_price)}, "
+                         f"S Strength: {stars}, R Strength: {stars_r})")
+                    
+                    return True, signal_candle, "SR_BOX_FALSE_SUPPORT_BREAKOUT", "LONG"
+    
+    return False, None, "", ""
+
+
+# ================================================================
+#  13f. SIGNAL CHECKERS (UPDATED - S/R BOX RETURNS DIRECTION)
 # ================================================================
 
 def check_short_signal(
@@ -1973,15 +1996,12 @@ def check_short_signal_no_rsi(
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    triggered, signal_candle, strategy = check_short_signal_support_resistance_manager(candles, sr_manager)
-    if triggered:
+    # S/R Box Strategy - checks both directions internally
+    triggered, signal_candle, strategy, direction = check_sr_box_signal(candles, sr_manager)
+    if triggered and direction == "SHORT":
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
-    
-    triggered, signal_candle, strategy = check_short_signal_resistance_false_breakout(candles, sr_manager)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
-        return True, signal_candle, strategy, None
+    # If it triggered but direction is LONG, it will be caught by the long checker
     
     return False, None, "", None
 
@@ -2039,21 +2059,18 @@ def check_long_signal_no_rsi(
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
     
-    triggered, signal_candle, strategy = check_long_signal_support_resistance_manager(candles, sr_manager)
-    if triggered:
+    # S/R Box Strategy - checks both directions internally
+    triggered, signal_candle, strategy, direction = check_sr_box_signal(candles, sr_manager)
+    if triggered and direction == "LONG":
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
         return True, signal_candle, strategy, None
-    
-    triggered, signal_candle, strategy = check_long_signal_support_false_breakout(candles, sr_manager)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
-        return True, signal_candle, strategy, None
+    # If it triggered but direction is SHORT, it will be caught by the short checker
     
     return False, None, "", None
 
 
 # ================================================================
-#  14. SUPPORT/RESISTANCE LEVEL MANAGER (UNCHANGED)
+#  14. SUPPORT/RESISTANCE LEVEL MANAGER 
 # ================================================================
 
 class SRLevelManager:
@@ -2077,6 +2094,7 @@ class SRLevelManager:
         self.pending_swing_lows: List[float] = []
         self.last_processed_index = 0
         self._lock = threading.Lock()
+        self._sent_boxes: set = set()  # Track sent box alerts
         
     def update_levels(self, candles: List[dict]) -> None:
         with self._lock:
@@ -2094,10 +2112,77 @@ class SRLevelManager:
             new_levels_created = self._process_pending_swings()
             self._update_level_strength(candles)
             expired_levels = self._age_levels()
-            self._send_level_notifications(new_levels_created, expired_levels)
+            
+            # Check for new boxes after levels are updated
+            self._check_and_send_box_alerts()
             
             self.last_processed_index = current_idx
             self._log_levels()
+    
+    def _check_and_send_box_alerts(self) -> None:
+        """
+        Check for new S/R boxes and send email alerts.
+        """
+        if not self.notifier:
+            return
+        
+        # Get valid levels
+        valid_supports = [l for l in self.support_levels 
+                         if l["strength"] >= self.min_strength]
+        valid_resistances = [l for l in self.resistance_levels 
+                            if l["strength"] >= self.min_strength]
+        
+        if not valid_supports or not valid_resistances:
+            return
+        
+        # Sort for pairing
+        supports_sorted = sorted(valid_supports, key=lambda x: x["price"], reverse=True)
+        resistances_sorted = sorted(valid_resistances, key=lambda x: x["price"])
+        
+        # Check each support-resistance pair for new boxes
+        for support_level in supports_sorted:
+            support_price = support_level["price"]
+            
+            for resistance_level in resistances_sorted:
+                resistance_price = resistance_level["price"]
+                
+                # Skip invalid boxes
+                if resistance_price <= support_price:
+                    continue
+                
+                box_height = resistance_price - support_price
+                # Skip if box is too narrow
+                if box_height < support_price * 0.001:
+                    continue
+                
+                # Create box key
+                box_key = f"{self.symbol}_{support_price:.10f}_{resistance_price:.10f}"
+                
+                # Skip if already sent
+                if box_key in self._sent_boxes:
+                    continue
+                
+                # Send box alert
+                box_data = {
+                    "support_price": support_price,
+                    "resistance_price": resistance_price,
+                    "support_strength": support_level["strength"],
+                    "resistance_strength": resistance_level["strength"],
+                    "box_height": box_height,
+                }
+                
+                self.notifier.send_sr_box_alert(
+                    symbol=self.symbol,
+                    box_data=box_data,
+                    all_supports=self.support_levels,
+                    all_resistances=self.resistance_levels
+                )
+                
+                self._sent_boxes.add(box_key)
+                
+                # Limit stored box keys
+                if len(self._sent_boxes) > 1000:
+                    self._sent_boxes = set(list(self._sent_boxes)[-500:])
     
     def _detect_new_swings(self, candles: List[dict]) -> Tuple[List[float], List[float]]:
         n = len(candles)
@@ -2260,20 +2345,6 @@ class SRLevelManager:
         
         return expired_levels
     
-    def _send_level_notifications(self, new_levels: List[Dict], expired_levels: List[Dict]) -> None:
-        if not self.notifier:
-            return
-        for level in new_levels:
-            self.notifier.send_sr_level_event(
-                symbol=self.symbol, event_type="NEW", level_data=level,
-                all_supports=self.support_levels, all_resistances=self.resistance_levels
-            )
-        for level in expired_levels:
-            self.notifier.send_sr_level_event(
-                symbol=self.symbol, event_type="EXPIRED", level_data=level,
-                all_supports=self.support_levels, all_resistances=self.resistance_levels
-            )
-    
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
         with self._lock:
             price_range = current_price * 0.10
@@ -2319,6 +2390,7 @@ class SRLevelManager:
             self.pending_swing_highs.clear()
             self.pending_swing_lows.clear()
             self.last_processed_index = 0
+            self._sent_boxes.clear()
             _log("info", f"S/R [{self.symbol}]", "Levels reset")
 
 
@@ -2780,7 +2852,7 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  22. TRADING BOT
+#  22. TRADING BOT (UPDATED - S/R BOX DIRECTION FIXED)
 # ================================================================
 
 class TradingBot:
@@ -3249,14 +3321,15 @@ class TradingBot:
                    no_rsi: bool = False) -> None:
         entry = signal_candle["close"]
 
+        # Determine stop loss based on strategy type
         if direction == "SHORT":
-            if strategy_name in ("RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT",):
+            # For S/R Box SHORT strategies, use pattern_high
+            if strategy_name in ("SR_BOX_BEARISH_BREAKOUT", "SR_BOX_FALSE_RESISTANCE_BREAKOUT"):
                 sl = signal_candle.get("pattern_high", signal_candle["high"])
             elif strategy_name == "BEARISH_DOJI":
                 sl = signal_candle.get("pattern_high", signal_candle["high"])
             elif strategy_name in ("STRATEGY_1_SHORT", "RANGE_BREAK_SHORT",
-                                    "VOL_EXPANSION_SHORT", "SUPPORT_BREAKDOWN_SHORT",
-                                    "BEARISH_ENGULFING") and "pattern_high" in signal_candle:
+                                    "VOL_EXPANSION_SHORT", "BEARISH_ENGULFING") and "pattern_high" in signal_candle:
                 sl = signal_candle["pattern_high"]
             elif strategy_name == "BEARISH_HARAMI":
                 store = self.candle_store.get(symbol)
@@ -3268,13 +3341,13 @@ class TradingBot:
                 store = self.candle_store.get(symbol)
                 sl    = list(store)[-2]["high"] if store and len(store) >= 2 else signal_candle["high"]
         else:
-            if strategy_name in ("SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG",):
+            # For S/R Box LONG strategies, use pattern_low
+            if strategy_name in ("SR_BOX_BULLISH_BREAKOUT", "SR_BOX_FALSE_SUPPORT_BREAKOUT"):
                 sl = signal_candle.get("pattern_low", signal_candle["low"])
             elif strategy_name == "BULLISH_DOJI":
                 sl = signal_candle.get("pattern_low", signal_candle["low"])
             elif strategy_name in ("STRATEGY_1_LONG", "RANGE_BREAK_LONG",
-                                    "VOL_EXPANSION_LONG", "RESISTANCE_BREAKOUT_LONG",
-                                    "BULLISH_ENGULFING") and "pattern_low" in signal_candle:
+                                    "VOL_EXPANSION_LONG", "BULLISH_ENGULFING") and "pattern_low" in signal_candle:
                 sl = signal_candle["pattern_low"]
             elif strategy_name == "BULLISH_HARAMI":
                 store = self.candle_store.get(symbol)
@@ -3313,11 +3386,12 @@ class TradingBot:
                 "harami_tolerance": self.harami_tolerance if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI") else None,
                 "breakout_level": signal_candle.get("breakout_level", None),
                 "level_strength": signal_candle.get("level_strength", None),
-                "level_touches": signal_candle.get("level_touches", None),
-                "reversal_candle_close": signal_candle.get("reversal_candle_close", None),
-                "confirmation_close": signal_candle.get("confirmation_close", None),
-                "false_breakout_high": signal_candle.get("false_breakout_high", None),
-                "false_breakout_low": signal_candle.get("false_breakout_low", None),
+                "support_price": signal_candle.get("support_price", None),
+                "resistance_price": signal_candle.get("resistance_price", None),
+                "box_height": signal_candle.get("box_height", None),
+                "break_type": signal_candle.get("break_type", None),
+                "candle_1_close": signal_candle.get("candle_1_close", None),
+                "candle_2_close": signal_candle.get("candle_2_close", None),
             }
             self.signals.append(signal)
 
@@ -3337,8 +3411,11 @@ class TradingBot:
         direction_arrow = "↓ SHORT" if direction == "SHORT" else "↑ LONG"
         
         strategy_category = ""
-        if strategy_name in ("RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"):
-            strategy_category = " [S/R FALSE BREAKOUT REVERSAL]"
+        if strategy_name in ("SR_BOX_BULLISH_BREAKOUT", "SR_BOX_BEARISH_BREAKOUT",
+                             "SR_BOX_FALSE_RESISTANCE_BREAKOUT", "SR_BOX_FALSE_SUPPORT_BREAKOUT"):
+            strategy_category = f" [S/R BOX - NO RSI]"
+            if signal.get("support_price") and signal.get("resistance_price"):
+                strategy_category += f" Box: {smart_fmt(signal['support_price'])} - {smart_fmt(signal['resistance_price'])}"
         elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
             strategy_category = " [ENGULFING PATTERN]"
         elif strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
@@ -3356,10 +3433,14 @@ class TradingBot:
         if signal.get("breakout_level"):
             stars = "★" * (signal.get("level_strength", 0) or 0)
             print(f"           S/R Level   : {smart_fmt(signal['breakout_level'])} {stars}")
-            if signal.get("reversal_candle_close"):
-                print(f"           False Breakout Close: {smart_fmt(signal['reversal_candle_close'])}")
-            if signal.get("confirmation_close"):
-                print(f"           Confirm Close: {smart_fmt(signal['confirmation_close'])}")
+        if signal.get("support_price") and signal.get("resistance_price"):
+            print(f"           Box          : {smart_fmt(signal['support_price'])} - {smart_fmt(signal['resistance_price'])}")
+            if signal.get("box_height"):
+                print(f"           Box Height   : {smart_fmt(signal['box_height'])}")
+        if signal.get("candle_1_close"):
+            print(f"           Candle 1 Cls : {smart_fmt(signal['candle_1_close'])}")
+        if signal.get("candle_2_close"):
+            print(f"           Candle 2 Cls : {smart_fmt(signal['candle_2_close'])}")
         print(f"           Mode        : {signal['mode']}")
         print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
         print()
@@ -3488,14 +3569,24 @@ class TradingBot:
         print("|   NO-RSI STRATEGIES:                                   |")
         print("|   5. RANGE_BREAK_SHORT/LONG                           |")
         print("|   6. VOL_EXPANSION_SHORT/LONG                         |")
-        print("|   7. S/R BREAKOUT (SUPPORT_BREAKDOWN_SHORT /          |")
-        print("|      RESISTANCE_BREAKOUT_LONG)                        |")
-        print("|   8. S/R REVERSAL (RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT /")
-        print("|      SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG)            |")
-        print("|                                                        |")
-        print("|   S/R REVERSAL RULES:                                  |")
-        print("|   SHORT: Price above Resistance → Closes below → Bear Confirmation")
-        print("|   LONG:  Price below Support → Closes above → Bull Confirmation")
+        print("|   7. S/R BOX STRATEGY (FIXED):                        |")
+        print("|      - BULLISH BREAKOUT: C1 > Resistance, C2 > C1   |")
+        print("|        → LONG (pattern_low SL)                       |")
+        print("|      - BEARISH BREAKOUT: C1 < Support, C2 < C1      |")
+        print("|        → SHORT (pattern_high SL)                     |")
+        print("|      - FALSE RESISTANCE BREAKOUT                     |")
+        print("|        C1 high > Resistance, C1 close < Resistance   |")
+        print("|        C1 close > Support, C2 close < C1 close       |")
+        print("|        → SHORT (pattern_high SL)                     |")
+        print("|      - FALSE SUPPORT BREAKOUT                        |")
+        print("|        C1 low < Support, C1 close > Support          |")
+        print("|        C1 close < Resistance, C2 close > C1 close    |")
+        print("|        → LONG (pattern_low SL)                       |")
+        print("|      - NO RSI FILTER                                 |")
+        print("|      - Uses closed candles for box selection         |")
+        print("|      - Pairs nearest Support below + Resistance above|")
+        print("|      - Works with MULTIPLE S/R levels/boxes          |")
+        print("|      - Email alerts when new boxes are formed        |")
         print("|                                                        |")
         print("|   S/R LEVELS: Max Age = 100 candles base              |")
         print("|   S/R STRENGTH EXT: +15 candles per strength level    |")
@@ -3526,7 +3617,7 @@ class TradingBot:
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
-        print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
+        print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Box")
         print(f"  CANDLESTICK PATTERNS (RSI-based):")
         print(f"    • Bearish Engulfing: Bullish → Bearish engulf")
         print(f"    • Bullish Engulfing: Bearish → Bullish engulf")
@@ -3535,14 +3626,19 @@ class TradingBot:
         print(f"  Doji Strategy     : 2 candle breakout + Doji (body ≤ 30%) + Confirmation")
         print(f"  Vol Expansion     : 21-candle range break (NO WICK CONDITIONS)")
         print(f"  Range Break       : Rolling 7-candle range")
+        print(f"  S/R Box Strategy  : Detects boxes from Support + Resistance pairs")
+        print(f"    • Uses CLOSED candles for box selection")
+        print(f"    • Pairs nearest Support below + Resistance above")
+        print(f"    • NO RSI FILTER anywhere")
+        print(f"    • Works with multiple detected S/R levels/boxes")
+        print(f"    • Email alerts when new boxes are formed")
+        print(f"    • Correct direction routing: BUY → LONG, SELL → SHORT")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
         print(f"  S/R Detection     : {SR_LOOKBACK} candles, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
         print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
         print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
         print(f"  S/R Ready         : IMMEDIATELY (no aging requirement)")
-        print(f"  S/R Breakout      : Break + confirmation candle")
-        print(f"  S/R Reversal      : False breakout + confirmation candle")
         print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
@@ -3773,21 +3869,26 @@ def test_gmail():
             new_tp=0.0, st1=64200.0, st2=63800.0, timeframe="1h", mode="PAPER",
         )
         print("  ✅ SuperTrend test email sent!")
-        print("\n  📤 Sending test S/R level notification...")
-        notifier.send_sr_level_event(
+        print("\n  📤 Sending test S/R box notification...")
+        notifier.send_sr_box_alert(
             symbol="BTCUSD_PERP",
-            event_type="NEW",
-            level_data={"price": 64800.0, "strength": 2, "touches": 3, "age": 5, "type": "RESISTANCE"},
+            box_data={
+                "support_price": 63500.0,
+                "resistance_price": 64800.0,
+                "support_strength": 3,
+                "resistance_strength": 2,
+                "box_height": 1300.0,
+            },
             all_supports=[
                 {"price": 62000.0, "strength": 3, "touches": 8, "age": 10},
-                {"price": 63500.0, "strength": 1, "touches": 2, "age": 3},
+                {"price": 63500.0, "strength": 3, "touches": 5, "age": 3},
             ],
             all_resistances=[
                 {"price": 64800.0, "strength": 2, "touches": 3, "age": 5},
                 {"price": 66000.0, "strength": 4, "touches": 12, "age": 20},
             ]
         )
-        print("  ✅ S/R test email sent!")
+        print("  ✅ S/R Box test email sent!")
     else:
         print("  ❌ Failed to send email. Check your App Password and settings.")
 
@@ -3811,10 +3912,24 @@ def main() -> None:
     print("  |   NO-RSI STRATEGIES:                                   |")
     print("  |   • RANGE_BREAK_SHORT/LONG                            |")
     print("  |   • VOL_EXPANSION_SHORT/LONG                          |")
-    print("  |   • S/R BREAKOUT (SUPPORT_BREAKDOWN /                 |")
-    print("  |     RESISTANCE_BREAKOUT)                              |")
-    print("  |   • S/R REVERSAL (RESISTANCE_FALSE_BREAKOUT /        |")
-    print("  |     SUPPORT_FALSE_BREAKOUT)                           |")
+    print("  |   • S/R BOX STRATEGY (FIXED):                        |")
+    print("  |     - BULLISH BREAKOUT: C1 > Resistance, C2 > C1   |")
+    print("  |       → LONG (pattern_low SL)                        |")
+    print("  |     - BEARISH BREAKOUT: C1 < Support, C2 < C1      |")
+    print("  |       → SHORT (pattern_high SL)                      |")
+    print("  |     - FALSE RESISTANCE BREAKOUT                      |")
+    print("  |       C1 high > Resistance, C1 close < Resistance   |")
+    print("  |       C1 close > Support, C2 close < C1 close       |")
+    print("  |       → SHORT (pattern_high SL)                      |")
+    print("  |     - FALSE SUPPORT BREAKOUT                         |")
+    print("  |       C1 low < Support, C1 close > Support          |")
+    print("  |       C1 close < Resistance, C2 close > C1 close    |")
+    print("  |       → LONG (pattern_low SL)                        |")
+    print("  |     - NO RSI FILTER                                  |")
+    print("  |     - Uses closed candles for box selection         |")
+    print("  |     - Pairs nearest Support below + Resistance above|")
+    print("  |     - Works with MULTIPLE S/R levels/boxes          |")
+    print("  |     - Email alerts when new boxes are formed        |")
     print("  |                                                        |")
     print("  |   S/R LEVELS: Max Age = 100 + (Strength * 15)        |")
     print("  |   S/R LEVELS: Ready for trading IMMEDIATELY          |")
@@ -3884,7 +3999,7 @@ def main() -> None:
     print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
     print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
     print(f"  RSI LONG BLOCK    : RSI(14) < 24")
-    print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
+    print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Box")
     print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
     print(f"  S/R Ready         : IMMEDIATELY (no aging required)")
     print(f"  CANDLESTICK PATTERNS (RSI-based):")
@@ -3895,8 +4010,13 @@ def main() -> None:
     print(f"  Doji Strategy     : 2 candle breakout + Doji (body ≤ 30%) + Confirmation")
     print(f"  Vol Expansion     : 21-candle range break (NO WICK CONDITIONS)")
     print(f"  Range Break       : Rolling 7-candle range")
-    print(f"  S/R Breakout      : 100-candle S/R, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
-    print(f"  S/R Reversal      : False breakout + confirmation candle")
+    print(f"  S/R Box Strategy  : Detects boxes from Support + Resistance pairs")
+    print(f"    • Uses CLOSED candles for box selection")
+    print(f"    • Pairs nearest Support below + Resistance above")
+    print(f"    • NO RSI FILTER anywhere")
+    print(f"    • Works with multiple detected S/R levels/boxes")
+    print(f"    • Email alerts when new boxes are formed")
+    print(f"    • Correct direction routing: BUY → LONG, SELL → SHORT")
     print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required)")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported")
     print()
