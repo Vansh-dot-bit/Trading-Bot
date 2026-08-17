@@ -439,7 +439,7 @@ SuperTrend 2   : Length=21, Factor=1.0
 Doji Strategy  : 2 candle breakout + Doji + Confirmation
 Vol Expansion  : 21-candle range break (NO wick conditions)
 Range Break    : Rolling 7-candle range
-S/R Detection  : 100 candles, merge within 0.5%
+S/R Detection  : 100 candles (NO MERGE - every swing is a separate level)
 S/R Strength   : Minimum Strength 1 (★ or higher)
 S/R Max Age    : 100 candles base (extends based on strength)
 
@@ -466,6 +466,22 @@ LONG (Support Reversal):
   4. Bullish candle closes above false breakout candle close
   5. Enter LONG at Bullish candle close
   6. Stop Loss = False breakout candle Low
+
+IMMEDIATE S/R REPLACEMENT
+─────────────────────────────
+Resistance Break (Failed LONG):
+  • Price breaks above Resistance
+  • Next candle fails LONG confirmation
+  • Old Resistance removed
+  • New Resistance created at breakout candle HIGH
+  • Email alert sent
+
+Support Break (Failed SHORT):
+  • Price breaks below Support
+  • Next candle fails SHORT confirmation
+  • Old Support removed
+  • New Support created at breakdown candle LOW
+  • Email alert sent
 
 MONITORED SYMBOLS ({len(symbols)})
 ─────────────────────────────
@@ -495,6 +511,9 @@ MONITORED SYMBOLS ({len(symbols)})
         elif event_type == "EXPIRED":
             event_emoji = "⏰"
             event_desc = "SUPPORT/RESISTANCE LEVEL EXPIRED"
+        elif event_type == "REPLACED":
+            event_emoji = "🔄"
+            event_desc = "SUPPORT/RESISTANCE LEVEL REPLACED"
         else:
             return False
         
@@ -549,6 +568,15 @@ Age         : {age} candles"""
         if event_type == "EXPIRED":
             body += f"""
 Reason      : Level aged out (max age reached)"""
+        elif event_type == "REPLACED":
+            body += f"""
+Reason      : Level was broken but confirmation failed
+           → Immediate replacement at new level"""
+            if "old_price" in level_data:
+                body += f"""
+Old Level   : {smart_fmt(level_data['old_price'])}
+New Level   : {smart_fmt(level_data['new_price'])}
+Break Candle: {level_data.get('candle_type', '')} at {smart_fmt(level_data.get('break_price', 0))}"""
         
         body += f"""
 
@@ -565,7 +593,9 @@ LEGEND
 ★ = Strength (more ★ = stronger level)
 Touches = Number of times price has touched this level
 Age = Candles since level was created
-Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
+Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)
+
+NOTE: Levels are NOT merged. Each detected swing is a separate level."""
         
         return self._send_email(subject, body)
 
@@ -848,7 +878,7 @@ VOL_EXP_LOOKBACK = 21
 # ── Support/Resistance Strategy Constants ──
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
-SR_MERGE_THRESHOLD = 0.005
+SR_MERGE_THRESHOLD = 0.005  # DEPRECATED - NO LONGER USED FOR MERGING
 SR_MIN_LEVEL_AGE = 0  # No aging requirement - use immediately
 SR_MAX_LEVEL_AGE = 100  # Max age in candles
 SR_MIN_STRENGTH = 1
@@ -891,7 +921,7 @@ class APIRequestHandler:
         self.session    = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/13.2",
+            "User-Agent":   "python-DeltaBot/13.3",
             "Accept":       "application/json",
             "Connection":   "keep-alive",
         })
@@ -1609,7 +1639,7 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     
     _log("info", "RANGE_BREAK_LONG", 
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
-         f"Break close {smart_fmt(break_candle['close'])} > range high | "
+         f"Break close {break_candle['close']} > range high | "
          f"Confirm close {confirm_candle['close']} > break close")
     return True, confirm_candle_copy, "RANGE_BREAK_LONG"
 
@@ -2053,7 +2083,7 @@ def check_long_signal_no_rsi(
 
 
 # ================================================================
-#  14. SUPPORT/RESISTANCE LEVEL MANAGER (UNCHANGED)
+#  14. SUPPORT/RESISTANCE LEVEL MANAGER (NO MERGE - EVERY LEVEL SEPARATE)
 # ================================================================
 
 class SRLevelManager:
@@ -2065,7 +2095,7 @@ class SRLevelManager:
                  notifier: Optional[GmailNotifier] = None):
         self.symbol = symbol
         self.lookback = lookback
-        self.merge_threshold = merge_threshold
+        self.merge_threshold = merge_threshold  # DEPRECATED - NOT USED FOR MERGING
         self.min_age = 0
         self.max_age = max_age
         self.min_strength = min_strength
@@ -2078,6 +2108,12 @@ class SRLevelManager:
         self.last_processed_index = 0
         self._lock = threading.Lock()
         
+        # Track broken but unconfirmed levels for immediate replacement
+        self._broken_resistance: Optional[Dict] = None
+        self._broken_support: Optional[Dict] = None
+        self._break_candle: Optional[Dict] = None
+        self._break_direction: Optional[str] = None
+        
     def update_levels(self, candles: List[dict]) -> None:
         with self._lock:
             if len(candles) < self.lookback:
@@ -2086,6 +2122,9 @@ class SRLevelManager:
             current_idx = len(candles) - 1
             if current_idx == self.last_processed_index:
                 return
+            
+            # Check for broken levels before processing new swings
+            self._check_broken_levels(candles)
             
             new_swing_highs, new_swing_lows = self._detect_new_swings(candles)
             self.pending_swing_highs.extend(new_swing_highs)
@@ -2098,6 +2137,118 @@ class SRLevelManager:
             
             self.last_processed_index = current_idx
             self._log_levels()
+    
+    def _check_broken_levels(self, candles: List[dict]) -> None:
+        """
+        Check if any resistance was broken but the LONG confirmation failed,
+        or any support was broken but the SHORT confirmation failed.
+        If so, immediately replace the broken level.
+        """
+        if len(candles) < 3:
+            return
+        
+        current_candle = candles[-1]  # Current forming candle (for price reference)
+        break_candle = candles[-3] if len(candles) >= 3 else None
+        confirm_candle = candles[-2] if len(candles) >= 2 else None
+        
+        if not break_candle or not confirm_candle:
+            return
+        
+        current_price = current_candle.get("close", 0)
+        
+        # Check for broken resistance (LONG failed)
+        for i, level in enumerate(self.resistance_levels):
+            resistance_price = level["price"]
+            
+            # Break condition: price closed above resistance
+            if break_candle["close"] > resistance_price:
+                # Check if confirmation failed (not bullish or didn't close above break)
+                confirm_failed = (
+                    not is_bullish(confirm_candle) or 
+                    confirm_candle["close"] <= break_candle["close"]
+                )
+                
+                if confirm_failed:
+                    # Remove the old resistance
+                    old_resistance = self.resistance_levels.pop(i)
+                    
+                    # Create new resistance at break candle HIGH
+                    new_price = break_candle["high"]
+                    
+                    # NO MERGE CHECK - add as separate level
+                    new_level = {
+                        "price": new_price,
+                        "age": 0,
+                        "strength": max(1, old_resistance.get("strength", 1)),
+                        "touches": old_resistance.get("touches", 0) + 1,
+                        "type": "RESISTANCE",
+                        "old_price": old_resistance["price"],
+                        "new_price": new_price,
+                        "break_price": break_candle["close"],
+                        "candle_type": "BREAKOUT"
+                    }
+                    self.resistance_levels.append(new_level)
+                    
+                    _log("info", f"S/R [{self.symbol}]", 
+                         f"RESISTANCE IMMEDIATELY REPLACED: {smart_fmt(old_resistance['price'])} → {smart_fmt(new_price)} "
+                         f"(break at {smart_fmt(break_candle['close'])}, confirmation failed)")
+                    
+                    if self.notifier:
+                        self.notifier.send_sr_level_event(
+                            symbol=self.symbol,
+                            event_type="REPLACED",
+                            level_data=new_level,
+                            all_supports=self.support_levels,
+                            all_resistances=self.resistance_levels
+                        )
+                    break
+        
+        # Check for broken support (SHORT failed)
+        for i, level in enumerate(self.support_levels):
+            support_price = level["price"]
+            
+            # Break condition: price closed below support
+            if break_candle["close"] < support_price:
+                # Check if confirmation failed (not bearish or didn't close below break)
+                confirm_failed = (
+                    not is_bearish(confirm_candle) or 
+                    confirm_candle["close"] >= break_candle["close"]
+                )
+                
+                if confirm_failed:
+                    # Remove the old support
+                    old_support = self.support_levels.pop(i)
+                    
+                    # Create new support at break candle LOW
+                    new_price = break_candle["low"]
+                    
+                    # NO MERGE CHECK - add as separate level
+                    new_level = {
+                        "price": new_price,
+                        "age": 0,
+                        "strength": max(1, old_support.get("strength", 1)),
+                        "touches": old_support.get("touches", 0) + 1,
+                        "type": "SUPPORT",
+                        "old_price": old_support["price"],
+                        "new_price": new_price,
+                        "break_price": break_candle["close"],
+                        "candle_type": "BREAKDOWN"
+                    }
+                    self.support_levels.append(new_level)
+                    
+                    _log("info", f"S/R [{self.symbol}]", 
+                         f"SUPPORT IMMEDIATELY REPLACED: {smart_fmt(old_support['price'])} → {smart_fmt(new_price)} "
+                         f"(break at {smart_fmt(break_candle['close'])}, confirmation failed)")
+                    
+                    if self.notifier:
+                        self.notifier.send_sr_level_event(
+                            symbol=self.symbol,
+                            event_type="REPLACED",
+                            level_data=new_level,
+                            all_supports=self.support_levels,
+                            all_resistances=self.resistance_levels
+                        )
+                    break
     
     def _detect_new_swings(self, candles: List[dict]) -> Tuple[List[float], List[float]]:
         n = len(candles)
@@ -2120,9 +2271,17 @@ class SRLevelManager:
                     break
             if is_high:
                 price = candles[i]["high"]
-                if not self._level_exists(price, self.resistance_levels):
-                    new_highs.append(price)
-                    _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level detected: {smart_fmt(price)}")
+                # NO MERGE CHECK - add as new level directly
+                new_level = {
+                    "price": price,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1,
+                    "type": "RESISTANCE"
+                }
+                self.resistance_levels.append(new_level)
+                new_highs.append(price)
+                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level detected: {smart_fmt(price)} (★)")
             
             is_low = True
             for j in range(1, sensitivity + 1):
@@ -2131,79 +2290,30 @@ class SRLevelManager:
                     break
             if is_low:
                 price = candles[i]["low"]
-                if not self._level_exists(price, self.support_levels):
-                    new_lows.append(price)
-                    _log("info", f"S/R [{self.symbol}]", f"New SUPPORT level detected: {smart_fmt(price)}")
-        
-        return new_highs, new_lows
-    
-    def _level_exists(self, price: float, existing_levels: List[Dict]) -> bool:
-        threshold = price * self.merge_threshold
-        for level in existing_levels:
-            if abs(level["price"] - price) <= threshold:
-                level["strength"] = min(5, level["strength"] + 1)
-                level["touches"] += 1
-                level["age"] = 0
-                _log("info", f"S/R [{self.symbol}]", 
-                     f"Level {smart_fmt(level['price'])} strengthened to ★{'★' * (level['strength'] - 1)} "
-                     f"({level['touches']} touches)")
-                return True
-        return False
-    
-    def _process_pending_swings(self) -> List[Dict]:
-        new_levels = []
-        
-        for high in self.pending_swing_highs:
-            exists = False
-            threshold = high * self.merge_threshold
-            for level in self.resistance_levels:
-                if abs(level["price"] - high) <= threshold:
-                    level["price"] = (level["price"] + high) / 2
-                    level["strength"] = min(5, level["strength"] + 1)
-                    level["touches"] += 1
-                    level["age"] = 0
-                    exists = True
-                    _log("info", f"S/R [{self.symbol}]", 
-                         f"RESISTANCE updated: {smart_fmt(level['price'])} (★{'★' * (level['strength'] - 1)})")
-                    break
-            
-            if not exists:
+                # NO MERGE CHECK - add as new level directly
                 new_level = {
-                    "price": high, 
-                    "age": 0, 
-                    "strength": 1, 
-                    "touches": 1, 
-                    "type": "RESISTANCE"
-                }
-                self.resistance_levels.append(new_level)
-                new_levels.append(new_level)
-                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE level added: {smart_fmt(high)} (★) - READY FOR TRADING")
-        
-        for low in self.pending_swing_lows:
-            exists = False
-            threshold = low * self.merge_threshold
-            for level in self.support_levels:
-                if abs(level["price"] - low) <= threshold:
-                    level["price"] = (level["price"] + low) / 2
-                    level["strength"] = min(5, level["strength"] + 1)
-                    level["touches"] += 1
-                    level["age"] = 0
-                    exists = True
-                    _log("info", f"S/R [{self.symbol}]", 
-                         f"SUPPORT updated: {smart_fmt(level['price'])} (★{'★' * (level['strength'] - 1)})")
-                    break
-            
-            if not exists:
-                new_level = {
-                    "price": low, 
-                    "age": 0, 
-                    "strength": 1, 
-                    "touches": 1, 
+                    "price": price,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1,
                     "type": "SUPPORT"
                 }
                 self.support_levels.append(new_level)
-                new_levels.append(new_level)
-                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT level added: {smart_fmt(low)} (★) - READY FOR TRADING")
+                new_lows.append(price)
+                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT level detected: {smart_fmt(price)} (★)")
+        
+        return new_highs, new_lows
+    
+    def _process_pending_swings(self) -> List[Dict]:
+        # Pending swings are already added directly in _detect_new_swings
+        # This method is kept for compatibility but no longer merges
+        new_levels = []
+        
+        # Just clear pending lists
+        if self.pending_swing_highs:
+            _log("info", f"S/R [{self.symbol}]", f"Processing {len(self.pending_swing_highs)} pending resistance levels (no merge)")
+        if self.pending_swing_lows:
+            _log("info", f"S/R [{self.symbol}]", f"Processing {len(self.pending_swing_lows)} pending support levels (no merge)")
         
         self.pending_swing_highs.clear()
         self.pending_swing_lows.clear()
@@ -2319,6 +2429,10 @@ class SRLevelManager:
             self.pending_swing_highs.clear()
             self.pending_swing_lows.clear()
             self.last_processed_index = 0
+            self._broken_resistance = None
+            self._broken_support = None
+            self._break_candle = None
+            self._break_direction = None
             _log("info", f"S/R [{self.symbol}]", "Levels reset")
 
 
@@ -3476,7 +3590,7 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v13.2           |")
+        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v13.3           |")
         print("|   VERIFIED: ALL STRATEGIES INTEGRATED CORRECTLY       |")
         print("|                                                        |")
         print("|   RSI-BASED STRATEGIES (SHORT > 55 | LONG < 40):       |")
@@ -3497,6 +3611,12 @@ class TradingBot:
         print("|   SHORT: Price above Resistance → Closes below → Bear Confirmation")
         print("|   LONG:  Price below Support → Closes above → Bull Confirmation")
         print("|                                                        |")
+        print("|   IMMEDIATE S/R REPLACEMENT:                           |")
+        print("|   Resistance broken → LONG fails → Replace at breakout HIGH")
+        print("|   Support broken → SHORT fails → Replace at breakdown LOW")
+        print("|   GMAIL alert sent for every replacement              |")
+        print("|                                                        |")
+        print("|   S/R LEVELS: NO MERGE - EVERY LEVEL SEPARATE         |")
         print("|   S/R LEVELS: Max Age = 100 candles base              |")
         print("|   S/R STRENGTH EXT: +15 candles per strength level    |")
         print("|   S/R LEVELS: Ready for trading IMMEDIATELY           |")
@@ -3537,12 +3657,13 @@ class TradingBot:
         print(f"  Range Break       : Rolling 7-candle range")
         print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
         print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
-        print(f"  S/R Detection     : {SR_LOOKBACK} candles, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
+        print(f"  S/R Detection     : {SR_LOOKBACK} candles, NO MERGE - every level separate")
         print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required for trades)")
         print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
         print(f"  S/R Ready         : IMMEDIATELY (no aging requirement)")
         print(f"  S/R Breakout      : Break + confirmation candle")
         print(f"  S/R Reversal      : False breakout + confirmation candle")
+        print(f"  S/R Replacement   : Broken level → immediate replacement on failed confirmation")
         print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
@@ -3788,6 +3909,31 @@ def test_gmail():
             ]
         )
         print("  ✅ S/R test email sent!")
+        print("\n  📤 Sending test S/R REPLACEMENT notification...")
+        notifier.send_sr_level_event(
+            symbol="BTCUSD_PERP",
+            event_type="REPLACED",
+            level_data={
+                "price": 65200.0, 
+                "strength": 2, 
+                "touches": 4, 
+                "age": 0, 
+                "type": "RESISTANCE",
+                "old_price": 64800.0,
+                "new_price": 65200.0,
+                "break_price": 64950.0,
+                "candle_type": "BREAKOUT"
+            },
+            all_supports=[
+                {"price": 62000.0, "strength": 3, "touches": 8, "age": 10},
+                {"price": 63500.0, "strength": 1, "touches": 2, "age": 3},
+            ],
+            all_resistances=[
+                {"price": 65200.0, "strength": 2, "touches": 4, "age": 0},
+                {"price": 66000.0, "strength": 4, "touches": 12, "age": 20},
+            ]
+        )
+        print("  ✅ S/R REPLACEMENT test email sent!")
     else:
         print("  ❌ Failed to send email. Check your App Password and settings.")
 
@@ -3799,7 +3945,7 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v13.2       |")
+    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v13.3       |")
     print("  |   VERIFIED: ALL STRATEGIES INTEGRATED CORRECTLY     |")
     print("  |                                                        |")
     print("  |   RSI-BASED STRATEGIES:                                |")
@@ -3816,6 +3962,12 @@ def main() -> None:
     print("  |   • S/R REVERSAL (RESISTANCE_FALSE_BREAKOUT /        |")
     print("  |     SUPPORT_FALSE_BREAKOUT)                           |")
     print("  |                                                        |")
+    print("  |   IMMEDIATE S/R REPLACEMENT:                           |")
+    print("  |   • Resistance broken → LONG fails → Replace at HIGH  |")
+    print("  |   • Support broken → SHORT fails → Replace at LOW     |")
+    print("  |   • GMAIL alert for every replacement                 |")
+    print("  |                                                        |")
+    print("  |   S/R LEVELS: NO MERGE - EVERY LEVEL SEPARATE         |")
     print("  |   S/R LEVELS: Max Age = 100 + (Strength * 15)        |")
     print("  |   S/R LEVELS: Ready for trading IMMEDIATELY          |")
     print("  |                                                        |")
@@ -3887,6 +4039,8 @@ def main() -> None:
     print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
     print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
     print(f"  S/R Ready         : IMMEDIATELY (no aging required)")
+    print(f"  S/R Replacement   : Broken level → immediate replacement on failed confirmation")
+    print(f"  S/R Merge         : DISABLED - every level separate")
     print(f"  CANDLESTICK PATTERNS (RSI-based):")
     print(f"    • Bearish Engulfing: Bullish → Bearish engulf")
     print(f"    • Bullish Engulfing: Bearish → Bullish engulf")
@@ -3895,7 +4049,7 @@ def main() -> None:
     print(f"  Doji Strategy     : 2 candle breakout + Doji (body ≤ 30%) + Confirmation")
     print(f"  Vol Expansion     : 21-candle range break (NO WICK CONDITIONS)")
     print(f"  Range Break       : Rolling 7-candle range")
-    print(f"  S/R Breakout      : 100-candle S/R, merge within {SR_MERGE_THRESHOLD*100:.2f}%")
+    print(f"  S/R Breakout      : 100-candle S/R, NO MERGE")
     print(f"  S/R Reversal      : False breakout + confirmation candle")
     print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required)")
     print(f"  Price Precision   : auto dp — altcoin micro-prices supported")
