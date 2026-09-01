@@ -39,7 +39,7 @@ import websocket
 # ================================================================
 #  3.  LOGGING
 # ================================================================
-LOG_FORMAT  = "%(asctime)s [%(levelname)-8s] %(message)s"
+LOG_FORMAT = "%(asctime)s [%(levelname)-8s] %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -85,14 +85,22 @@ def smart_fmt(price: float) -> str:
     if price == 0:
         return "0"
     abs_p = abs(price)
-    if abs_p >= 10_000:  decimals = 2
-    elif abs_p >= 1_000: decimals = 3
-    elif abs_p >= 100:   decimals = 4
-    elif abs_p >= 10:    decimals = 5
-    elif abs_p >= 1:     decimals = 6
-    elif abs_p >= 0.1:   decimals = 7
-    elif abs_p >= 0.01:  decimals = 8
-    else:                decimals = 10
+    if abs_p >= 10_000:
+        decimals = 2
+    elif abs_p >= 1_000:
+        decimals = 3
+    elif abs_p >= 100:
+        decimals = 4
+    elif abs_p >= 10:
+        decimals = 5
+    elif abs_p >= 1:
+        decimals = 6
+    elif abs_p >= 0.1:
+        decimals = 7
+    elif abs_p >= 0.01:
+        decimals = 8
+    else:
+        decimals = 10
 
     formatted = f"{price:.{decimals}f}"
     if "." in formatted:
@@ -122,10 +130,10 @@ class GmailNotifier:
         recipient_emails: List[str],
         enabled: bool = True,
     ):
-        self.sender_email       = sender_email
+        self.sender_email = sender_email
         self.gmail_app_password = gmail_app_password
-        self.recipient_emails   = recipient_emails
-        self.enabled            = enabled
+        self.recipient_emails = recipient_emails
+        self.enabled = enabled
         self._last_sr_alert: Dict[str, str] = {}
         self._last_rejection_alert: Dict[str, str] = {}
 
@@ -134,8 +142,8 @@ class GmailNotifier:
             return False
         try:
             msg = MIMEMultipart()
-            msg["From"]    = self.sender_email
-            msg["To"]      = ", ".join(self.recipient_emails)
+            msg["From"] = self.sender_email
+            msg["To"] = ", ".join(self.recipient_emails)
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain", "utf-8"))
             context = ssl.create_default_context()
@@ -151,33 +159,33 @@ class GmailNotifier:
     def send_signal(self, signal: dict) -> bool:
         if not self.enabled:
             return False
-        direction       = signal.get("direction", "UNKNOWN")
-        symbol          = signal.get("symbol", "UNKNOWN")
-        strategy        = signal.get("strategy", "UNKNOWN")
-        timeframe       = signal.get("timeframe", "UNKNOWN")
-        entry           = signal.get("entry", 0)
-        stop_loss       = signal.get("stop_loss", 0)
-        take_profit     = signal.get("take_profit", 0)
-        rsi             = signal.get("rsi", "N/A")
-        mode            = signal.get("mode", "PAPER")
-        risk_usd        = signal.get("risk_usd", 0)
+        direction = signal.get("direction", "UNKNOWN")
+        symbol = signal.get("symbol", "UNKNOWN")
+        strategy = signal.get("strategy", "UNKNOWN")
+        timeframe = signal.get("timeframe", "UNKNOWN")
+        entry = signal.get("entry", 0)
+        stop_loss = signal.get("stop_loss", 0)
+        take_profit = signal.get("take_profit", 0)
+        rsi = signal.get("rsi", "N/A")
+        mode = signal.get("mode", "PAPER")
+        risk_usd = signal.get("risk_usd", 0)
         trading_capital = signal.get("trading_capital", 0)
-        signal_time     = signal.get("time", datetime.now(timezone.utc).isoformat())
-        no_rsi          = signal.get("no_rsi", False)
-        
-        direction_text = "SHORT" if direction == "SHORT" else "LONG"
-        direction_emoji = "🔴" if direction == "SHORT" else "🟢"
+        signal_time = signal.get("time", datetime.now(timezone.utc).isoformat())
+        no_rsi = signal.get("no_rsi", False)
 
-        risk_dist   = abs(entry - stop_loss)
+        direction_text = "SHORT" if direction == "SHORT" else "LONG"
+        direction_emoji = "\U0001F534" if direction == "SHORT" else "\U0001F7E2"
+
+        risk_dist = abs(entry - stop_loss)
         reward_dist = abs(take_profit - entry)
-        rr          = (reward_dist / risk_dist) if risk_dist > 0 else 0
-        rsi_str     = "N/A (no RSI)" if no_rsi else (f"{rsi:.2f}" if isinstance(rsi, float) else str(rsi))
-        risk_pct    = (risk_usd / trading_capital * 100) if trading_capital > 0 else 0
+        rr = (reward_dist / risk_dist) if risk_dist > 0 else 0
+        rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi:.2f}" if isinstance(rsi, float) else str(rsi))
+        risk_pct = (risk_usd / trading_capital * 100) if trading_capital > 0 else 0
 
         subject = f"[{mode}] {direction_emoji} {symbol} {direction_text} - {strategy}"
 
         body = f"""TRADING SIGNAL ALERT
-─────────────────────────────
+-----------------------------
 Time       : {signal_time}
 Mode       : {mode}
 Symbol     : {symbol}
@@ -187,7 +195,7 @@ Timeframe  : {timeframe}
 RSI(14)    : {rsi_str}
 
 ENTRY & EXIT LEVELS
-─────────────────────────────
+-----------------------------
 Entry      : {smart_fmt(entry)}
 Stop Loss  : {smart_fmt(stop_loss)}
 Take Profit: {smart_fmt(take_profit)}
@@ -196,21 +204,21 @@ Reward Dist: {smart_fmt(reward_dist)}
 Risk:Reward: {rr:.2f}:1
 
 RISK MANAGEMENT
-─────────────────────────────
+-----------------------------
 Risk $     : ${risk_usd:.2f}
 Capital    : ${trading_capital:,.2f}
 Risk %     : {risk_pct:.2f}%
 
 STRATEGY NOTES
-─────────────────────────────
+-----------------------------
 Stop Loss  : Triggers on CANDLE CLOSE
 Take Profit: Triggers on PRICE TOUCH
 SuperTrend : Monitored post-entry"""
-        
+
         if no_rsi:
             body += "\nRSI Filter : DISABLED"
         if strategy in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
-            body += f"\nHarami Tol : {signal.get('harami_tolerance', 0.001)*100:.2f}%"
+            body += f"\nHarami Tol : {signal.get('harami_tolerance', 0.001) * 100:.2f}%"
         if "breakout_level" in signal:
             body += f"\nBreakout Lvl: {smart_fmt(signal['breakout_level'])}"
         if "level_strength" in signal:
@@ -219,7 +227,7 @@ SuperTrend : Monitored post-entry"""
             body += f"\nReversal Close: {smart_fmt(signal['reversal_candle_close'])}"
         if "confirmation_close" in signal:
             body += f"\nConfirm Close: {smart_fmt(signal['confirmation_close'])}"
-        
+
         return self._send_email(subject, body)
 
     def send_supertrend_strong(self, symbol: str, direction: str, entry: float,
@@ -228,16 +236,16 @@ SuperTrend : Monitored post-entry"""
         if not self.enabled:
             return False
         if direction == "SHORT":
-            trend_emoji = "🔴"
-            trend_desc  = "BEARISH - Both SuperTrends turned RED"
+            trend_emoji = "\U0001F534"
+            trend_desc = "BEARISH - Both SuperTrends turned RED"
         else:
-            trend_emoji = "🟢"
-            trend_desc  = "BULLISH - Both SuperTrends turned GREEN"
+            trend_emoji = "\U0001F7E2"
+            trend_desc = "BULLISH - Both SuperTrends turned GREEN"
 
         subject = f"[{mode}] {trend_emoji} {symbol} SuperTrend Confirmed - {direction}"
 
         body = f"""SUPERTREND STRONG TREND CONFIRMATION
-─────────────────────────────
+-----------------------------
 Symbol     : {symbol}
 Direction  : {direction}
 Trend      : {trend_desc}
@@ -245,20 +253,20 @@ Timeframe  : {timeframe}
 Mode       : {mode}
 
 TRADE DETAILS
-─────────────────────────────
+-----------------------------
 Entry Price: {smart_fmt(entry)}
 Exit Mode  : SuperTrend-based (no fixed TP)
 
 SUPERTREND VALUES
-─────────────────────────────
+-----------------------------
 ST(14,2)   : {smart_fmt(st1)}
 ST(21,1)   : {smart_fmt(st2)}
 
 EXIT STRATEGY
-─────────────────────────────
+-----------------------------
 Will exit when BOTH SuperTrends reverse direction:
 - {'Flip to GREEN for exit' if direction == 'SHORT' else 'Flip to RED for exit'}"""
-        
+
         return self._send_email(subject, body)
 
     def send_supertrend_exit(self, symbol: str, direction: str, entry: float,
@@ -266,11 +274,11 @@ Will exit when BOTH SuperTrends reverse direction:
                               timeframe: str, mode: str) -> bool:
         if not self.enabled:
             return False
-        is_profit   = realized_pnl > 0
-        emoji       = "✅" if is_profit else "❌"
-        pnl_text    = f"+${realized_pnl:.2f}" if is_profit else f"-${abs(realized_pnl):.2f}"
+        is_profit = realized_pnl > 0
+        emoji = "\u2705" if is_profit else "\u274C"
+        pnl_text = f"+${realized_pnl:.2f}" if is_profit else f"-${abs(realized_pnl):.2f}"
         result_text = "PROFIT" if is_profit else "LOSS"
-        
+
         if direction == "SHORT":
             flip_desc = "Both SuperTrends flipped GREEN - bearish trend ended"
         else:
@@ -279,134 +287,134 @@ Will exit when BOTH SuperTrends reverse direction:
         subject = f"[ST-EXIT] {emoji} {symbol} {direction} - {pnl_text}"
 
         body = f"""SUPERTREND EXIT - TREND REVERSAL
-─────────────────────────────
+-----------------------------
 Symbol      : {symbol}
 Direction   : {direction}
 Timeframe   : {timeframe}
 Mode        : {mode}
 
 EXIT DETAILS
-─────────────────────────────
+-----------------------------
 Exit Reason : {flip_desc}
 Entry       : {smart_fmt(entry)}
 Exit Price  : {smart_fmt(exit_price)}
 
 RESULT
-─────────────────────────────
+-----------------------------
 Realized PnL: {pnl_text}
-Result      : {result_text} {'🎉' if is_profit else '😢'}"""
-        
+Result      : {result_text}"""
+
         return self._send_email(subject, body)
 
     def send_trade_executed(self, trade: dict) -> bool:
         if not self.enabled:
             return False
-        direction   = trade.get("direction", "UNKNOWN")
-        symbol      = trade.get("symbol", "UNKNOWN")
-        entry       = trade.get("entry", 0)
-        stop_loss   = trade.get("stop_loss", 0)
+        direction = trade.get("direction", "UNKNOWN")
+        symbol = trade.get("symbol", "UNKNOWN")
+        entry = trade.get("entry", 0)
+        stop_loss = trade.get("stop_loss", 0)
         take_profit = trade.get("take_profit", 0)
-        size        = trade.get("size", 0)
-        strategy    = trade.get("strategy", "UNKNOWN")
-        no_rsi      = trade.get("no_rsi", False)
-        
-        direction_emoji = "🔴" if direction == "SHORT" else "🟢"
+        size = trade.get("size", 0)
+        strategy = trade.get("strategy", "UNKNOWN")
+        no_rsi = trade.get("no_rsi", False)
+
+        direction_emoji = "\U0001F534" if direction == "SHORT" else "\U0001F7E2"
         subject = f"[EXECUTED] {direction_emoji} {symbol} {direction} - {size} contracts"
 
         body = f"""TRADE EXECUTED SUCCESSFULLY
-─────────────────────────────
+-----------------------------
 Symbol     : {symbol}
 Direction  : {direction}
 Strategy   : {strategy}
 Size       : {size} contracts
 
 ENTRY & EXIT LEVELS
-─────────────────────────────
+-----------------------------
 Entry      : {smart_fmt(entry)}
 Stop Loss  : {smart_fmt(stop_loss)}
 Take Profit: {smart_fmt(take_profit)}
 
 EXECUTION NOTES
-─────────────────────────────
+-----------------------------
 Stop Loss  : Triggers on CANDLE CLOSE
 Take Profit: Triggers on PRICE TOUCH
 SuperTrend : Monitoring post-entry"""
-        
+
         if no_rsi:
             body += "\nRSI Filter : DISABLED"
-        
+
         return self._send_email(subject, body)
 
     def send_trade_closed(self, trade: dict, close_reason: str, pnl_usd: float) -> bool:
         if not self.enabled:
             return False
-        direction  = trade.get("direction", "UNKNOWN")
-        symbol     = trade.get("symbol", "UNKNOWN")
-        entry      = trade.get("entry", 0)
-        is_profit  = pnl_usd > 0
-        emoji      = "✅" if is_profit else "❌"
-        pnl_text   = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
-        subject    = f"[CLOSED] {emoji} {symbol} - {pnl_text} - {close_reason}"
+        direction = trade.get("direction", "UNKNOWN")
+        symbol = trade.get("symbol", "UNKNOWN")
+        entry = trade.get("entry", 0)
+        is_profit = pnl_usd > 0
+        emoji = "\u2705" if is_profit else "\u274C"
+        pnl_text = f"+${pnl_usd:.2f}" if is_profit else f"-${abs(pnl_usd):.2f}"
+        subject = f"[CLOSED] {emoji} {symbol} - {pnl_text} - {close_reason}"
 
         body = f"""TRADE CLOSED
-─────────────────────────────
+-----------------------------
 Symbol      : {symbol}
 Direction   : {direction}
 Close Reason: {close_reason}
 
 TRADE DETAILS
-─────────────────────────────
+-----------------------------
 Entry       : {smart_fmt(entry)}
 Exit Price  : {trade.get('exit_price', entry)}
 
 RESULT
-─────────────────────────────
+-----------------------------
 Realized PnL: {pnl_text}
-Result      : {'PROFIT 🎉' if is_profit else 'LOSS 😢'}"""
-        
+Result      : {'PROFIT' if is_profit else 'LOSS'}"""
+
         return self._send_email(subject, body)
 
     def send_daily_loss_warning(self, daily_loss_usd: float, daily_limit_usd: float) -> bool:
         if not self.enabled:
             return False
-        percent = (daily_loss_usd / daily_limit_usd) * 100
-        subject = f"⚠️ DAILY LOSS WARNING - {percent:.1f}% of limit"
+        percent = (daily_loss_usd / daily_limit_usd) * 100 if daily_limit_usd > 0 else 0
+        subject = f"WARNING DAILY LOSS WARNING - {percent:.1f}% of limit"
 
         body = f"""DAILY LOSS LIMIT WARNING
-─────────────────────────────
+-----------------------------
 Current Loss : ${daily_loss_usd:.2f}
 Daily Limit  : ${daily_limit_usd:.2f}
 Percentage   : {percent:.1f}%
-Status       : {'⚠️ NEAR LIMIT - Caution!' if percent >= 80 else 'Monitoring'}"""
-        
+Status       : {'NEAR LIMIT - Caution!' if percent >= 80 else 'Monitoring'}"""
+
         return self._send_email(subject, body)
 
     def send_daily_limit_hit(self, daily_loss_usd: float, daily_limit_usd: float) -> bool:
         if not self.enabled:
             return False
-        subject = "🛑 DAILY LOSS LIMIT HIT - TRADING STOPPED"
+        subject = "DAILY LOSS LIMIT HIT - TRADING STOPPED"
 
         body = f"""DAILY LOSS LIMIT REACHED - TRADING HALTED
-─────────────────────────────
+-----------------------------
 Current Loss : ${daily_loss_usd:.2f}
 Daily Limit  : ${daily_limit_usd:.2f}
 Status       : TRADING HALTED UNTIL TOMORROW (UTC)
 Action       : No new trades will be placed"""
-        
+
         return self._send_email(subject, body)
 
     def send_startup_report(self, config: dict, symbols: List[str], harami_tolerance: float) -> bool:
         if not self.enabled:
             return False
-        mode         = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
-        subject      = f"🤖 TRADING BOT STARTED - {mode}"
-        
-        symbols_list = "\n".join([f"  • {sym}" for sym in symbols[:10]])
+        mode = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
+        subject = f"TRADING BOT STARTED - {mode}"
+
+        symbols_list = "\n".join([f"  - {sym}" for sym in symbols[:10]])
         if len(symbols) > 10:
-            symbols_list += f"\n  • ... and {len(symbols) - 10} more"
+            symbols_list += f"\n  - ... and {len(symbols) - 10} more"
 
         body = f"""TRADING BOT STARTED - {mode}
-─────────────────────────────
+-----------------------------
 Timeframe      : {config.get('timeframe', '1h')}
 Leverage       : {config.get('leverage', 5)}x
 Risk/Trade     : {config.get('risk_pct', 2)}%
@@ -415,126 +423,54 @@ Daily Loss Cap : {config.get('daily_loss_limit_pct', 0.05) * 100:.0f}%
 Capital        : ${config.get('trading_capital', 0):,.2f}
 
 TRADE DIRECTIONS
-─────────────────────────────
-SHORT TRADES   : {'ENABLED ✅' if config.get('enable_short', True) else 'DISABLED ❌'}
-LONG TRADES    : {'ENABLED ✅' if config.get('enable_long', True) else 'DISABLED ❌'}
-
-RSI FILTERS
-─────────────────────────────
-SHORT RSI      : > 55
-LONG RSI       : < 40
-RSI LONG BLOCK : < 24 (extreme oversold)
-NO RSI         : Range Break, Vol Expansion, S/R Breakout, S/R Reversal
-
-STRATEGY PARAMETERS
-─────────────────────────────
-CANDLESTICK PATTERNS (RSI-based):
-  • Bearish Engulfing: Bullish → Bearish engulf
-  • Bullish Engulfing: Bearish → Bullish engulf
-  • Bearish Harami: Bullish → Bearish inside body (tol: {harami_tolerance*100:.2f}%)
-  • Bullish Harami: Bearish → Bullish inside body (tol: {harami_tolerance*100:.2f}%)
-Take Profit    : 2:1 R:R (or SuperTrend exit if both ST confirm)
-Stop Loss      : Triggers on CANDLE CLOSE
-SuperTrend 1   : Length=14, Factor=2.0
-SuperTrend 2   : Length=21, Factor=1.0
-Doji Strategy  : 2 candle breakout + Doji + Confirmation
-Vol Expansion  : 21-candle range break (NO wick conditions)
-Range Break    : Rolling 7-candle range
-S/R Detection  : 100 candles (NO MERGE - every swing is a separate level)
-S/R Strength   : Minimum Strength 1 (★ or higher)
-S/R Max Age    : 100 candles base (extends based on strength)
-
-S/R BREAKOUT STRATEGY
-─────────────────────────────
-Breakout       : Price closes beyond S/R level
-Confirmation   : NEXT candle closes beyond break candle close
-Entry          : On confirmation candle close (IMMEDIATE)
-
-S/R REVERSAL STRATEGY
-─────────────────────────────
-SHORT (Resistance Reversal):
-  1. Price moves above Resistance level
-  2. False breakout candle closes back below Resistance
-  3. Next candle must be Bearish
-  4. Bearish candle closes below false breakout candle close
-  5. Enter SHORT at Bearish candle close (IMMEDIATE)
-  6. Stop Loss = False breakout candle High
-
-LONG (Support Reversal):
-  1. Price moves below Support level
-  2. False breakout candle closes back above Support
-  3. Next candle must be Bullish
-  4. Bullish candle closes above false breakout candle close
-  5. Enter LONG at Bullish candle close (IMMEDIATE)
-  6. Stop Loss = False breakout candle Low
-
-IMMEDIATE S/R REPLACEMENT
-─────────────────────────────
-Resistance Break (Failed LONG):
-  • Price breaks above Resistance
-  • Next candle fails LONG confirmation
-  • Old Resistance removed
-  • New Resistance created at breakout candle HIGH
-  • Email alert sent
-
-Support Break (Failed SHORT):
-  • Price breaks below Support
-  • Next candle fails SHORT confirmation
-  • Old Support removed
-  • New Support created at breakdown candle LOW
-  • Email alert sent
-
-S/R REJECTION EMAILS
-─────────────────────────────
-For every failed S/R breakout/breakdown:
-  • Detailed rejection reason logged
-  • Email sent with symbol, S/R level, breakout/confirm close, rejection reason
-  • No duplicate emails for same event
+-----------------------------
+SHORT TRADES   : {'ENABLED' if config.get('enable_short', True) else 'DISABLED'}
+LONG TRADES    : {'ENABLED' if config.get('enable_long', True) else 'DISABLED'}
 
 MONITORED SYMBOLS ({len(symbols)})
-─────────────────────────────
+-----------------------------
 {symbols_list}"""
-        
+
         return self._send_email(subject, body)
 
-    def send_sr_level_event(self, symbol: str, event_type: str, level_data: dict, 
-                            all_supports: List[dict], all_resistances: List[dict]) -> bool:
+    def send_sr_level_event(self, symbol: str, event_type: str, level_data: dict,
+                             all_supports: List[dict], all_resistances: List[dict]) -> bool:
         if not self.enabled:
             return False
-        
+
         event_key = f"{symbol}_{event_type}_{level_data.get('price', 0):.10f}"
         if self._last_sr_alert.get(event_key) == event_type:
             return False
-        
+
         self._last_sr_alert[event_key] = event_type
-        
+
         if len(self._last_sr_alert) > 100:
             keys = list(self._last_sr_alert.keys())
             for k in keys[:-100]:
                 del self._last_sr_alert[k]
-        
+
         if event_type == "NEW":
-            event_emoji = "🆕"
+            event_emoji = "NEW"
             event_desc = "NEW SUPPORT/RESISTANCE LEVEL DETECTED"
         elif event_type == "EXPIRED":
-            event_emoji = "⏰"
+            event_emoji = "EXPIRED"
             event_desc = "SUPPORT/RESISTANCE LEVEL EXPIRED"
         elif event_type == "REPLACED":
-            event_emoji = "🔄"
+            event_emoji = "REPLACED"
             event_desc = "SUPPORT/RESISTANCE LEVEL REPLACED"
         else:
             return False
-        
+
         level_type = "SUPPORT" if "SUPPORT" in str(level_data.get("type", "")) else "RESISTANCE"
         price = level_data.get("price", 0)
         strength = level_data.get("strength", 1)
         touches = level_data.get("touches", 0)
         age = level_data.get("age", 0)
-        stars = "★" * strength
-        
+        stars = "*" * strength
+
         subject = f"[S/R-ALERT] {event_emoji} {symbol} - {level_type} {smart_fmt(price)} - {event_type}"
-        
-        def format_level_list(levels: List[dict], level_type_str: str) -> str:
+
+        def format_level_list(levels: List[dict]) -> str:
             if not levels:
                 return "  (none)"
             sorted_levels = sorted(levels, key=lambda x: x.get("price", 0))
@@ -544,120 +480,153 @@ MONITORED SYMBOLS ({len(symbols)})
                 lv_strength = lv.get("strength", 1)
                 lv_touches = lv.get("touches", 0)
                 lv_age = lv.get("age", 0)
-                lv_stars = "★" * lv_strength
-                lines.append(f"  • {smart_fmt(lv_price):>15}  {lv_stars:>5}  Touches: {lv_touches:>3}  Age: {lv_age:>3}")
+                lv_stars = "*" * lv_strength
+                lines.append(f"  - {smart_fmt(lv_price):>15}  {lv_stars:>5}  Touches: {lv_touches:>3}  Age: {lv_age:>3}")
             return "\n".join(lines)
-        
+
         supports_display = all_supports[-50:] if len(all_supports) > 50 else all_supports
         resistances_display = all_resistances[-50:] if len(all_resistances) > 50 else all_resistances
-        
-        support_lines = format_level_list(supports_display, "SUPPORT")
-        resistance_lines = format_level_list(resistances_display, "RESISTANCE")
-        
+
+        support_lines = format_level_list(supports_display)
+        resistance_lines = format_level_list(resistances_display)
+
         total_supports = len(all_supports)
         total_resistances = len(all_resistances)
         truncated_s = " (showing last 50)" if len(all_supports) > 50 else ""
         truncated_r = " (showing last 50)" if len(all_resistances) > 50 else ""
-        
+
         body = f"""S/R LEVEL EVENT
-─────────────────────────────
+-----------------------------
 Event       : {event_desc}
 Symbol      : {symbol}
 Time        : {datetime.now(timezone.utc).isoformat()}
 
 AFFECTED LEVEL
-─────────────────────────────
+-----------------------------
 Type        : {level_type}
 Price       : {smart_fmt(price)}
 Strength    : {stars} ({strength})
 Touches     : {touches}
 Age         : {age} candles"""
-        
+
         if event_type == "EXPIRED":
-            body += f"""
-Reason      : Level aged out (max age reached)"""
+            body += "\nReason      : Level aged out (max age reached)"
         elif event_type == "REPLACED":
-            body += f"""
-Reason      : Level was broken but confirmation failed
-           → Immediate replacement at new level"""
+            body += "\nReason      : Level was broken but confirmation failed\n            -> Immediate replacement at new level"
             if "old_price" in level_data:
-                body += f"""
-Old Level   : {smart_fmt(level_data['old_price'])}
-New Level   : {smart_fmt(level_data['new_price'])}
-Break Candle: {level_data.get('candle_type', '')} at {smart_fmt(level_data.get('break_price', 0))}"""
-        
+                body += (
+                    f"\nOld Level   : {smart_fmt(level_data['old_price'])}"
+                    f"\nNew Level   : {smart_fmt(level_data['new_price'])}"
+                    f"\nBreak Candle: {level_data.get('candle_type', '')} at {smart_fmt(level_data.get('break_price', 0))}"
+                )
+
         body += f"""
 
 CURRENT SUPPORT LEVELS{truncated_s} ({total_supports} total)
-─────────────────────────────
+-----------------------------
 {support_lines}
 
 CURRENT RESISTANCE LEVELS{truncated_r} ({total_resistances} total)
-─────────────────────────────
+-----------------------------
 {resistance_lines}
 
 LEGEND
-─────────────────────────────
-★ = Strength (more ★ = stronger level)
+-----------------------------
+* = Strength (more * = stronger level)
 Touches = Number of times price has touched this level
 Age = Candles since level was created
 Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)
 
 NOTE: Levels are NOT merged. Each detected swing is a separate level."""
-        
+
         return self._send_email(subject, body)
 
     def send_sr_rejection(self, symbol: str, direction: str, level_price: float,
-                          breakout_close: float, confirm_close: float,
-                          rejection_reason: str, strategy: str = "S/R_BREAKOUT") -> bool:
+                           breakout_close: float, confirm_close: float,
+                           rejection_reason: str, strategy: str = "S/R_BREAKOUT") -> bool:
         """
         Send a rejection email for failed S/R breakout/breakdown attempts.
         Prevents duplicate emails for the same event.
         """
         if not self.enabled:
             return False
-        
-        # Create unique key for this rejection event
+
         event_key = f"{symbol}_{direction}_{level_price:.10f}_{strategy}"
         if self._last_rejection_alert.get(event_key) == rejection_reason:
             return False
-        
+
         self._last_rejection_alert[event_key] = rejection_reason
-        
-        # Clean up old rejection keys
+
         if len(self._last_rejection_alert) > 200:
             keys = list(self._last_rejection_alert.keys())
             for k in keys[:-200]:
                 del self._last_rejection_alert[k]
-        
-        direction_emoji = "🔴" if direction == "SHORT" else "🟢"
+
+        direction_emoji = "\U0001F534" if direction == "SHORT" else "\U0001F7E2"
         direction_text = "SHORT" if direction == "SHORT" else "LONG"
-        
+
         subject = f"[S/R-REJECTED] {direction_emoji} {symbol} {direction_text} - {rejection_reason[:30]}..."
-        
+
         body = f"""S/R TRADE REJECTED
-─────────────────────────────
+-----------------------------
 Symbol      : {symbol}
 Direction   : {direction_text}
 Strategy    : {strategy}
 Time        : {datetime.now(timezone.utc).isoformat()}
 
 LEVEL DETAILS
-─────────────────────────────
+-----------------------------
 S/R Level   : {smart_fmt(level_price)}
 Breakout Candle Close: {smart_fmt(breakout_close)}
 Confirmation Candle Close: {smart_fmt(confirm_close)}
 
 REJECTION REASON
-─────────────────────────────
+-----------------------------
 {rejection_reason}
 
 NOTES
-─────────────────────────────
-• Trade was NOT executed
-• S/R level may be replaced if confirmation failed
-• Check logs for more details"""
-        
+-----------------------------
+- Trade was NOT executed
+- S/R level may be replaced if confirmation failed
+- Check logs for more details"""
+
+        return self._send_email(subject, body)
+
+    def send_health_alert(self, issue_key: str, message: str, resolved: bool = False) -> bool:
+        """
+        Sends an alert when the watchdog detects a condition that could mean
+        the bot is silently failing to trade (stalled candle feed, evaluation
+        never running, WebSocket down, daily-loss gate stuck active, etc.),
+        or a "resolved" follow-up once that condition clears.
+        """
+        if not self.enabled:
+            return False
+
+        if resolved:
+            subject = f"[BOT HEALTH] RESOLVED - {issue_key}"
+            body = f"""BOT HEALTH - ISSUE RESOLVED
+-----------------------------
+Issue    : {issue_key}
+Time     : {datetime.now(timezone.utc).isoformat()}
+Details  : {message}
+
+The bot has recovered from this condition and appears to be operating normally again."""
+        else:
+            subject = f"[BOT HEALTH] WARNING - {issue_key}"
+            body = f"""BOT HEALTH WARNING - POSSIBLE SILENT FAILURE
+-----------------------------
+Issue    : {issue_key}
+Time     : {datetime.now(timezone.utc).isoformat()}
+Details  : {message}
+
+This means the bot may be running without actually evaluating or executing
+trades, even though no crash has occurred. Check the bot logs and dashboard
+as soon as possible.
+
+You will get a RESOLVED email automatically once this condition clears.
+This alert will not repeat for the same ongoing issue for at least
+{HEALTH_ALERT_COOLDOWN // 60} minutes."""
+
         return self._send_email(subject, body)
 
 
@@ -667,46 +636,55 @@ NOTES
 
 class WSState(Enum):
     DISCONNECTED = "disconnected"
-    CONNECTING   = "connecting"
-    CONNECTED    = "connected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
     RECONNECTING = "reconnecting"
-    STOPPED      = "stopped"
+    STOPPED = "stopped"
 
 
 @dataclass
 class WSConfig:
     url: str = "wss://socket.india.delta.exchange"
     ping_interval: int = 20
-    ping_timeout: int  = 10
-    max_reconnect_attempts: int    = 10
-    reconnect_base_delay: int      = 5
-    reconnect_max_delay: int       = 30
+    ping_timeout: int = 10
+    max_reconnect_attempts: int = 10
+    reconnect_base_delay: int = 5
+    reconnect_max_delay: int = 30
     reconnect_backoff_multiplier: int = 2
 
 
 class DeltaWebSocket:
     def __init__(self, config: Optional[WSConfig] = None):
-        self.config   = config or WSConfig()
-        self._state   = WSState.DISCONNECTED
+        self.config = config or WSConfig()
+        self._state = WSState.DISCONNECTED
         self._ws: Optional[websocket.WebSocketApp] = None
-        self._thread: Optional[threading.Thread]   = None
-        self._thread_lock       = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._thread_lock = threading.Lock()
         self._subscriptions: Dict[str, List[str]] = {}
         self._subscription_lock = threading.Lock()
         self._reconnect_attempts = 0
-        self._reconnect_delay    = self.config.reconnect_base_delay
-        self._should_stop        = threading.Event()
-        self._on_candle_callback:       Optional[callable] = None
-        self._on_connected_callback:    Optional[callable] = None
+        self._reconnect_delay = self.config.reconnect_base_delay
+        self._should_stop = threading.Event()
+        self._on_candle_callback: Optional[callable] = None
+        self._on_connected_callback: Optional[callable] = None
         self._on_disconnected_callback: Optional[callable] = None
-        self._on_error_callback:        Optional[callable] = None
-        self._on_reconnect_callback:    Optional[callable] = None
+        self._on_error_callback: Optional[callable] = None
+        self._on_reconnect_callback: Optional[callable] = None
 
-    def set_candle_callback(self, cb: callable)       -> None: self._on_candle_callback       = cb
-    def set_connected_callback(self, cb: callable)    -> None: self._on_connected_callback    = cb
-    def set_disconnected_callback(self, cb: callable) -> None: self._on_disconnected_callback = cb
-    def set_error_callback(self, cb: callable)        -> None: self._on_error_callback        = cb
-    def set_reconnect_callback(self, cb: callable)    -> None: self._on_reconnect_callback    = cb
+    def set_candle_callback(self, cb: callable) -> None:
+        self._on_candle_callback = cb
+
+    def set_connected_callback(self, cb: callable) -> None:
+        self._on_connected_callback = cb
+
+    def set_disconnected_callback(self, cb: callable) -> None:
+        self._on_disconnected_callback = cb
+
+    def set_error_callback(self, cb: callable) -> None:
+        self._on_error_callback = cb
+
+    def set_reconnect_callback(self, cb: callable) -> None:
+        self._on_reconnect_callback = cb
 
     def subscribe(self, timeframe: str, symbols: List[str]) -> None:
         channel = self._get_channel_name(timeframe)
@@ -729,7 +707,7 @@ class DeltaWebSocket:
             if self._thread and self._thread.is_alive():
                 return
             self._should_stop.clear()
-            self._state  = WSState.CONNECTING
+            self._state = WSState.CONNECTING
             self._thread = threading.Thread(
                 target=self._run_forever, daemon=True, name="DeltaWebSocket"
             )
@@ -739,14 +717,19 @@ class DeltaWebSocket:
         self._should_stop.set()
         self._state = WSState.STOPPED
         if self._ws:
-            try: self._ws.close()
-            except Exception: pass
+            try:
+                self._ws.close()
+            except Exception:
+                pass
         with self._thread_lock:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=5.0)
 
-    def is_connected(self) -> bool: return self._state == WSState.CONNECTED
-    def get_state(self) -> str:     return self._state.value
+    def is_connected(self) -> bool:
+        return self._state == WSState.CONNECTED
+
+    def get_state(self) -> str:
+        return self._state.value
 
     def _get_channel_name(self, timeframe: str) -> str:
         return {
@@ -761,8 +744,10 @@ class DeltaWebSocket:
                 self._connect()
                 if not self._should_stop.is_set() and self._state != WSState.STOPPED:
                     if not first_connect and self._on_reconnect_callback:
-                        try: self._on_reconnect_callback()
-                        except Exception as e: _log("error", "WS", f"Reconnect callback error: {e}")
+                        try:
+                            self._on_reconnect_callback()
+                        except Exception as e:
+                            _log("error", "WS", f"Reconnect callback error: {e}")
                     first_connect = False
                     self._reconnect()
             except Exception as e:
@@ -788,13 +773,16 @@ class DeltaWebSocket:
         if self._reconnect_attempts >= self.config.max_reconnect_attempts:
             self._state = WSState.DISCONNECTED
             if self._on_disconnected_callback:
-                try: self._on_disconnected_callback()
-                except Exception: pass
+                try:
+                    self._on_disconnected_callback()
+                except Exception:
+                    pass
             return
         self._reconnect_attempts += 1
         self._state = WSState.RECONNECTING
         for _ in range(self._reconnect_delay):
-            if self._should_stop.is_set(): return
+            if self._should_stop.is_set():
+                return
             time.sleep(1)
         self._reconnect_delay = min(
             self._reconnect_delay * self.config.reconnect_backoff_multiplier,
@@ -802,44 +790,57 @@ class DeltaWebSocket:
         )
 
     def _on_open(self, ws) -> None:
-        self._state              = WSState.CONNECTED
+        self._state = WSState.CONNECTED
         self._reconnect_attempts = 0
-        self._reconnect_delay    = self.config.reconnect_base_delay
+        self._reconnect_delay = self.config.reconnect_base_delay
         with self._subscription_lock:
             for channel, symbols in self._subscriptions.items():
-                if symbols: self._send_subscription(channel, symbols)
+                if symbols:
+                    self._send_subscription(channel, symbols)
         if self._on_connected_callback:
-            try: self._on_connected_callback()
-            except Exception: pass
+            try:
+                self._on_connected_callback()
+            except Exception:
+                pass
 
     def _send_subscription(self, channel: str, symbols: List[str]) -> None:
-        if not self._ws: return
+        if not self._ws:
+            return
         msg = {"type": "subscribe", "payload": {"channels": [{"name": channel, "symbols": symbols}]}}
-        try: self._ws.send(json.dumps(msg))
-        except Exception as e: _log("error", "WS", f"Failed to send subscription: {e}")
+        try:
+            self._ws.send(json.dumps(msg))
+        except Exception as e:
+            _log("error", "WS", f"Failed to send subscription: {e}")
 
     def _on_message(self, ws, message: str) -> None:
         try:
-            data     = json.loads(message)
+            data = json.loads(message)
             msg_type = data.get("type", "")
-            if msg_type in ("subscribe", "error"): return
+            if msg_type in ("subscribe", "error"):
+                return
             candle_data = self._parse_candle_message(data)
             if candle_data and self._on_candle_callback:
                 symbol = candle_data.get("symbol")
                 candle = candle_data.get("candle")
                 if symbol and candle:
-                    try: self._on_candle_callback(symbol, candle)
-                    except Exception as e: _log("error", "WS", f"Candle callback error: {e}")
-        except Exception: pass
+                    try:
+                        self._on_candle_callback(symbol, candle)
+                    except Exception as e:
+                        _log("error", "WS", f"Candle callback error: {e}")
+        except Exception:
+            pass
 
     def _parse_candle_message(self, data: dict) -> Optional[dict]:
         msg_type = data.get("type", "")
-        if not msg_type.startswith("candlestick_"): return None
+        if not msg_type.startswith("candlestick_"):
+            return None
         ws_symbol = data.get("symbol", "")
-        if not ws_symbol: return None
+        if not ws_symbol:
+            return None
         trading_symbol = ws_symbol if ws_symbol.endswith("_PERP") else ws_symbol + "_PERP"
         candle = self._normalize_candle_flat(data)
-        if candle is None: return None
+        if candle is None:
+            return None
         return {"symbol": trading_symbol, "candle": candle}
 
     def _normalize_candle_flat(self, data: dict) -> Optional[dict]:
@@ -847,26 +848,33 @@ class DeltaWebSocket:
             ts_raw = data.get("candle_start_time")
             if ts_raw is not None:
                 ts = int(ts_raw)
-                if ts > 1_000_000_000_000_000: ts = ts // 1_000_000_000
-                elif ts > 10_000_000_000:      ts = ts // 1_000
+                if ts > 1_000_000_000_000_000:
+                    ts = ts // 1_000_000_000
+                elif ts > 10_000_000_000:
+                    ts = ts // 1_000
             else:
+                ts = None
                 for key in ("time", "start", "t"):
                     v = data.get(key)
                     if v is not None:
                         ts = int(float(v))
-                        if ts > 10_000_000_000: ts = ts // 1_000
+                        if ts > 10_000_000_000:
+                            ts = ts // 1_000
                         break
-                else: return None
-            if ts <= 0: return None
+                if ts is None:
+                    return None
+            if ts <= 0:
+                return None
             return {
-                "time":   ts,
-                "open":   float(data.get("open",   0)),
-                "high":   float(data.get("high",   0)),
-                "low":    float(data.get("low",    0)),
-                "close":  float(data.get("close",  0)),
+                "time": ts,
+                "open": float(data.get("open", 0)),
+                "high": float(data.get("high", 0)),
+                "low": float(data.get("low", 0)),
+                "close": float(data.get("close", 0)),
                 "volume": float(data.get("volume", 0)),
             }
-        except (TypeError, ValueError): return None
+        except (TypeError, ValueError):
+            return None
 
     def _on_error(self, ws, error) -> None:
         error_msg = str(error)
@@ -883,60 +891,68 @@ class DeltaWebSocket:
 
 def to_trading_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
-    if s.endswith("_PERP"): s = s[:-5]
-    if s.endswith("USDT"):  s = s[:-4] + "USD"
+    if s.endswith("_PERP"):
+        s = s[:-5]
+    if s.endswith("USDT"):
+        s = s[:-4] + "USD"
     return s + "_PERP"
+
 
 def to_ws_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
-    if s.endswith("_PERP"): s = s[:-5]
-    if s.endswith("USDT"):  s = s[:-4] + "USD"
+    if s.endswith("_PERP"):
+        s = s[:-5]
+    if s.endswith("USDT"):
+        s = s[:-4] + "USD"
     return s
+
 
 def to_candle_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
-    if s.endswith("_PERP"): s = s[:-5]
-    if s.endswith("USDT"):  s = s[:-4] + "USD"
+    if s.endswith("_PERP"):
+        s = s[:-5]
+    if s.endswith("USDT"):
+        s = s[:-4] + "USD"
     return s
 
 
 # ================================================================
 #  7.  CONSTANTS
 # ================================================================
-REST_BASE_INDIA  = "https://api.india.delta.exchange"
+REST_BASE_INDIA = "https://api.india.delta.exchange"
 REST_BASE_GLOBAL = "https://api.delta.exchange"
 
-CANDLE_LIMIT        = 200
-MAX_RETRIES         = 3
-RETRY_DELAYS        = [5, 10, 15]
-TIMEOUT             = 30
+CANDLE_LIMIT = 200
+MAX_RETRIES = 3
+RETRY_DELAYS = [5, 10, 15]
+TIMEOUT = 30
 CANDLE_SAFETY_SHIFT = 1
 
-RSI_PERIOD      = 14
-RSI_OVERBOUGHT  = 55.0
-RSI_OVERSOLD    = 40.0
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 55.0
+RSI_OVERSOLD = 40.0
 RSI_MIN_CANDLES = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL = 0.5
-FILL_POLL_TIMEOUT  = 15
+FILL_POLL_TIMEOUT = 15
 
 DOJI_BODY_RATIO_MAX = 0.30
-TP_RR_RATIO         = 2.0
-TP_MAX_PCT          = 0.05
+TP_RR_RATIO = 2.0
+TP_MAX_PCT = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
 
 MIN_ENGULF_BODY_PCT = 0.30
 
-# ── Harami pattern tolerance ──
+# -- Harami pattern tolerance --
 HARAMI_BODY_TOLERANCE = 0.001
 
-# ── Range Break Strategy Constants ──
+# -- Range Break Strategy Constants --
 RANGE_BREAK_LOOKBACK = 7
 
-# ── Volatility Expansion Strategy Constants ──
+# -- Volatility Expansion Strategy Constants --
 VOL_EXP_LOOKBACK = 21
 
-# ── Support/Resistance Strategy Constants ──
+# -- Support/Resistance Strategy Constants --
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
 SR_MERGE_THRESHOLD = 0.005  # DEPRECATED - NO LONGER USED FOR MERGING
@@ -945,18 +961,24 @@ SR_MAX_LEVEL_AGE = 100  # Max age in candles
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
 
-# ── SuperTrend parameters ──
+# -- SuperTrend parameters --
 ST1_LENGTH = 14
 ST1_FACTOR = 2.0
 ST2_LENGTH = 21
 ST2_FACTOR = 1.0
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
-    "1m":  {"resolution": "1m",  "api_resolution": "1m",  "ws_channel": "candlestick_1m",  "secs": 60},
-    "5m":  {"resolution": "5m",  "api_resolution": "5m",  "ws_channel": "candlestick_5m",  "secs": 300},
+    "1m": {"resolution": "1m", "api_resolution": "1m", "ws_channel": "candlestick_1m", "secs": 60},
+    "5m": {"resolution": "5m", "api_resolution": "5m", "ws_channel": "candlestick_5m", "secs": 300},
     "15m": {"resolution": "15m", "api_resolution": "15m", "ws_channel": "candlestick_15m", "secs": 900},
-    "1h":  {"resolution": "1h",  "api_resolution": "1h",  "ws_channel": "candlestick_1h",  "secs": 3600},
+    "1h": {"resolution": "1h", "api_resolution": "1h", "ws_channel": "candlestick_1h", "secs": 3600},
 }
+
+# -- Watchdog / silent-failure health-check constants --
+WATCHDOG_CHECK_INTERVAL = 300      # how often the watchdog runs its checks (seconds)
+STALE_CANDLE_MULTIPLIER = 3        # alert if no candle close for N x timeframe
+EVAL_STALL_MULTIPLIER = 2          # alert if candles close but signal-eval never runs for N x timeframe
+HEALTH_ALERT_COOLDOWN = 3600       # don't re-alert the same ongoing issue more often than this (seconds)
 
 
 # ================================================================
@@ -977,14 +999,14 @@ def warm_up_connection() -> None:
 
 class APIRequestHandler:
     def __init__(self, api_key: str = "", api_secret: str = ""):
-        self.api_key    = api_key
+        self.api_key = api_key
         self.api_secret = api_secret
-        self.session    = requests.Session()
+        self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent":   "python-DeltaBot/13.4",
-            "Accept":       "application/json",
-            "Connection":   "keep-alive",
+            "User-Agent": "python-DeltaBot/13.5",
+            "Accept": "application/json",
+            "Connection": "keep-alive",
         })
         self.session.mount("https://", requests.adapters.HTTPAdapter(
             pool_connections=20, pool_maxsize=40, max_retries=0, pool_block=False
@@ -994,14 +1016,14 @@ class APIRequestHandler:
         return REST_BASE_INDIA
 
     def _sign_request(self, method: str, path: str,
-                      params: dict = None, body: dict = None) -> dict:
+                       params: dict = None, body: dict = None) -> dict:
         if not self.api_key or not self.api_secret:
             raise ValueError("API key/secret missing")
-        timestamp    = str(int(time.time()))
+        timestamp = str(int(time.time()))
         query_string = ""
         if params:
             sorted_params = sorted(params.items())
-            query_string  = "?" + urlencode(sorted_params)
+            query_string = "?" + urlencode(sorted_params)
         body_string = ""
         if body and method.upper() != "GET":
             body_string = json.dumps(body)
@@ -1017,8 +1039,8 @@ class APIRequestHandler:
                 params: dict = None, body: dict = None,
                 retry_count: int = 0) -> Optional[Dict]:
         base_url = self._get_base_url(endpoint_type)
-        url      = base_url + endpoint
-        headers  = {}
+        url = base_url + endpoint
+        headers = {}
         if endpoint_type == "private":
             headers = self._sign_request(method, endpoint, params, body)
         if body and method.upper() != "GET":
@@ -1034,8 +1056,10 @@ class APIRequestHandler:
                 response = self.session.delete(url, headers=headers, json=body, timeout=TIMEOUT)
             else:
                 raise ValueError(f"Unsupported method: {method}")
-            try: response_data = response.json()
-            except Exception: response_data = {"error": response.text}
+            try:
+                response_data = response.json()
+            except Exception:
+                response_data = {"error": response.text}
             if response.status_code == 401:
                 _log("error", "AUTH", f"Authentication failed (401). Response: {response_data}")
                 return None
@@ -1066,23 +1090,32 @@ class TimeframeSafe:
         k = key.strip().lower()
         if k not in TIMEFRAME_MAP:
             raise ValueError(f"[TIMEFRAME] '{k}' not valid. Choose from: {list(TIMEFRAME_MAP)}")
-        entry                = TIMEFRAME_MAP[k]
-        self._key            = k
-        self._resolution     = entry["resolution"]
+        entry = TIMEFRAME_MAP[k]
+        self._key = k
+        self._resolution = entry["resolution"]
         self._api_resolution = entry["api_resolution"]
-        self._ws_channel     = entry["ws_channel"]
-        self._secs           = entry["secs"]
+        self._ws_channel = entry["ws_channel"]
+        self._secs = entry["secs"]
 
     @property
-    def key(self)            -> str: return self._key
+    def key(self) -> str:
+        return self._key
+
     @property
-    def resolution(self)     -> str: return self._resolution
+    def resolution(self) -> str:
+        return self._resolution
+
     @property
-    def api_resolution(self) -> str: return self._api_resolution
+    def api_resolution(self) -> str:
+        return self._api_resolution
+
     @property
-    def ws_channel(self)     -> str: return self._ws_channel
+    def ws_channel(self) -> str:
+        return self._ws_channel
+
     @property
-    def secs(self)           -> int: return self._secs
+    def secs(self) -> int:
+        return self._secs
 
 
 # ================================================================
@@ -1094,16 +1127,22 @@ _CANDLE_FIELDS = ("time", "open", "high", "low", "close", "volume")
 
 def validate_candle(candle: dict, symbol: str = "") -> bool:
     for f in _CANDLE_FIELDS:
-        if f not in candle or candle[f] is None: return False
+        if f not in candle or candle[f] is None:
+            return False
     for f in ("open", "high", "low", "close", "volume"):
         try:
             v = float(candle[f])
-        except (TypeError, ValueError): return False
-        if math.isnan(v) or math.isinf(v): return False
-    if candle["time"] <= 0:           return False
-    if candle["high"] < candle["low"]: return False
+        except (TypeError, ValueError):
+            return False
+        if math.isnan(v) or math.isinf(v):
+            return False
+    if candle["time"] <= 0:
+        return False
+    if candle["high"] < candle["low"]:
+        return False
     for f in ("open", "high", "low", "close"):
-        if candle[f] <= 0: return False
+        if candle[f] <= 0:
+            return False
     return True
 
 
@@ -1114,9 +1153,9 @@ def validate_candle(candle: dict, symbol: str = "") -> bool:
 def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optional[float]:
     if len(closed_candles) < period + 1:
         return None
-    closes  = [float(c["close"]) for c in closed_candles]
+    closes = [float(c["close"]) for c in closed_candles]
     changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    seed    = changes[:period]
+    seed = changes[:period]
     avg_gain = sum(max(ch, 0.0) for ch in seed) / period
     avg_loss = sum(abs(min(ch, 0.0)) for ch in seed) / period
     for ch in changes[period:]:
@@ -1124,19 +1163,19 @@ def compute_rsi(closed_candles: List[dict], period: int = RSI_PERIOD) -> Optiona
         avg_loss = (avg_loss * (period - 1) + abs(min(ch, 0.0))) / period
     if avg_loss == 0:
         return 100.0
-    rs  = avg_gain / avg_loss
+    rs = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return round(rsi, 2)
 
 
 def check_rsi_filter(closed_candles: List[dict], symbol: str = "",
-                     period: int = RSI_PERIOD,
-                     threshold: float = RSI_OVERBOUGHT) -> Tuple[bool, Optional[float]]:
+                      period: int = RSI_PERIOD,
+                      threshold: float = RSI_OVERBOUGHT) -> Tuple[bool, Optional[float]]:
     rsi = compute_rsi(closed_candles, period)
     if rsi is None:
         _log("warning", f"RSI [{symbol}]",
              f"Insufficient candles for RSI({period}): have {len(closed_candles)}, "
-             f"need {period + 1} — BLOCKING")
+             f"need {period + 1} - BLOCKING")
         return False, None
     _log("info", f"RSI [{symbol}]", f"RSI({period}) = {rsi:.2f}  (threshold > {threshold})")
     return (rsi > threshold), rsi
@@ -1153,8 +1192,8 @@ def compute_atr(candles: List[dict], period: int) -> List[float]:
 
     trs = [0.0]
     for i in range(1, n):
-        h  = candles[i]["high"]
-        l  = candles[i]["low"]
+        h = candles[i]["high"]
+        l = candles[i]["low"]
         pc = candles[i - 1]["close"]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
@@ -1163,7 +1202,7 @@ def compute_atr(candles: List[dict], period: int) -> List[float]:
     if n < period + 1:
         return atrs
 
-    seed = sum(trs[1 : period + 1]) / period
+    seed = sum(trs[1: period + 1]) / period
     atrs[period] = seed
     alpha = 1.0 / period
     for i in range(period + 1, n):
@@ -1174,12 +1213,12 @@ def compute_atr(candles: List[dict], period: int) -> List[float]:
 
 def compute_supertrend(candles: List[dict],
                         length: int, factor: float) -> List[Optional[bool]]:
-    n    = len(candles)
+    n = len(candles)
     atrs = compute_atr(candles, length)
 
     directions: List[Optional[bool]] = [None] * n
-    upper_bands  = [0.0] * n
-    lower_bands  = [0.0] * n
+    upper_bands = [0.0] * n
+    lower_bands = [0.0] * n
 
     start = length
 
@@ -1193,7 +1232,7 @@ def compute_supertrend(candles: List[dict],
         if i == start:
             upper_bands[i] = raw_upper
             lower_bands[i] = raw_lower
-            directions[i]  = candles[i]["close"] >= hl2
+            directions[i] = candles[i]["close"] >= hl2
         else:
             prev_upper = upper_bands[i - 1]
             prev_lower = lower_bands[i - 1]
@@ -1209,7 +1248,7 @@ def compute_supertrend(candles: List[dict],
             )
 
             prev_dir = directions[i - 1]
-            close    = candles[i]["close"]
+            close = candles[i]["close"]
 
             if prev_dir is False:
                 directions[i] = close > upper_bands[i]
@@ -1246,7 +1285,7 @@ def both_supertrends_bearish(candles: List[dict]) -> bool:
 
 def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optional[float]]:
     def _get_last_band(cndls, length, factor):
-        n    = len(cndls)
+        n = len(cndls)
         atrs = compute_atr(cndls, length)
         if n < length + 1:
             return None
@@ -1255,14 +1294,14 @@ def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optiona
         dirs: List[Optional[bool]] = [None] * n
         start = length
         for i in range(start, n):
-            hl2       = (cndls[i]["high"] + cndls[i]["low"]) / 2.0
-            atr       = atrs[i]
+            hl2 = (cndls[i]["high"] + cndls[i]["low"]) / 2.0
+            atr = atrs[i]
             raw_upper = hl2 + factor * atr
             raw_lower = hl2 - factor * atr
             if i == start:
                 upper_bands[i] = raw_upper
                 lower_bands[i] = raw_lower
-                dirs[i]        = cndls[i]["close"] >= hl2
+                dirs[i] = cndls[i]["close"] >= hl2
             else:
                 prev_upper = upper_bands[i - 1]
                 prev_lower = lower_bands[i - 1]
@@ -1275,8 +1314,8 @@ def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optiona
                     raw_upper if raw_upper < prev_upper or prev_close > prev_upper
                     else prev_upper
                 )
-                prev_dir   = dirs[i - 1]
-                close      = cndls[i]["close"]
+                prev_dir = dirs[i - 1]
+                close = cndls[i]["close"]
                 if prev_dir is False:
                     dirs[i] = close > upper_bands[i]
                 elif prev_dir is True:
@@ -1298,16 +1337,34 @@ def get_supertrend_values(candles: List[dict]) -> Tuple[Optional[float], Optiona
 #  13. STRATEGY HELPERS
 # ================================================================
 
-def candle_body(c: dict)  -> float: return abs(c["close"] - c["open"])
-def upper_wick(c: dict)   -> float: return c["high"] - max(c["open"], c["close"])
-def lower_wick(c: dict)   -> float: return min(c["open"], c["close"]) - c["low"]
-def candle_range(c: dict) -> float: return c["high"] - c["low"]
-def is_bullish(c: dict)   -> bool:  return c["close"] > c["open"]
-def is_bearish(c: dict)   -> bool:  return c["close"] < c["open"]
+def candle_body(c: dict) -> float:
+    return abs(c["close"] - c["open"])
+
+
+def upper_wick(c: dict) -> float:
+    return c["high"] - max(c["open"], c["close"])
+
+
+def lower_wick(c: dict) -> float:
+    return min(c["open"], c["close"]) - c["low"]
+
+
+def candle_range(c: dict) -> float:
+    return c["high"] - c["low"]
+
+
+def is_bullish(c: dict) -> bool:
+    return c["close"] > c["open"]
+
+
+def is_bearish(c: dict) -> bool:
+    return c["close"] < c["open"]
+
 
 def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
     r = candle_range(c)
-    if r <= 0: return False
+    if r <= 0:
+        return False
     return (candle_body(c) / r) <= body_ratio_max
 
 
@@ -1318,11 +1375,11 @@ def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
 def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 4:
         return False, None, ""
-    
+
     signal = candles[-2]
     bearish_c = candles[-3]
     bullish_c = candles[-4]
-    
+
     if not is_bullish(bullish_c):
         return False, None, ""
     if not is_bearish(bearish_c):
@@ -1331,11 +1388,11 @@ def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[d
         return False, None, ""
     if signal["close"] >= bullish_c["low"]:
         return False, None, ""
-    
+
     sc = signal.copy()
     sc["pattern_high"] = max(bullish_c["high"], bearish_c["high"], signal["high"])
-    
-    _log("info", "STRATEGY_1_SHORT", 
+
+    _log("info", "STRATEGY_1_SHORT",
          f"Signal close {signal['close']} < bullish low {bullish_c['low']}")
     return True, sc, "STRATEGY_1_SHORT"
 
@@ -1343,12 +1400,12 @@ def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[d
 def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 5:
         return False, None, ""
-    
+
     signal_c = candles[-2]
     doji_c = candles[-3]
     bullish_2 = candles[-4]
     bullish_1 = candles[-5]
-    
+
     if not is_bullish(bullish_1):
         return False, None, ""
     if not is_bullish(bullish_2):
@@ -1361,14 +1418,14 @@ def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[d
         return False, None, ""
     if signal_c["close"] >= doji_c["low"]:
         return False, None, ""
-    
+
     result = signal_c.copy()
     result["doji_low"] = doji_c["low"]
     result["pattern_high"] = doji_c["high"]
-    
-    _log("info", "BEARISH_DOJI", 
+
+    _log("info", "BEARISH_DOJI",
          f"Bullish breakout: C2 close {smart_fmt(bullish_2['close'])} > C1 close {smart_fmt(bullish_1['close'])} | "
-         f"Doji (body ratio: {candle_body(doji_c)/candle_range(doji_c)*100:.1f}%) → Bearish confirmation: "
+         f"Doji (body ratio: {candle_body(doji_c) / candle_range(doji_c) * 100:.1f}%) -> Bearish confirmation: "
          f"Signal close {smart_fmt(signal_c['close'])} < doji low {smart_fmt(doji_c['low'])}")
     return True, result, "BEARISH_DOJI"
 
@@ -1377,31 +1434,31 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 3:
         return False, None, ""
-    
+
     confirm_candle = candles[-2]
     break_candle = candles[-3]
     range_candles = candles[-(lookback + 3):-3]
     if len(range_candles) != lookback:
         return False, None, ""
-    
+
     range_high = max(c["high"] for c in range_candles)
     range_low = min(c["low"] for c in range_candles)
     range_size = range_high - range_low
-    
+
     if range_size <= 0:
         return False, None, ""
-    
+
     if break_candle["close"] >= range_low:
         return False, None, ""
     if not is_bearish(confirm_candle):
         return False, None, ""
     if confirm_candle["close"] >= break_candle["close"]:
         return False, None, ""
-    
+
     confirm_candle_copy = confirm_candle.copy()
     confirm_candle_copy["pattern_high"] = break_candle["high"]
-    
-    _log("info", "RANGE_BREAK_SHORT", 
+
+    _log("info", "RANGE_BREAK_SHORT",
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {smart_fmt(break_candle['close'])} < range low | "
          f"Confirm close {confirm_candle['close']} < break close")
@@ -1412,24 +1469,24 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 2:
         return False, None, ""
-    
+
     current = candles[-2]
     prev_candles = candles[-(lookback + 2):-2]
     if len(prev_candles) < lookback:
         return False, None, ""
-    
+
     lowest_low = min(c["low"] for c in prev_candles)
-    
+
     if current["close"] >= lowest_low:
         return False, None, ""
     if not is_bearish(current):
         return False, None, ""
-    
+
     current_copy = current.copy()
     current_copy["pattern_high"] = current["high"]
     current_copy["breakout_level"] = lowest_low
-    
-    _log("info", "VOL_EXPANSION_SHORT", 
+
+    _log("info", "VOL_EXPANSION_SHORT",
          f"Break below 21-candle low {smart_fmt(lowest_low)} | "
          f"Close {smart_fmt(current['close'])} < low | NO WICK CONDITION")
     return True, current_copy, "VOL_EXPANSION_SHORT"
@@ -1446,59 +1503,53 @@ def check_short_signal_support_resistance_manager(candles: List[dict], sr_manage
     """
     if len(candles) < 4:
         return False, None, ""
-    
-    confirm_candle = candles[-2]  # Confirmation candle (last closed)
-    break_candle = candles[-3]    # Break candle
-    
-    # Get ALL support levels
+
+    confirm_candle = candles[-2]
+    break_candle = candles[-3]
+
     with sr_manager._lock:
-        valid_supports = [l for l in sr_manager.support_levels 
-                         if l["strength"] >= sr_manager.min_strength]
-    
+        valid_supports = [l for l in sr_manager.support_levels
+                           if l["strength"] >= sr_manager.min_strength]
+
     if not valid_supports:
         return False, None, ""
-    
-    # Sort supports by price (highest first - nearest to current price)
+
     valid_supports_sorted = sorted(valid_supports, key=lambda x: x["price"], reverse=True)
-    
-    current_price = candles[-1]["close"]  # Current forming candle
-    
+
+    current_price = candles[-1]["close"]
+
     for level_dict in valid_supports_sorted:
         support = level_dict["price"]
-        
-        # Allow up to 50% deviation to catch large breakdowns
+
         if abs(support - current_price) > current_price * 0.50:
             continue
-        
-        # Break candle must CLOSE below support
+
         if break_candle["close"] >= support:
             continue
-        
-        # Confirmation candle must be bearish
+
         if not is_bearish(confirm_candle):
             continue
-        
-        # Confirmation candle must CLOSE below break candle close
+
         if confirm_candle["close"] >= break_candle["close"]:
             continue
-        
+
         signal_candle = confirm_candle.copy()
-        signal_candle["pattern_high"] = confirm_candle["high"]  # SL at confirmation high
+        signal_candle["pattern_high"] = confirm_candle["high"]
         signal_candle["breakout_level"] = support
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
         signal_candle["break_candle_close"] = break_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "SUPPORT_BREAKDOWN_SHORT", 
+
+        stars = "*" * level_dict["strength"]
+
+        _log("info", "SUPPORT_BREAKDOWN_SHORT",
              f"SHORT: Support {smart_fmt(support)} broken (break close {smart_fmt(break_candle['close'])}) "
              f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < break close "
-             f"(Strength: {stars}, {level_dict['touches']} touches) → TRADE IMMEDIATE")
-        
+             f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
+
         return True, signal_candle, "SUPPORT_BREAKDOWN_SHORT"
-    
+
     return False, None, ""
 
 
@@ -1513,52 +1564,52 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
     """
     if len(candles) < 4:
         return False, None, ""
-    
-    false_breakout_candle = candles[-3]  # False breakout candle
-    confirm_candle = candles[-2]         # Confirmation candle (last closed)
-    
+
+    false_breakout_candle = candles[-3]
+    confirm_candle = candles[-2]
+
     if not is_bearish(false_breakout_candle):
         return False, None, ""
-    
+
     resistances, _ = sr_manager.get_levels_near_price(false_breakout_candle["high"], tolerance=0.02)
-    
+
     if not resistances:
         return False, None, ""
-    
+
     for level_dict in resistances:
         resistance = level_dict["price"]
-        
+
         if false_breakout_candle["high"] <= resistance:
             continue
-        
+
         if false_breakout_candle["close"] >= resistance:
             continue
-        
+
         if not is_bearish(confirm_candle):
             continue
-        
+
         if confirm_candle["close"] >= false_breakout_candle["close"]:
             continue
-        
+
         signal_candle = confirm_candle.copy()
-        signal_candle["pattern_high"] = false_breakout_candle["high"]  # SL at false breakout high
+        signal_candle["pattern_high"] = false_breakout_candle["high"]
         signal_candle["breakout_level"] = resistance
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
         signal_candle["false_breakout_high"] = false_breakout_candle["high"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT", 
+
+        stars = "*" * level_dict["strength"]
+
+        _log("info", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT",
              f"SHORT: Resistance false breakout reversal at {smart_fmt(resistance)} "
              f"(High {smart_fmt(false_breakout_candle['high'])} > Resistance > Close {smart_fmt(false_breakout_candle['close'])}) "
              f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout close "
-             f"(Strength: {stars}, {level_dict['touches']} touches) → TRADE IMMEDIATE")
-        
+             f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
+
         return True, signal_candle, "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-    
+
     return False, None, ""
 
 
@@ -1569,11 +1620,11 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
 def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 4:
         return False, None, ""
-    
+
     signal = candles[-2]
     bullish_c = candles[-3]
     bearish_c = candles[-4]
-    
+
     if not is_bearish(bearish_c):
         return False, None, ""
     if not is_bullish(bullish_c):
@@ -1582,11 +1633,11 @@ def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[di
         return False, None, ""
     if signal["close"] <= bearish_c["high"]:
         return False, None, ""
-    
+
     sc = signal.copy()
     sc["pattern_low"] = min(bearish_c["low"], bullish_c["low"], signal["low"])
-    
-    _log("info", "STRATEGY_1_LONG", 
+
+    _log("info", "STRATEGY_1_LONG",
          f"Signal close {signal['close']} > bearish high {bearish_c['high']}")
     return True, sc, "STRATEGY_1_LONG"
 
@@ -1594,12 +1645,12 @@ def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[di
 def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 5:
         return False, None, ""
-    
+
     signal_c = candles[-2]
     doji_c = candles[-3]
     bearish_2 = candles[-4]
     bearish_1 = candles[-5]
-    
+
     if not is_bearish(bearish_1):
         return False, None, ""
     if not is_bearish(bearish_2):
@@ -1612,14 +1663,14 @@ def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[di
         return False, None, ""
     if signal_c["close"] <= doji_c["high"]:
         return False, None, ""
-    
+
     result = signal_c.copy()
     result["doji_high"] = doji_c["high"]
     result["pattern_low"] = doji_c["low"]
-    
-    _log("info", "BULLISH_DOJI", 
+
+    _log("info", "BULLISH_DOJI",
          f"Bearish breakout: C2 close {smart_fmt(bearish_2['close'])} < C1 close {smart_fmt(bearish_1['close'])} | "
-         f"Doji (body ratio: {candle_body(doji_c)/candle_range(doji_c)*100:.1f}%) → Bullish confirmation: "
+         f"Doji (body ratio: {candle_body(doji_c) / candle_range(doji_c) * 100:.1f}%) -> Bullish confirmation: "
          f"Signal close {smart_fmt(signal_c['close'])} > doji high {smart_fmt(doji_c['high'])}")
     return True, result, "BULLISH_DOJI"
 
@@ -1628,31 +1679,31 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 3:
         return False, None, ""
-    
+
     confirm_candle = candles[-2]
     break_candle = candles[-3]
     range_candles = candles[-(lookback + 3):-3]
     if len(range_candles) != lookback:
         return False, None, ""
-    
+
     range_high = max(c["high"] for c in range_candles)
     range_low = min(c["low"] for c in range_candles)
     range_size = range_high - range_low
-    
+
     if range_size <= 0:
         return False, None, ""
-    
+
     if break_candle["close"] <= range_high:
         return False, None, ""
     if not is_bullish(confirm_candle):
         return False, None, ""
     if confirm_candle["close"] <= break_candle["close"]:
         return False, None, ""
-    
+
     confirm_candle_copy = confirm_candle.copy()
     confirm_candle_copy["pattern_low"] = break_candle["low"]
-    
-    _log("info", "RANGE_BREAK_LONG", 
+
+    _log("info", "RANGE_BREAK_LONG",
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {break_candle['close']} > range high | "
          f"Confirm close {confirm_candle['close']} > break close")
@@ -1663,24 +1714,24 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
     lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 2:
         return False, None, ""
-    
+
     current = candles[-2]
     prev_candles = candles[-(lookback + 2):-2]
     if len(prev_candles) < lookback:
         return False, None, ""
-    
+
     highest_high = max(c["high"] for c in prev_candles)
-    
+
     if current["close"] <= highest_high:
         return False, None, ""
     if not is_bullish(current):
         return False, None, ""
-    
+
     current_copy = current.copy()
     current_copy["pattern_low"] = current["low"]
     current_copy["breakout_level"] = highest_high
-    
-    _log("info", "VOL_EXPANSION_LONG", 
+
+    _log("info", "VOL_EXPANSION_LONG",
          f"Break above 21-candle high {smart_fmt(highest_high)} | "
          f"Close {smart_fmt(current['close'])} > high | NO WICK CONDITION")
     return True, current_copy, "VOL_EXPANSION_LONG"
@@ -1697,59 +1748,53 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
     """
     if len(candles) < 4:
         return False, None, ""
-    
-    confirm_candle = candles[-2]  # Confirmation candle (last closed)
-    break_candle = candles[-3]    # Break candle
-    
-    # Get ALL resistance levels
+
+    confirm_candle = candles[-2]
+    break_candle = candles[-3]
+
     with sr_manager._lock:
-        valid_resistances = [l for l in sr_manager.resistance_levels 
-                            if l["strength"] >= sr_manager.min_strength]
-    
+        valid_resistances = [l for l in sr_manager.resistance_levels
+                              if l["strength"] >= sr_manager.min_strength]
+
     if not valid_resistances:
         return False, None, ""
-    
-    # Sort resistances by price (lowest first - nearest to current price)
+
     valid_resistances_sorted = sorted(valid_resistances, key=lambda x: x["price"])
-    
-    current_price = candles[-1]["close"]  # Current forming candle
-    
+
+    current_price = candles[-1]["close"]
+
     for level_dict in valid_resistances_sorted:
         resistance = level_dict["price"]
-        
-        # Allow up to 50% deviation to catch large breakouts
+
         if abs(resistance - current_price) > current_price * 0.50:
             continue
-        
-        # Break candle must CLOSE above resistance
+
         if break_candle["close"] <= resistance:
             continue
-        
-        # Confirmation candle must be bullish
+
         if not is_bullish(confirm_candle):
             continue
-        
-        # Confirmation candle must CLOSE above break candle close
+
         if confirm_candle["close"] <= break_candle["close"]:
             continue
-        
+
         signal_candle = confirm_candle.copy()
-        signal_candle["pattern_low"] = confirm_candle["low"]  # SL at confirmation low
+        signal_candle["pattern_low"] = confirm_candle["low"]
         signal_candle["breakout_level"] = resistance
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
         signal_candle["break_candle_close"] = break_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "RESISTANCE_BREAKOUT_LONG", 
+
+        stars = "*" * level_dict["strength"]
+
+        _log("info", "RESISTANCE_BREAKOUT_LONG",
              f"LONG: Resistance {smart_fmt(resistance)} broken (break close {smart_fmt(break_candle['close'])}) "
              f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > break close "
-             f"(Strength: {stars}, {level_dict['touches']} touches) → TRADE IMMEDIATE")
-        
+             f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
+
         return True, signal_candle, "RESISTANCE_BREAKOUT_LONG"
-    
+
     return False, None, ""
 
 
@@ -1764,52 +1809,52 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
     """
     if len(candles) < 4:
         return False, None, ""
-    
-    false_breakout_candle = candles[-3]  # False breakout candle
-    confirm_candle = candles[-2]         # Confirmation candle (last closed)
-    
+
+    false_breakout_candle = candles[-3]
+    confirm_candle = candles[-2]
+
     if not is_bullish(false_breakout_candle):
         return False, None, ""
-    
+
     _, supports = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
-    
+
     if not supports:
         return False, None, ""
-    
+
     for level_dict in supports:
         support = level_dict["price"]
-        
+
         if false_breakout_candle["low"] >= support:
             continue
-        
+
         if false_breakout_candle["close"] <= support:
             continue
-        
+
         if not is_bullish(confirm_candle):
             continue
-        
+
         if confirm_candle["close"] <= false_breakout_candle["close"]:
             continue
-        
+
         signal_candle = confirm_candle.copy()
-        signal_candle["pattern_low"] = false_breakout_candle["low"]  # SL at false breakout low
+        signal_candle["pattern_low"] = false_breakout_candle["low"]
         signal_candle["breakout_level"] = support
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
         signal_candle["false_breakout_low"] = false_breakout_candle["low"]
-        
-        stars = "★" * level_dict["strength"]
-        
-        _log("info", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG", 
+
+        stars = "*" * level_dict["strength"]
+
+        _log("info", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG",
              f"LONG: Support false breakout reversal at {smart_fmt(support)} "
              f"(Low {smart_fmt(false_breakout_candle['low'])} < Support < Close {smart_fmt(false_breakout_candle['close'])}) "
              f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout close "
-             f"(Strength: {stars}, {level_dict['touches']} touches) → TRADE IMMEDIATE")
-        
+             f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
+
         return True, signal_candle, "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-    
+
     return False, None, ""
 
 
@@ -1820,58 +1865,58 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
 def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 3:
         return False, None, ""
-    
+
     signal = candles[-2]
     prev = candles[-3]
-    
+
     if not is_bullish(prev):
         return False, None, ""
     if not is_bearish(signal):
         return False, None, ""
     if signal["open"] <= prev["close"] or signal["close"] >= prev["open"]:
         return False, None, ""
-    
+
     signal_body = candle_body(signal)
     signal_range = candle_range(signal)
-    
+
     if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
         return False, None, ""
-    
+
     signal_candle = signal.copy()
     signal_candle["pattern_high"] = signal["high"]
-    
-    _log("info", "BEARISH_ENGULFING", 
+
+    _log("info", "BEARISH_ENGULFING",
          f"Bearish Engulfing: Signal body {smart_fmt(signal_body)} engulfed prev body "
-         f"(range ratio: {(signal_body/signal_range)*100:.1f}%)")
+         f"(range ratio: {(signal_body / signal_range) * 100:.1f}%)")
     return True, signal_candle, "BEARISH_ENGULFING"
 
 
 def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 3:
         return False, None, ""
-    
+
     signal = candles[-2]
     prev = candles[-3]
-    
+
     if not is_bearish(prev):
         return False, None, ""
     if not is_bullish(signal):
         return False, None, ""
     if signal["open"] >= prev["close"] or signal["close"] <= prev["open"]:
         return False, None, ""
-    
+
     signal_body = candle_body(signal)
     signal_range = candle_range(signal)
-    
+
     if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
         return False, None, ""
-    
+
     signal_candle = signal.copy()
     signal_candle["pattern_low"] = signal["low"]
-    
-    _log("info", "BULLISH_ENGULFING", 
+
+    _log("info", "BULLISH_ENGULFING",
          f"Bullish Engulfing: Signal body {smart_fmt(signal_body)} engulfed prev body "
-         f"(range ratio: {(signal_body/signal_range)*100:.1f}%)")
+         f"(range ratio: {(signal_body / signal_range) * 100:.1f}%)")
     return True, signal_candle, "BULLISH_ENGULFING"
 
 
@@ -1882,70 +1927,70 @@ def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Opti
 def check_short_signal_bearish_harami(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 3:
         return False, None, ""
-    
+
     signal = candles[-2]
     prev = candles[-3]
-    
+
     if not is_bullish(prev):
         return False, None, ""
     if not is_bearish(signal):
         return False, None, ""
-    
+
     prev_body_top = max(prev["open"], prev["close"])
     prev_body_bottom = min(prev["open"], prev["close"])
     signal_body_top = max(signal["open"], signal["close"])
     signal_body_bottom = min(signal["open"], signal["close"])
-    
+
     tolerance_amount = prev_body_top * harami_tolerance
-    
+
     if signal_body_top > prev_body_top + tolerance_amount:
         return False, None, ""
     if signal_body_bottom < prev_body_bottom - tolerance_amount:
         return False, None, ""
     if signal_body_top >= prev_body_top and signal_body_bottom <= prev_body_bottom:
         return False, None, ""
-    
+
     signal_candle = signal.copy()
     signal_candle["pattern_high"] = prev["high"]
     signal_candle["harami_tolerance"] = harami_tolerance
-    
-    _log("info", "BEARISH_HARAMI", 
-         f"Bearish Harami: Signal body inside prev body (tolerance: {harami_tolerance*100:.2f}%)")
+
+    _log("info", "BEARISH_HARAMI",
+         f"Bearish Harami: Signal body inside prev body (tolerance: {harami_tolerance * 100:.2f}%)")
     return True, signal_candle, "BEARISH_HARAMI"
 
 
 def check_long_signal_bullish_harami(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
     if len(candles) < 3:
         return False, None, ""
-    
+
     signal = candles[-2]
     prev = candles[-3]
-    
+
     if not is_bearish(prev):
         return False, None, ""
     if not is_bullish(signal):
         return False, None, ""
-    
+
     prev_body_top = max(prev["open"], prev["close"])
     prev_body_bottom = min(prev["open"], prev["close"])
     signal_body_top = max(signal["open"], signal["close"])
     signal_body_bottom = min(signal["open"], signal["close"])
-    
+
     tolerance_amount = prev_body_top * harami_tolerance
-    
+
     if signal_body_top > prev_body_top + tolerance_amount:
         return False, None, ""
     if signal_body_bottom < prev_body_bottom - tolerance_amount:
         return False, None, ""
     if signal_body_top >= prev_body_top and signal_body_bottom <= prev_body_bottom:
         return False, None, ""
-    
+
     signal_candle = signal.copy()
     signal_candle["pattern_low"] = prev["low"]
     signal_candle["harami_tolerance"] = harami_tolerance
-    
-    _log("info", "BULLISH_HARAMI", 
-         f"Bullish Harami: Signal body inside prev body (tolerance: {harami_tolerance*100:.2f}%)")
+
+    _log("info", "BULLISH_HARAMI",
+         f"Bullish Harami: Signal body inside prev body (tolerance: {harami_tolerance * 100:.2f}%)")
     return True, signal_candle, "BULLISH_HARAMI"
 
 
@@ -1962,32 +2007,32 @@ def check_short_signal(
     )
     if not rsi_passes:
         return False, None, "", rsi_value
-    
+
     triggered, signal_candle, strategy = check_short_signal_strategy_1(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
-    
+
     triggered, signal_candle, strategy = check_short_signal_strategy_5(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
-    
+
     triggered, signal_candle, strategy = check_short_signal_bearish_engulfing(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
-    
+
     triggered, signal_candle, strategy = check_short_signal_bearish_harami(candles, harami_tolerance)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
-    
+
     return False, None, "", rsi_value
 
 
 def check_short_signal_no_rsi(
-    candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "", 
+    candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
     harami_tolerance: float = HARAMI_BODY_TOLERANCE,
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
@@ -1995,46 +2040,41 @@ def check_short_signal_no_rsi(
     Check NO-RSI short strategies with detailed rejection logging.
     S/R strategies now execute immediately on confirmation candle close.
     """
-    # Range Break
     triggered, signal_candle, strategy = check_short_signal_range_break(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
         return True, signal_candle, strategy, None
-    
-    # Vol Expansion
+
     triggered, signal_candle, strategy = check_short_signal_vol_expansion(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
         return True, signal_candle, strategy, None
-    
-    # S/R Breakdown - with detailed rejection logging
+
     if len(candles) >= 4:
         confirm_candle = candles[-2]
         break_candle = candles[-3]
-        
-        # Get support levels
+
         with sr_manager._lock:
-            valid_supports = [l for l in sr_manager.support_levels 
-                             if l["strength"] >= sr_manager.min_strength]
-        
+            valid_supports = [l for l in sr_manager.support_levels
+                               if l["strength"] >= sr_manager.min_strength]
+
         if valid_supports:
             support_found = False
             for level_dict in valid_supports:
                 support = level_dict["price"]
                 current_price = candles[-1]["close"]
-                
+
                 if abs(support - current_price) > current_price * 0.50:
                     continue
-                
+
                 support_found = True
-                
-                # Check each condition and log if fails
+
                 if break_candle["close"] >= support:
                     rejection_reason = f"Break candle close {smart_fmt(break_candle['close'])} did not close below Support {smart_fmt(support)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
                     if notifier:
                         notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT", 
+                            symbol=symbol, direction="SHORT",
                             level_price=support,
                             breakout_close=break_candle["close"],
                             confirm_close=confirm_candle["close"],
@@ -2042,7 +2082,7 @@ def check_short_signal_no_rsi(
                             strategy="SUPPORT_BREAKDOWN_SHORT"
                         )
                     continue
-                
+
                 if not is_bearish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bearish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
@@ -2056,7 +2096,7 @@ def check_short_signal_no_rsi(
                             strategy="SUPPORT_BREAKDOWN_SHORT"
                         )
                     continue
-                
+
                 if confirm_candle["close"] >= break_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below break close {smart_fmt(break_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
@@ -2070,15 +2110,14 @@ def check_short_signal_no_rsi(
                             strategy="SUPPORT_BREAKDOWN_SHORT"
                         )
                     continue
-                
-                # All conditions passed - generate trade signal
+
                 triggered, signal_candle, strategy = check_short_signal_support_resistance_manager(candles, sr_manager)
                 if triggered:
-                    _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED IMMEDIATE")
+                    _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED IMMEDIATE")
                     return True, signal_candle, strategy, None
-                
+
                 break
-            
+
             if not support_found:
                 rejection_reason = "No matching Support level found (strength >= 1)"
                 _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
@@ -2103,20 +2142,19 @@ def check_short_signal_no_rsi(
                     rejection_reason=rejection_reason,
                     strategy="SUPPORT_BREAKDOWN_SHORT"
                 )
-    
-    # S/R False Breakout Reversal - with detailed rejection logging
+
     if len(candles) >= 4:
         false_breakout_candle = candles[-3]
         confirm_candle = candles[-2]
-        
+
         resistances, _ = sr_manager.get_levels_near_price(false_breakout_candle["high"], tolerance=0.02)
-        
+
         if resistances:
             resistance_found = False
             for level_dict in resistances:
                 resistance = level_dict["price"]
                 resistance_found = True
-                
+
                 if false_breakout_candle["high"] <= resistance:
                     rejection_reason = f"False breakout high {smart_fmt(false_breakout_candle['high'])} not above Resistance {smart_fmt(resistance)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
@@ -2130,7 +2168,7 @@ def check_short_signal_no_rsi(
                             strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
                         )
                     continue
-                
+
                 if false_breakout_candle["close"] >= resistance:
                     rejection_reason = f"False breakout close {smart_fmt(false_breakout_candle['close'])} not below Resistance {smart_fmt(resistance)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
@@ -2144,7 +2182,7 @@ def check_short_signal_no_rsi(
                             strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
                         )
                     continue
-                
+
                 if not is_bearish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bearish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
@@ -2158,7 +2196,7 @@ def check_short_signal_no_rsi(
                             strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
                         )
                     continue
-                
+
                 if confirm_candle["close"] >= false_breakout_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout close {smart_fmt(false_breakout_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
@@ -2172,15 +2210,14 @@ def check_short_signal_no_rsi(
                             strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
                         )
                     continue
-                
-                # All conditions passed - generate trade signal
+
                 triggered, signal_candle, strategy = check_short_signal_resistance_false_breakout(candles, sr_manager)
                 if triggered:
-                    _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER — CONFIRMED IMMEDIATE")
+                    _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED IMMEDIATE")
                     return True, signal_candle, strategy, None
-                
+
                 break
-            
+
             if not resistance_found:
                 rejection_reason = "No matching Resistance level found near false breakout high"
                 _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
@@ -2205,7 +2242,7 @@ def check_short_signal_no_rsi(
                     rejection_reason=rejection_reason,
                     strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
                 )
-    
+
     return False, None, "", None
 
 
@@ -2217,32 +2254,32 @@ def check_long_signal(
     if rsi is None:
         return False, None, "", None
     if rsi < 24.0:
-        _log("warning", f"RSI [{symbol}]", f"RSI={rsi:.2f} < 24 — BLOCKING LONG TRADE (extreme oversold)")
+        _log("warning", f"RSI [{symbol}]", f"RSI={rsi:.2f} < 24 - BLOCKING LONG TRADE (extreme oversold)")
         return False, None, "", rsi
     if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
-    _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} — LONG filter passes")
-    
+    _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} - LONG filter passes")
+
     triggered, signal_candle, strategy = check_long_signal_strategy_1(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
-    
+
     triggered, signal_candle, strategy = check_long_signal_strategy_5(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
-    
+
     triggered, signal_candle, strategy = check_long_signal_bullish_engulfing(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
-    
+
     triggered, signal_candle, strategy = check_long_signal_bullish_harami(candles, harami_tolerance)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
-    
+
     return False, None, "", rsi
 
 
@@ -2255,39 +2292,35 @@ def check_long_signal_no_rsi(
     Check NO-RSI long strategies with detailed rejection logging.
     S/R strategies now execute immediately on confirmation candle close.
     """
-    # Range Break
     triggered, signal_candle, strategy = check_long_signal_range_break(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
         return True, signal_candle, strategy, None
-    
-    # Vol Expansion
+
     triggered, signal_candle, strategy = check_long_signal_vol_expansion(candles)
     if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED")
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
         return True, signal_candle, strategy, None
-    
-    # S/R Breakout - with detailed rejection logging
+
     if len(candles) >= 4:
         confirm_candle = candles[-2]
         break_candle = candles[-3]
-        
-        # Get resistance levels
+
         with sr_manager._lock:
-            valid_resistances = [l for l in sr_manager.resistance_levels 
-                                if l["strength"] >= sr_manager.min_strength]
-        
+            valid_resistances = [l for l in sr_manager.resistance_levels
+                                  if l["strength"] >= sr_manager.min_strength]
+
         if valid_resistances:
             resistance_found = False
             for level_dict in valid_resistances:
                 resistance = level_dict["price"]
                 current_price = candles[-1]["close"]
-                
+
                 if abs(resistance - current_price) > current_price * 0.50:
                     continue
-                
+
                 resistance_found = True
-                
+
                 if break_candle["close"] <= resistance:
                     rejection_reason = f"Break candle close {smart_fmt(break_candle['close'])} did not close above Resistance {smart_fmt(resistance)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
@@ -2301,7 +2334,7 @@ def check_long_signal_no_rsi(
                             strategy="RESISTANCE_BREAKOUT_LONG"
                         )
                     continue
-                
+
                 if not is_bullish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bullish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
@@ -2315,7 +2348,7 @@ def check_long_signal_no_rsi(
                             strategy="RESISTANCE_BREAKOUT_LONG"
                         )
                     continue
-                
+
                 if confirm_candle["close"] <= break_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above break close {smart_fmt(break_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
@@ -2329,15 +2362,14 @@ def check_long_signal_no_rsi(
                             strategy="RESISTANCE_BREAKOUT_LONG"
                         )
                     continue
-                
-                # All conditions passed - generate trade signal
+
                 triggered, signal_candle, strategy = check_long_signal_support_resistance_manager(candles, sr_manager)
                 if triggered:
-                    _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED IMMEDIATE")
+                    _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED IMMEDIATE")
                     return True, signal_candle, strategy, None
-                
+
                 break
-            
+
             if not resistance_found:
                 rejection_reason = "No matching Resistance level found (strength >= 1)"
                 _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
@@ -2362,20 +2394,19 @@ def check_long_signal_no_rsi(
                     rejection_reason=rejection_reason,
                     strategy="RESISTANCE_BREAKOUT_LONG"
                 )
-    
-    # S/R False Breakout Reversal - with detailed rejection logging
+
     if len(candles) >= 4:
         false_breakout_candle = candles[-3]
         confirm_candle = candles[-2]
-        
+
         _, supports = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
-        
+
         if supports:
             support_found = False
             for level_dict in supports:
                 support = level_dict["price"]
                 support_found = True
-                
+
                 if false_breakout_candle["low"] >= support:
                     rejection_reason = f"False breakout low {smart_fmt(false_breakout_candle['low'])} not below Support {smart_fmt(support)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
@@ -2389,7 +2420,7 @@ def check_long_signal_no_rsi(
                             strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
                         )
                     continue
-                
+
                 if false_breakout_candle["close"] <= support:
                     rejection_reason = f"False breakout close {smart_fmt(false_breakout_candle['close'])} not above Support {smart_fmt(support)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
@@ -2403,7 +2434,7 @@ def check_long_signal_no_rsi(
                             strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
                         )
                     continue
-                
+
                 if not is_bullish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bullish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
@@ -2417,7 +2448,7 @@ def check_long_signal_no_rsi(
                             strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
                         )
                     continue
-                
+
                 if confirm_candle["close"] <= false_breakout_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout close {smart_fmt(false_breakout_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
@@ -2431,15 +2462,14 @@ def check_long_signal_no_rsi(
                             strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
                         )
                     continue
-                
-                # All conditions passed - generate trade signal
+
                 triggered, signal_candle, strategy = check_long_signal_support_false_breakout(candles, sr_manager)
                 if triggered:
-                    _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER — CONFIRMED IMMEDIATE")
+                    _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED IMMEDIATE")
                     return True, signal_candle, strategy, None
-                
+
                 break
-            
+
             if not support_found:
                 rejection_reason = "No matching Support level found near false breakout low"
                 _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
@@ -2464,7 +2494,7 @@ def check_long_signal_no_rsi(
                     rejection_reason=rejection_reason,
                     strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
                 )
-    
+
     return False, None, "", None
 
 
@@ -2473,7 +2503,7 @@ def check_long_signal_no_rsi(
 # ================================================================
 
 class SRLevelManager:
-    def __init__(self, symbol: str, lookback: int = SR_LOOKBACK, 
+    def __init__(self, symbol: str, lookback: int = SR_LOOKBACK,
                  merge_threshold: float = SR_MERGE_THRESHOLD,
                  min_age: int = SR_MIN_LEVEL_AGE,
                  max_age: int = SR_MAX_LEVEL_AGE,
@@ -2481,59 +2511,56 @@ class SRLevelManager:
                  notifier: Optional[GmailNotifier] = None):
         self.symbol = symbol
         self.lookback = lookback
-        self.merge_threshold = merge_threshold  # DEPRECATED - NOT USED FOR MERGING
+        self.merge_threshold = merge_threshold
         self.min_age = 0
         self.max_age = max_age
         self.min_strength = min_strength
         self.notifier = notifier
-        
+
         self.resistance_levels: List[Dict] = []
         self.support_levels: List[Dict] = []
         self.pending_swing_highs: List[float] = []
         self.pending_swing_lows: List[float] = []
         self.last_processed_index = 0
         self._lock = threading.Lock()
-        
+
     def update_levels(self, candles: List[dict]) -> None:
         with self._lock:
             if len(candles) < self.lookback:
                 return
-            
+
             current_idx = len(candles) - 1
             if current_idx == self.last_processed_index:
                 return
-            
-            # Check for broken levels before processing new swings
+
             self._check_broken_levels(candles)
-            
+
             new_swing_highs, new_swing_lows = self._detect_new_swings(candles)
             new_levels_created = []
-            
-            # Track newly created levels for notification
+
             for price in new_swing_highs:
                 for level in self.resistance_levels:
                     if level["price"] == price and level["age"] == 0 and level["strength"] == 1:
                         new_levels_created.append(level)
                         break
-            
+
             for price in new_swing_lows:
                 for level in self.support_levels:
                     if level["price"] == price and level["age"] == 0 and level["strength"] == 1:
                         new_levels_created.append(level)
                         break
-            
+
             self.pending_swing_highs.extend(new_swing_highs)
             self.pending_swing_lows.extend(new_swing_lows)
-            
+
             self._update_level_strength(candles)
             expired_levels = self._age_levels()
-            
-            # Send notifications for new levels immediately
+
             self._send_level_notifications(new_levels_created, expired_levels)
-            
+
             self.last_processed_index = current_idx
             self._log_levels()
-    
+
     def _check_broken_levels(self, candles: List[dict]) -> None:
         """
         Check if any resistance was broken but the LONG confirmation failed,
@@ -2542,27 +2569,26 @@ class SRLevelManager:
         """
         if len(candles) < 3:
             return
-        
+
         break_candle = candles[-3] if len(candles) >= 3 else None
         confirm_candle = candles[-2] if len(candles) >= 2 else None
-        
+
         if not break_candle or not confirm_candle:
             return
-        
-        # Check for broken resistance (LONG failed)
+
         for i, level in enumerate(self.resistance_levels):
             resistance_price = level["price"]
-            
+
             if break_candle["close"] > resistance_price:
                 confirm_failed = (
-                    not is_bullish(confirm_candle) or 
+                    not is_bullish(confirm_candle) or
                     confirm_candle["close"] <= break_candle["close"]
                 )
-                
+
                 if confirm_failed:
                     old_resistance = self.resistance_levels.pop(i)
                     new_price = break_candle["high"]
-                    
+
                     new_level = {
                         "price": new_price,
                         "age": 0,
@@ -2575,11 +2601,11 @@ class SRLevelManager:
                         "candle_type": "BREAKOUT"
                     }
                     self.resistance_levels.append(new_level)
-                    
-                    _log("info", f"S/R [{self.symbol}]", 
-                         f"RESISTANCE REPLACED: {smart_fmt(old_resistance['price'])} → {smart_fmt(new_price)} "
+
+                    _log("info", f"S/R [{self.symbol}]",
+                         f"RESISTANCE REPLACED: {smart_fmt(old_resistance['price'])} -> {smart_fmt(new_price)} "
                          f"(confirmation failed)")
-                    
+
                     if self.notifier:
                         self.notifier.send_sr_level_event(
                             symbol=self.symbol,
@@ -2589,21 +2615,20 @@ class SRLevelManager:
                             all_resistances=self.resistance_levels
                         )
                     break
-        
-        # Check for broken support (SHORT failed)
+
         for i, level in enumerate(self.support_levels):
             support_price = level["price"]
-            
+
             if break_candle["close"] < support_price:
                 confirm_failed = (
-                    not is_bearish(confirm_candle) or 
+                    not is_bearish(confirm_candle) or
                     confirm_candle["close"] >= break_candle["close"]
                 )
-                
+
                 if confirm_failed:
                     old_support = self.support_levels.pop(i)
                     new_price = break_candle["low"]
-                    
+
                     new_level = {
                         "price": new_price,
                         "age": 0,
@@ -2616,11 +2641,11 @@ class SRLevelManager:
                         "candle_type": "BREAKDOWN"
                     }
                     self.support_levels.append(new_level)
-                    
-                    _log("info", f"S/R [{self.symbol}]", 
-                         f"SUPPORT REPLACED: {smart_fmt(old_support['price'])} → {smart_fmt(new_price)} "
+
+                    _log("info", f"S/R [{self.symbol}]",
+                         f"SUPPORT REPLACED: {smart_fmt(old_support['price'])} -> {smart_fmt(new_price)} "
                          f"(confirmation failed)")
-                    
+
                     if self.notifier:
                         self.notifier.send_sr_level_event(
                             symbol=self.symbol,
@@ -2630,21 +2655,21 @@ class SRLevelManager:
                             all_resistances=self.resistance_levels
                         )
                     break
-    
+
     def _detect_new_swings(self, candles: List[dict]) -> Tuple[List[float], List[float]]:
         n = len(candles)
         if n < self.lookback:
             return [], []
-        
+
         new_highs = []
         new_lows = []
         check_range = min(10, n - 1)
         sensitivity = SR_SWING_SENSITIVITY
-        
+
         for i in range(n - check_range, n - sensitivity):
             if i < sensitivity or i >= n - sensitivity:
                 continue
-            
+
             is_high = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
@@ -2661,8 +2686,8 @@ class SRLevelManager:
                 }
                 self.resistance_levels.append(new_level)
                 new_highs.append(price)
-                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE: {smart_fmt(price)} (★)")
-            
+                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE: {smart_fmt(price)} (*)")
+
             is_low = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
@@ -2679,35 +2704,35 @@ class SRLevelManager:
                 }
                 self.support_levels.append(new_level)
                 new_lows.append(price)
-                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT: {smart_fmt(price)} (★)")
-        
+                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT: {smart_fmt(price)} (*)")
+
         return new_highs, new_lows
-    
+
     def _update_level_strength(self, candles: List[dict]) -> None:
         if not candles:
             return
         current_price = candles[-1]["close"]
         threshold = current_price * SR_PRICE_TOUCH_THRESHOLD
-        
+
         for level in self.resistance_levels:
             if abs(level["price"] - current_price) <= threshold:
                 level["strength"] = min(5, level["strength"] + 1)
                 level["touches"] += 1
                 level["age"] = 0
-                _log("info", f"S/R [{self.symbol}]", 
-                     f"RESISTANCE touched: {smart_fmt(level['price'])} ★{'★' * (level['strength'] - 1)}")
-        
+                _log("info", f"S/R [{self.symbol}]",
+                     f"RESISTANCE touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
+
         for level in self.support_levels:
             if abs(level["price"] - current_price) <= threshold:
                 level["strength"] = min(5, level["strength"] + 1)
                 level["touches"] += 1
                 level["age"] = 0
-                _log("info", f"S/R [{self.symbol}]", 
-                     f"SUPPORT touched: {smart_fmt(level['price'])} ★{'★' * (level['strength'] - 1)}")
-    
+                _log("info", f"S/R [{self.symbol}]",
+                     f"SUPPORT touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
+
     def _age_levels(self) -> List[Dict]:
         expired_levels = []
-        
+
         new_resistances = []
         for level in self.resistance_levels:
             effective_max_age = self.max_age + (level["strength"] * 15)
@@ -2716,10 +2741,10 @@ class SRLevelManager:
                 new_resistances.append(level)
             else:
                 expired_levels.append(level)
-                _log("info", f"S/R [{self.symbol}]", 
+                _log("info", f"S/R [{self.symbol}]",
                      f"RESISTANCE expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
         self.resistance_levels = new_resistances
-        
+
         new_supports = []
         for level in self.support_levels:
             effective_max_age = self.max_age + (level["strength"] * 15)
@@ -2728,12 +2753,12 @@ class SRLevelManager:
                 new_supports.append(level)
             else:
                 expired_levels.append(level)
-                _log("info", f"S/R [{self.symbol}]", 
+                _log("info", f"S/R [{self.symbol}]",
                      f"SUPPORT expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
         self.support_levels = new_supports
-        
+
         return expired_levels
-    
+
     def _send_level_notifications(self, new_levels: List[Dict], expired_levels: List[Dict]) -> None:
         if not self.notifier:
             return
@@ -2747,45 +2772,45 @@ class SRLevelManager:
                 symbol=self.symbol, event_type="EXPIRED", level_data=level,
                 all_supports=self.support_levels, all_resistances=self.resistance_levels
             )
-    
+
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
         with self._lock:
             price_range = current_price * 0.10
-            supports = [l for l in self.support_levels 
-                       if abs(l["price"] - current_price) <= price_range
-                       and l["strength"] >= self.min_strength]
-            resistances = [l for l in self.resistance_levels 
-                          if abs(l["price"] - current_price) <= price_range
-                          and l["strength"] >= self.min_strength]
+            supports = [l for l in self.support_levels
+                        if abs(l["price"] - current_price) <= price_range
+                        and l["strength"] >= self.min_strength]
+            resistances = [l for l in self.resistance_levels
+                           if abs(l["price"] - current_price) <= price_range
+                           and l["strength"] >= self.min_strength]
             return supports, resistances
-    
+
     def get_levels_near_price(self, current_price: float, tolerance: float = 0.02) -> Tuple[List[Dict], List[Dict]]:
         with self._lock:
             threshold = current_price * tolerance
-            supports = [l for l in self.support_levels 
-                       if abs(l["price"] - current_price) <= threshold
-                       and l["strength"] >= self.min_strength]
-            resistances = [l for l in self.resistance_levels 
-                          if abs(l["price"] - current_price) <= threshold
-                          and l["strength"] >= self.min_strength]
+            supports = [l for l in self.support_levels
+                        if abs(l["price"] - current_price) <= threshold
+                        and l["strength"] >= self.min_strength]
+            resistances = [l for l in self.resistance_levels
+                           if abs(l["price"] - current_price) <= threshold
+                           and l["strength"] >= self.min_strength]
             return supports, resistances
-    
+
     def _log_levels(self) -> None:
         with self._lock:
             if self.support_levels or self.resistance_levels:
                 support_str = []
                 for l in self.support_levels[-5:]:
-                    support_str.append(f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)}) [age:{l['age']}]")
-                
+                    support_str.append(f"{smart_fmt(l['price'])} ({'*' * l['strength']}) [age:{l['age']}]")
+
                 resistance_str = []
                 for l in self.resistance_levels[-5:]:
-                    resistance_str.append(f"{smart_fmt(l['price'])} (★{'★' * (l['strength'] - 1)}) [age:{l['age']}]")
-                
+                    resistance_str.append(f"{smart_fmt(l['price'])} ({'*' * l['strength']}) [age:{l['age']}]")
+
                 if support_str:
                     _log("info", f"S/R [{self.symbol}]", f"SUPPORT: {', '.join(support_str)}")
                 if resistance_str:
                     _log("info", f"S/R [{self.symbol}]", f"RESISTANCE: {', '.join(resistance_str)}")
-    
+
     def reset(self) -> None:
         with self._lock:
             self.resistance_levels.clear()
@@ -2802,7 +2827,7 @@ class SRLevelManager:
 
 class SymbolValidator:
     def __init__(self, product_map: Dict[str, int]):
-        self.product_map   = product_map
+        self.product_map = product_map
         self.known_symbols = list(product_map.keys())
 
     def validate_trading_symbol(self, symbol: str) -> Tuple[Optional[str], str]:
@@ -2836,12 +2861,12 @@ class SymbolValidator:
 
 def get_time_range(num_candles: int, timeframe_minutes: int) -> Tuple[int, int]:
     secs_per_candle = timeframe_minutes * 60
-    now             = int(time.time())
-    aligned_now     = (now // secs_per_candle) * secs_per_candle
-    safe_end        = aligned_now - (CANDLE_SAFETY_SHIFT * secs_per_candle)
-    start           = safe_end - (num_candles * secs_per_candle)
-    start           = max(1, start)
-    safe_end        = max(secs_per_candle * (CANDLE_SAFETY_SHIFT + 1), safe_end)
+    now = int(time.time())
+    aligned_now = (now // secs_per_candle) * secs_per_candle
+    safe_end = aligned_now - (CANDLE_SAFETY_SHIFT * secs_per_candle)
+    start = safe_end - (num_candles * secs_per_candle)
+    start = max(1, start)
+    safe_end = max(secs_per_candle * (CANDLE_SAFETY_SHIFT + 1), safe_end)
     if start >= safe_end:
         raise ValueError(f"start={start} >= end={safe_end}")
     return start, safe_end
@@ -2852,9 +2877,9 @@ def get_time_range_with_retry_shift(
 ) -> Tuple[int, int]:
     start, end = get_time_range(num_candles, timeframe_minutes)
     if shift_candles > 0:
-        secs  = shift_candles * timeframe_minutes * 60
+        secs = shift_candles * timeframe_minutes * 60
         start = max(1, start - secs)
-        end   = max(timeframe_minutes * 60, end - secs)
+        end = max(timeframe_minutes * 60, end - secs)
     return start, end
 
 
@@ -2868,8 +2893,10 @@ def _extract_timestamp(src: dict) -> int:
         if v is not None:
             try:
                 ts = int(float(v))
-                if ts > 0: return ts
-            except (TypeError, ValueError): continue
+                if ts > 0:
+                    return ts
+            except (TypeError, ValueError):
+                continue
     return 0
 
 
@@ -2877,20 +2904,24 @@ def _extract_price(src: dict, long_key: str, short_key: str) -> Optional[float]:
     for k in (long_key, short_key):
         v = src.get(k)
         if v is not None:
-            try: return float(v)
-            except (TypeError, ValueError): pass
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
     return None
 
 
 def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
     ts = _extract_timestamp(row)
-    if ts <= 0: return None
-    o  = _extract_price(row, "open",   "o")
-    h  = _extract_price(row, "high",   "h")
-    l  = _extract_price(row, "low",    "l")
-    c  = _extract_price(row, "close",  "c")
-    v  = _extract_price(row, "volume", "v") or 0.0
-    if any(x is None for x in (o, h, l, c)): return None
+    if ts <= 0:
+        return None
+    o = _extract_price(row, "open", "o")
+    h = _extract_price(row, "high", "h")
+    l = _extract_price(row, "low", "l")
+    c = _extract_price(row, "close", "c")
+    v = _extract_price(row, "volume", "v") or 0.0
+    if any(x is None for x in (o, h, l, c)):
+        return None
     return {"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
 
 
@@ -2901,9 +2932,9 @@ def _parse_rest_candle_row(row: dict, symbol: str = "") -> Optional[dict]:
 def round_to_tick(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return round(price, 8)
-    rounded  = round(price / tick_size) * tick_size
+    rounded = round(price / tick_size) * tick_size
     tick_str = f"{tick_size:.10f}".rstrip("0")
-    dp       = len(tick_str.split(".")[-1]) if "." in tick_str else 0
+    dp = len(tick_str.split(".")[-1]) if "." in tick_str else 0
     return round(rounded, max(dp, 2))
 
 
@@ -2913,8 +2944,8 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 class DeltaREST:
     def __init__(self, api_key: str = "", api_secret: str = ""):
-        self.api_key         = api_key
-        self.api_secret      = api_secret
+        self.api_key = api_key
+        self.api_secret = api_secret
         self.request_handler = APIRequestHandler(api_key, api_secret)
         self._tick_sizes: Dict[str, float] = {}
 
@@ -2922,7 +2953,7 @@ class DeltaREST:
         result = self.request_handler.request("GET", "/v2/profile", endpoint_type="private")
         if result and "result" in result:
             profile = result["result"]
-            _log("info", "AUTH", f"Authenticated: {profile.get('email','?')}")
+            _log("info", "AUTH", f"Authenticated: {profile.get('email', '?')}")
             return profile
         return None
 
@@ -2941,8 +2972,8 @@ class DeltaREST:
         pmap: Dict[str, int] = {}
         if result and "result" in result:
             for item in result.get("result", []):
-                sym      = item.get("symbol", "")
-                pid      = item.get("id")
+                sym = item.get("symbol", "")
+                pid = item.get("id")
                 tick_raw = item.get("tick_size", "0.01")
                 if sym and pid is not None:
                     pmap[sym] = int(pid)
@@ -2970,10 +3001,10 @@ class DeltaREST:
             if order is None:
                 time.sleep(FILL_POLL_INTERVAL)
                 continue
-            state         = order.get("state", "")
-            size          = int(order.get("size", 0))
+            state = order.get("state", "")
+            size = int(order.get("size", 0))
             unfilled_size = int(order.get("unfilled_size", 0))
-            filled_size   = size - unfilled_size
+            filled_size = size - unfilled_size
             if state == "closed" and unfilled_size == 0:
                 return True, filled_size
             if state in ("cancelled", "rejected"):
@@ -2982,10 +3013,12 @@ class DeltaREST:
         return False, 0
 
     def place_order(self, product_id: int, side: str, size: int,
-                    order_type: str = "market_order",
-                    limit_price: Optional[float] = None) -> dict:
-        if side not in ("buy", "sell"): return {"error": "invalid_side"}
-        if size < 1:                    return {"error": "invalid_size"}
+                     order_type: str = "market_order",
+                     limit_price: Optional[float] = None) -> dict:
+        if side not in ("buy", "sell"):
+            return {"error": "invalid_side"}
+        if size < 1:
+            return {"error": "invalid_size"}
         body: Dict = {"product_id": product_id, "size": size,
                       "side": side, "order_type": order_type}
         if limit_price and order_type == "limit_order":
@@ -2998,12 +3031,12 @@ class DeltaREST:
     def place_take_profit_only(self, product_id: int, tp_price: float, symbol: str = "") -> dict:
         if tp_price <= 0:
             return {"error": "invalid_tp_price"}
-        tick_size  = self.get_tick_size(symbol) if symbol else 0.01
+        tick_size = self.get_tick_size(symbol) if symbol else 0.01
         rounded_tp = round_to_tick(tp_price, tick_size)
         body: Dict = {
             "product_id": product_id,
             "take_profit_order": {
-                "order_type":  "limit_order",
+                "order_type": "limit_order",
                 "limit_price": str(rounded_tp),
             },
             "bracket_take_profit_trigger_method": "last_traded_price",
@@ -3030,26 +3063,29 @@ class DeltaREST:
         return False
 
     def cancel_order(self, order_id: int, product_id: int) -> dict:
-        body   = {"id": order_id, "product_id": product_id}
+        body = {"id": order_id, "product_id": product_id}
         result = self.request_handler.request(
             "DELETE", "/v2/orders", endpoint_type="private", body=body
         )
         return result or {"error": "no_response"}
 
     def get_top_symbols(self, product_map: Dict[str, int], mode: str = "volatile",
-                        limit: int = 5, perp_only: bool = True) -> List[str]:
-        result  = self.request_handler.request("GET", "/v2/tickers", endpoint_type="public")
+                         limit: int = 5, perp_only: bool = True) -> List[str]:
+        result = self.request_handler.request("GET", "/v2/tickers", endpoint_type="public")
         tickers = result.get("result", []) if result else []
         ranked: List[Tuple[float, str]] = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if perp_only and "_PERP" not in sym: continue
-            if sym not in product_map:           continue
+            if perp_only and "_PERP" not in sym:
+                continue
+            if sym not in product_map:
+                continue
             try:
                 score = (abs(float(t.get("change", 0) or 0)) if mode == "volatile"
                          else float(t.get("volume", 0) or 0))
                 ranked.append((score, sym))
-            except (TypeError, ValueError): continue
+            except (TypeError, ValueError):
+                continue
         ranked.sort(reverse=True)
         return [s for _, s in ranked[:limit]]
 
@@ -3060,20 +3096,21 @@ class DeltaREST:
             for shift in range(1, MAX_RETRIES + 1):
                 time.sleep(RETRY_DELAYS[shift - 1])
                 candles = self.get_candles(symbol, resolution, limit, shift_candles=shift)
-                if candles: break
+                if candles:
+                    break
         return candles
 
     def get_candles(self, symbol: str, resolution: str = "1h",
-                    limit: int = CANDLE_LIMIT, shift_candles: int = 0) -> List[dict]:
-        candle_symbol     = to_candle_symbol(symbol)
-        tf_entry          = next(
+                     limit: int = CANDLE_LIMIT, shift_candles: int = 0) -> List[dict]:
+        candle_symbol = to_candle_symbol(symbol)
+        tf_entry = next(
             (tf for tf in TIMEFRAME_MAP.values()
              if tf["api_resolution"] == resolution or tf["resolution"] == resolution),
             TIMEFRAME_MAP["1h"],
         )
         timeframe_minutes = tf_entry["secs"] // 60
-        api_resolution    = tf_entry["api_resolution"]
-        safe_limit        = min(limit, 500)
+        api_resolution = tf_entry["api_resolution"]
+        safe_limit = min(limit, 500)
         try:
             start, end = get_time_range_with_retry_shift(
                 safe_limit, timeframe_minutes, shift_candles
@@ -3088,14 +3125,16 @@ class DeltaREST:
         result = self.request_handler.request(
             "GET", "/v2/history/candles", endpoint_type="public", params=params
         )
-        if not result: return []
+        if not result:
+            return []
         raw_result = result.get("result", [])
         if isinstance(raw_result, dict):
             for key in ("candles", "data", "ohlcv"):
                 if key in raw_result:
                     raw_result = raw_result[key]
                     break
-        if not isinstance(raw_result, list) or not raw_result: return []
+        if not isinstance(raw_result, list) or not raw_result:
+            return []
         candles = []
         for row in raw_result:
             candle = _parse_rest_candle_row(row, candle_symbol)
@@ -3106,7 +3145,7 @@ class DeltaREST:
         return candles
 
     def set_leverage(self, product_id: int, leverage: int) -> bool:
-        body   = {"leverage": str(leverage)}
+        body = {"leverage": str(leverage)}
         result = self.request_handler.request(
             "POST", f"/v2/products/{product_id}/orders/leverage",
             endpoint_type="private", body=body,
@@ -3140,7 +3179,7 @@ class DeltaREST:
                 "GET", f"/v2/orders/{order_id}", endpoint_type="private"
             )
             if result and "result" in result:
-                order        = result["result"]
+                order = result["result"]
                 realized_pnl = float(order.get("realized_pnl", 0))
                 _log("info", "PNL", f"Fetched realized PnL for order_id={order_id}: ${realized_pnl:.2f}")
                 return realized_pnl
@@ -3156,39 +3195,39 @@ class DeltaREST:
 def compute_position_size(entry_price: float, stop_loss_price: float,
                            account_balance: float, risk_pct: float,
                            leverage: int) -> Tuple[int, dict]:
-    risk_amount    = account_balance * risk_pct
-    stop_distance  = abs(entry_price - stop_loss_price)
+    risk_amount = account_balance * risk_pct
+    stop_distance = abs(entry_price - stop_loss_price)
     if stop_distance <= 0:
         return 0, {}
-    risk_size      = risk_amount / stop_distance
-    max_by_margin  = (account_balance * leverage) / entry_price
+    risk_size = risk_amount / stop_distance
+    max_by_margin = (account_balance * leverage) / entry_price
     final_size_raw = min(risk_size, max_by_margin)
-    final_size     = max(1, int(final_size_raw))
-    margin_used    = (final_size * entry_price) / leverage
-    max_loss_est   = final_size * stop_distance
+    final_size = max(1, int(final_size_raw))
+    margin_used = (final_size * entry_price) / leverage
+    max_loss_est = final_size * stop_distance
     diag = {
-        "account_balance":  round(account_balance, 2),
-        "risk_pct":         round(risk_pct * 100, 2),
-        "risk_amount":      round(risk_amount, 2),
-        "entry_price":      entry_price,
-        "stop_loss_price":  stop_loss_price,
-        "stop_distance":    stop_distance,
-        "risk_size_raw":    round(risk_size, 6),
-        "max_by_margin":    round(max_by_margin, 6),
-        "final_size":       final_size,
-        "margin_used":      round(margin_used, 2),
-        "max_loss_est":     round(max_loss_est, 2),
-        "leverage":         leverage,
+        "account_balance": round(account_balance, 2),
+        "risk_pct": round(risk_pct * 100, 2),
+        "risk_amount": round(risk_amount, 2),
+        "entry_price": entry_price,
+        "stop_loss_price": stop_loss_price,
+        "stop_distance": stop_distance,
+        "risk_size_raw": round(risk_size, 6),
+        "max_by_margin": round(max_by_margin, 6),
+        "final_size": final_size,
+        "margin_used": round(margin_used, 2),
+        "max_loss_est": round(max_loss_est, 2),
+        "leverage": leverage,
     }
     return final_size, diag
 
 
 def compute_take_profit(entry_price: float, stop_loss_price: float,
                          direction: str = "SHORT") -> float:
-    stop_distance   = abs(entry_price - stop_loss_price)
+    stop_distance = abs(entry_price - stop_loss_price)
     raw_tp_distance = stop_distance * TP_RR_RATIO
     max_tp_distance = entry_price * TP_MAX_PCT
-    tp_distance     = min(raw_tp_distance, max_tp_distance)
+    tp_distance = min(raw_tp_distance, max_tp_distance)
     if direction == "SHORT":
         tp = entry_price - tp_distance
     else:
@@ -3198,6 +3237,12 @@ def compute_take_profit(entry_price: float, stop_loss_price: float,
 
 # ================================================================
 #  21. DAILY LOSS TRACKER
+#      *** BUG FIX APPLIED HERE ***
+#      is_limit_reached() now treats a zero/undefined daily limit
+#      (which happens if trading_capital is 0 or missing) as
+#      "not reached" instead of "always reached". Previously a
+#      $0 limit meant 0.0 >= 0 was True on literally every check,
+#      silently blocking every single signal check forever.
 # ================================================================
 
 class DailyLossTracker:
@@ -3213,7 +3258,7 @@ class DailyLossTracker:
     def _check_day_rollover(self) -> None:
         today = datetime.now(timezone.utc).date()
         if today != self._day:
-            _log("info", "DAILY-LOSS", f"New day {today} — resetting daily loss counter")
+            _log("info", "DAILY-LOSS", f"New day {today} - resetting daily loss counter")
             self.daily_loss_usd = 0.0
             self._day = today
 
@@ -3231,15 +3276,19 @@ class DailyLossTracker:
                 self.daily_loss_usd = max(0.0, self.daily_loss_usd - profit_amount)
                 _log("info", "DAILY-LOSS",
                      f"Realized profit: ${profit_amount:.2f} | Daily loss total reduced to: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
-            if self.notifier and self.daily_loss_usd >= limit * 0.8:
+            if limit > 0 and self.notifier and self.daily_loss_usd >= limit * 0.8:
                 self.notifier.send_daily_loss_warning(self.daily_loss_usd, limit)
-            if self.notifier and self.daily_loss_usd >= limit:
+            if limit > 0 and self.notifier and self.daily_loss_usd >= limit:
                 self.notifier.send_daily_limit_hit(self.daily_loss_usd, limit)
 
     def is_limit_reached(self) -> bool:
         with self._lock:
             self._check_day_rollover()
             limit = self.trading_capital * self.limit_pct
+            # FIX: a zero or undefined limit must never count as "reached" -
+            # otherwise 0.0 >= 0 is True and this blocks every trade forever.
+            if limit <= 0:
+                return False
             if self.daily_loss_usd >= limit:
                 _log("error", "DAILY-LOSS", f"DAILY LOSS LIMIT REACHED: ${self.daily_loss_usd:.2f} >= ${limit:.2f}")
                 return True
@@ -3249,7 +3298,7 @@ class DailyLossTracker:
         with self._lock:
             self._check_day_rollover()
             limit = self.trading_capital * self.limit_pct
-            pct   = (self.daily_loss_usd / limit * 100) if limit > 0 else 0
+            pct = (self.daily_loss_usd / limit * 100) if limit > 0 else 0
             return f"Daily loss: ${self.daily_loss_usd:.2f} / ${limit:.2f} ({pct:.1f}%)"
 
 
@@ -3259,36 +3308,45 @@ class DailyLossTracker:
 
 class TradingBot:
     def __init__(self, config: dict, notifier: Optional[GmailNotifier] = None):
-        self.config          = config
-        self.notifier        = notifier
-        self.paper           = config["paper_mode"]
-        self.leverage        = config["leverage"]
-        self.max_trades      = config.get("max_concurrent_trades", 2)
-        self.api_key         = config.get("api_key", "")
-        self.api_secret      = config.get("api_secret", "")
+        self.config = config
+        self.notifier = notifier
+        self.paper = config["paper_mode"]
+        self.leverage = config["leverage"]
+        self.max_trades = config.get("max_concurrent_trades", 2)
+        self.api_key = config.get("api_key", "")
+        self.api_secret = config.get("api_secret", "")
         self.trading_capital = float(config.get("trading_capital", 0.0))
-        self.risk_pct        = config["risk_pct"] / 100.0
+        self.risk_pct = config["risk_pct"] / 100.0
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
-        self.enable_short    = config.get("enable_short", True)
-        self.enable_long     = config.get("enable_long", True)
+        self.enable_short = config.get("enable_short", True)
+        self.enable_long = config.get("enable_long", True)
         self.harami_tolerance = config.get("harami_tolerance", HARAMI_BODY_TOLERANCE)
 
-        self._tf            = TimeframeSafe(config.get("timeframe", "1h"))
-        self.timeframe      = self._tf.key
-        self.resolution     = self._tf.resolution
+        # *** BUG FIX: loud, fail-fast guard against the root cause ***
+        # If trading_capital ends up 0 (missing from config, bad launch script,
+        # failed balance fetch, etc.) the bot must not silently run forever
+        # doing nothing - it must say so clearly at startup.
+        if self.trading_capital <= 0:
+            _log("error", "STARTUP",
+                 "trading_capital is 0 or missing in config - the bot will not be "
+                 "able to size any trade and will be halted at start(). Fix your config.")
+
+        self._tf = TimeframeSafe(config.get("timeframe", "1h"))
+        self.timeframe = self._tf.key
+        self.resolution = self._tf.resolution
         self.api_resolution = self._tf.api_resolution
-        self.ws_channel     = self._tf.ws_channel
+        self.ws_channel = self._tf.ws_channel
 
         self.rest = DeltaREST(self.api_key, self.api_secret)
 
-        self.symbols:      List[str]        = []
-        self.product_map:  Dict[str, int]   = {}
+        self.symbols: List[str] = []
+        self.product_map: Dict[str, int] = {}
         self.candle_store: Dict[str, deque] = {}
 
-        self._trade_lock    = threading.Lock()
+        self._trade_lock = threading.Lock()
         self.active_trades: Dict[str, dict] = {}
 
-        self.signals:   List[dict] = []
+        self.signals: List[dict] = []
         self.sl_events: List[dict] = []
         self.tp_events: List[dict] = []
 
@@ -3298,34 +3356,43 @@ class TradingBot:
             notifier=notifier,
         )
 
-        self.running     = False
+        self.running = False
         self.ws_manager: Optional[DeltaWebSocket] = None
         self.sr_managers: Dict[str, SRLevelManager] = {}
 
+        # -- Watchdog / silent-failure detection state --
+        self.last_candle_time: Dict[str, float] = {}   # symbol -> wall-clock time.time() of last candle close processed
+        self.last_eval_time: Dict[str, float] = {}     # symbol -> wall-clock time.time() when signal evaluation last actually ran
+        self._active_watchdog_issues: Dict[str, float] = {}  # issue_key -> time.time() last alerted
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
+
         self.on_signal_callback = None
-        self.on_trade_callback  = None
-        self.on_log_callback    = None
+        self.on_trade_callback = None
+        self.on_log_callback = None
 
     def _log(self, level: str, tag: str, msg: str) -> None:
         _log(level, tag, msg)
         if self.on_log_callback:
-            try: self.on_log_callback(f"[{tag}] {msg}", level)
-            except Exception: pass
+            try:
+                self.on_log_callback(f"[{tag}] {msg}", level)
+            except Exception:
+                pass
 
     def _get_realized_pnl_for_trade(self, trade: dict,
                                      max_retries: int = 5,
                                      retry_delay: float = 1.0) -> float:
         if self.paper:
             exit_price = trade.get("exit_price")
-            entry      = trade.get("entry")
-            size       = trade.get("size", 0)
-            direction  = trade.get("direction", "SHORT")
+            entry = trade.get("entry")
+            size = trade.get("size", 0)
+            direction = trade.get("direction", "SHORT")
             if exit_price and entry and size > 0:
                 return (entry - exit_price) * size if direction == "SHORT" \
-                       else (exit_price - entry) * size
+                    else (exit_price - entry) * size
             return 0.0
 
-        order_id   = trade.get("order_id")
+        order_id = trade.get("order_id")
         product_id = trade.get("product_id")
 
         if order_id:
@@ -3351,14 +3418,14 @@ class TradingBot:
         return 0.0
 
     def _close_trade(self, symbol: str, trade: dict, reason: str,
-                     exit_price: Optional[float] = None) -> None:
-        entry     = trade["entry"]
+                      exit_price: Optional[float] = None) -> None:
+        entry = trade["entry"]
         direction = trade.get("direction", "SHORT")
 
         _log("info", "TRADE-CLOSE", f"Closing trade: {symbol} {direction} | Reason: {reason}")
 
         if not self.paper:
-            pid  = trade.get("product_id")
+            pid = trade.get("product_id")
             size = trade.get("size", 1)
             if pid and size > 0:
                 close_side = "buy" if direction == "SHORT" else "sell"
@@ -3369,7 +3436,7 @@ class TradingBot:
         realized_pnl = self._get_realized_pnl_for_trade(trade)
 
         trade["close_reason"] = reason
-        trade["close_time"]   = datetime.now(timezone.utc).isoformat()
+        trade["close_time"] = datetime.now(timezone.utc).isoformat()
         trade["realized_pnl"] = realized_pnl
 
         if reason in ("TAKE_PROFIT", "ST_EXIT"):
@@ -3428,8 +3495,8 @@ class TradingBot:
             return
 
         direction = trade.get("direction", "SHORT")
-        entry     = trade.get("entry", 0)
-        st_mode   = trade.get("st_mode", False)
+        entry = trade.get("entry", 0)
+        st_mode = trade.get("st_mode", False)
 
         if len(closed_candles) < ST2_LENGTH + 2:
             return
@@ -3440,11 +3507,11 @@ class TradingBot:
         if not st_mode:
             confirmed = (
                 (direction == "SHORT" and bearish_now) or
-                (direction == "LONG"  and bullish_now)
+                (direction == "LONG" and bullish_now)
             )
             if confirmed:
                 st1_val, st2_val = get_supertrend_values(closed_candles)
-                trade["st_mode"]         = True
+                trade["st_mode"] = True
                 trade["st_confirmed_at"] = datetime.now(timezone.utc).isoformat()
 
                 if not self.paper:
@@ -3452,17 +3519,17 @@ class TradingBot:
                     if pid:
                         self.rest.cancel_bracket_tp(pid)
 
-                trend_label = "📉 STRONG DOWN TREND" if direction == "SHORT" else "📈 STRONG UP TREND"
+                trend_label = "STRONG DOWN TREND" if direction == "SHORT" else "STRONG UP TREND"
                 print()
                 print(f"  [SUPERTREND CONFIRMED] {symbol} {trend_label}")
-                print(f"    Both ST(14,2) + ST(21,1) {'RED' if direction=='SHORT' else 'GREEN'}")
+                print(f"    Both ST(14,2) + ST(21,1) {'RED' if direction == 'SHORT' else 'GREEN'}")
                 print(f"    Entry        : {smart_fmt(entry)}")
                 print(f"    ST(14,2) val : {smart_fmt(st1_val) if st1_val else 'N/A'}")
                 print(f"    ST(21,1) val : {smart_fmt(st2_val) if st2_val else 'N/A'}")
-                print(f"    TP CHANGED → Will exit when BOTH SuperTrends reverse direction")
+                print(f"    TP CHANGED -> Will exit when BOTH SuperTrends reverse direction")
                 print()
 
-                _log("info", "ST-CONFIRM", f"[{symbol}] {direction} trade — Both SuperTrends confirmed.")
+                _log("info", "ST-CONFIRM", f"[{symbol}] {direction} trade - Both SuperTrends confirmed.")
 
                 if self.notifier:
                     self.notifier.send_supertrend_strong(
@@ -3474,14 +3541,14 @@ class TradingBot:
         else:
             reversed_trend = (
                 (direction == "SHORT" and bullish_now) or
-                (direction == "LONG"  and bearish_now)
+                (direction == "LONG" and bearish_now)
             )
             if reversed_trend:
-                _log("info", "ST-EXIT", f"[{symbol}] {direction} — Both SuperTrends REVERSED.")
+                _log("info", "ST-EXIT", f"[{symbol}] {direction} - Both SuperTrends REVERSED.")
                 print()
                 print(f"  [ST REVERSAL EXIT] {symbol} {direction}")
                 flip_label = "both GREEN" if direction == "SHORT" else "both RED"
-                print(f"    SuperTrends flipped {flip_label} — closing position")
+                print(f"    SuperTrends flipped {flip_label} - closing position")
                 print()
                 self._close_trade(symbol, trade, "ST_EXIT")
 
@@ -3489,6 +3556,14 @@ class TradingBot:
         self.running = True
         self._print_banner()
         warm_up_connection()
+
+        # *** BUG FIX: hard stop if trading_capital is not usable ***
+        if self.trading_capital <= 0:
+            self._log("error", "STARTUP",
+                       "Aborting: trading_capital must be > 0. The bot cannot size "
+                       "trades or evaluate the daily loss limit with $0 capital.")
+            self.running = False
+            return
 
         if not self.paper:
             profile = self.rest.verify_account()
@@ -3511,7 +3586,7 @@ class TradingBot:
                 self.product_map, mode="volatile", limit=5, perp_only=True
             ) or []
 
-        validator    = SymbolValidator(self.product_map)
+        validator = SymbolValidator(self.product_map)
         self.symbols = validator.validate_list(raw_syms)
         if not self.symbols:
             self._log("error", "STARTUP", "No valid symbols. Aborting.")
@@ -3525,7 +3600,8 @@ class TradingBot:
         if not self.paper:
             for sym in self.symbols:
                 pid = self.product_map.get(sym)
-                if pid: self.rest.set_leverage(pid, self.leverage)
+                if pid:
+                    self.rest.set_leverage(pid, self.leverage)
 
         self._print_startup_summary()
 
@@ -3534,10 +3610,15 @@ class TradingBot:
 
         self._fetch_all_historical()
         self._start_ws()
+        self._start_watchdog()
 
     def stop(self) -> None:
         self.running = False
-        if self.ws_manager: self.ws_manager.stop()
+        self._watchdog_stop.set()
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=5.0)
+        if self.ws_manager:
+            self.ws_manager.stop()
         self._log("info", "BOT", "Bot stopped.")
 
     def _fetch_all_historical(self) -> None:
@@ -3571,28 +3652,174 @@ class TradingBot:
                 self.process_candle(known, candle)
                 return
 
-    def _on_ws_connected(self)    -> None: self._log("info",    "WS", "Connected")
-    def _on_ws_disconnected(self) -> None: self._log("warning", "WS", "Disconnected (max retries)")
-    def _on_ws_error(self, err)   -> None: self._log("error",   "WS", f"Error: {err}")
+    def _on_ws_connected(self) -> None:
+        self._log("info", "WS", "Connected")
+
+    def _on_ws_disconnected(self) -> None:
+        self._log("warning", "WS", "Disconnected (max retries)")
+
+    def _on_ws_error(self, err) -> None:
+        self._log("error", "WS", f"Error: {err}")
 
     def _on_ws_reconnect(self) -> None:
-        for sym in self.symbols: self._backfill_symbol(sym)
+        for sym in self.symbols:
+            self._backfill_symbol(sym)
 
     def _backfill_symbol(self, symbol: str) -> None:
         store = self.candle_store.get(symbol)
-        if store is None: return
+        if store is None:
+            return
         fresh = self.rest.get_candles_with_retry(symbol, self.api_resolution, CANDLE_LIMIT)
-        if not fresh: return
+        if not fresh:
+            return
         existing_ts = {c["time"] for c in store}
         for c in sorted(fresh, key=lambda x: x["time"]):
             if c["time"] not in existing_ts:
                 store.append(c)
                 existing_ts.add(c["time"])
 
+    # ============================================================
+    #  WATCHDOG - detects silent failures and emails an alert
+    # ============================================================
+
+    def _start_watchdog(self) -> None:
+        """
+        Starts a background thread that periodically checks for the kinds
+        of conditions that make a bot silently stop trading without ever
+        crashing or throwing a visible error - e.g. the exact daily-loss-limit
+        bug this bot previously had, a stalled WebSocket feed, or candles
+        that stop arriving. If Gmail notifications are enabled, an email is
+        sent the moment a problem is detected, and again once it clears.
+        """
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True, name="BotWatchdog"
+        )
+        self._watchdog_thread.start()
+        self._log("info", "WATCHDOG", f"Health watchdog started (checks every {WATCHDOG_CHECK_INTERVAL // 60} min)")
+
+    def _watchdog_loop(self) -> None:
+        # Give the bot a full startup grace period (one full check interval)
+        # before the first check, so historical loading / first candles
+        # don't trigger a false "stale data" alert immediately on boot.
+        for _ in range(WATCHDOG_CHECK_INTERVAL):
+            if self._watchdog_stop.is_set():
+                return
+            time.sleep(1)
+
+        while not self._watchdog_stop.is_set():
+            try:
+                self._run_health_checks()
+            except Exception as e:
+                _log("error", "WATCHDOG", f"Watchdog check itself failed: {e}")
+            for _ in range(WATCHDOG_CHECK_INTERVAL):
+                if self._watchdog_stop.is_set():
+                    return
+                time.sleep(1)
+
+    def _run_health_checks(self) -> None:
+        now = time.time()
+        current_issues: Dict[str, str] = {}
+
+        # 1. Trading capital must be usable, or nothing downstream works.
+        if self.trading_capital <= 0:
+            current_issues["CAPITAL_ZERO"] = (
+                "trading_capital is $0 or unset. The bot cannot size positions "
+                "or evaluate the daily loss limit correctly in this state."
+            )
+
+        # 2. WebSocket must be connected, or candles stop arriving entirely.
+        if self.ws_manager:
+            state = self.ws_manager.get_state()
+            if state in ("disconnected", "reconnecting"):
+                current_issues["WS_DOWN"] = (
+                    f"WebSocket state is '{state}'. Live candle data may not be "
+                    f"updating, so no new signals can be detected until it reconnects."
+                )
+
+        # 3. Candles must keep arriving for every symbol being tracked.
+        expected_secs = self._tf.secs
+        for sym in self.symbols:
+            last = self.last_candle_time.get(sym)
+            if last is None:
+                current_issues[f"NO_CANDLES_{sym}"] = (
+                    f"[{sym}] no candle close has been processed since startup. "
+                    f"Check the WebSocket symbol subscription matches Delta's feed."
+                )
+            elif now - last > expected_secs * STALE_CANDLE_MULTIPLIER:
+                mins = int((now - last) // 60)
+                current_issues[f"STALE_{sym}"] = (
+                    f"[{sym}] no new candle close in {mins} min "
+                    f"(expected roughly every {expected_secs // 60} min on {self.timeframe})."
+                )
+
+        # 4. Signal evaluation must actually be running whenever candles close
+        #    and there is no open trade - if candles are closing but evaluation
+        #    never runs, some gate (daily-loss limit, a future bug, etc.) is
+        #    silently blocking the bot exactly like the original bug did.
+        for sym in self.symbols:
+            if sym in self.active_trades:
+                continue  # evaluation is legitimately skipped while a trade is open
+            last_candle = self.last_candle_time.get(sym)
+            last_eval = self.last_eval_time.get(sym)
+            if last_candle is not None:
+                if last_eval is None or (last_candle - last_eval > 1):
+                    stall_duration = now - last_candle
+                    if stall_duration > expected_secs * EVAL_STALL_MULTIPLIER:
+                        mins = int(stall_duration // 60)
+                        current_issues[f"EVAL_BLOCKED_{sym}"] = (
+                            f"[{sym}] candles are closing but signal evaluation has not run "
+                            f"for {mins} min. Something upstream (e.g. the daily-loss gate) "
+                            f"may be silently blocking every strategy check again."
+                        )
+
+        # 5. Daily loss limit should not stay "reached" indefinitely across days.
+        if self.daily_loss_tracker.is_limit_reached():
+            current_issues["DAILY_LIMIT_ACTIVE"] = (
+                f"Daily loss limit is currently ACTIVE - no new trades will open. "
+                f"{self.daily_loss_tracker.status()}. This is expected if you "
+                f"genuinely hit your loss cap today; if it persists across a day "
+                f"rollover, that itself is worth investigating."
+            )
+
+        self._reconcile_watchdog_issues(current_issues)
+
+    def _reconcile_watchdog_issues(self, current_issues: Dict[str, str]) -> None:
+        """
+        Compares this check's issues against the previously active set:
+        - brand-new issues -> alert immediately
+        - still-active issues -> re-alert only after HEALTH_ALERT_COOLDOWN,
+          so a persistent problem isn't forgotten but also doesn't spam
+        - issues that vanished -> send a RESOLVED follow-up
+        """
+        now = time.time()
+
+        for key, message in current_issues.items():
+            last_alert = self._active_watchdog_issues.get(key)
+            if last_alert is None:
+                self._log("error", "WATCHDOG", f"[{key}] {message}")
+                if self.notifier:
+                    self.notifier.send_health_alert(key, message, resolved=False)
+                self._active_watchdog_issues[key] = now
+            elif now - last_alert >= HEALTH_ALERT_COOLDOWN:
+                self._log("error", "WATCHDOG", f"[{key}] (still active) {message}")
+                if self.notifier:
+                    self.notifier.send_health_alert(key, message, resolved=False)
+                self._active_watchdog_issues[key] = now
+
+        resolved_keys = [k for k in self._active_watchdog_issues if k not in current_issues]
+        for key in resolved_keys:
+            self._log("info", "WATCHDOG", f"[{key}] condition cleared")
+            if self.notifier:
+                self.notifier.send_health_alert(key, "This condition is no longer present.", resolved=True)
+            del self._active_watchdog_issues[key]
+
     def process_candle(self, symbol: str, candle: dict) -> None:
         store = self.candle_store.get(symbol)
-        if store is None: return
-        if not validate_candle(candle, symbol): return
+        if store is None:
+            return
+        if not validate_candle(candle, symbol):
+            return
 
         if store and store[-1]["time"] == candle["time"]:
             store[-1] = candle
@@ -3603,8 +3830,10 @@ class TradingBot:
             return
 
         if store:
-            closed_candle  = store[-1]
+            closed_candle = store[-1]
             closed_candles = list(store)
+
+            self.last_candle_time[symbol] = time.time()
 
             self._log("info", "CANDLE-CLOSED",
                       f"{symbol} [{self.timeframe}] "
@@ -3628,9 +3857,13 @@ class TradingBot:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
             if symbol not in self.active_trades:
+                # *** BUG FIX applies here indirectly: is_limit_reached() no
+                # longer returns True when trading_capital/limit is 0, so
+                # this gate correctly lets the strategy checks below run.
                 if self.daily_loss_tracker.is_limit_reached():
-                    self._log("warning", "DAILY-LOSS", f"[{symbol}] Skipping signal check — daily loss limit hit")
+                    self._log("warning", "DAILY-LOSS", f"[{symbol}] Skipping signal check - daily loss limit hit")
                 else:
+                    self.last_eval_time[symbol] = time.time()
                     candle_list = list(store) + [candle]
 
                     if self.enable_short:
@@ -3641,14 +3874,14 @@ class TradingBot:
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
-                                          rsi_value, "SHORT", no_rsi=True)
+                                             rsi_value, "SHORT", no_rsi=True)
                         else:
                             triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
                                 candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                             )
                             if triggered and signal_candle is not None:
                                 self._on_signal(symbol, signal_candle, strategy_name,
-                                              rsi_value, "SHORT", no_rsi=False)
+                                                 rsi_value, "SHORT", no_rsi=False)
 
                     if self.enable_long and symbol not in self.active_trades:
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi(
@@ -3658,26 +3891,29 @@ class TradingBot:
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
-                                          rsi_value, "LONG", no_rsi=True)
+                                             rsi_value, "LONG", no_rsi=True)
                         else:
                             triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
                                 candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
                             )
                             if triggered and signal_candle is not None:
                                 self._on_signal(symbol, signal_candle, strategy_name,
-                                              rsi_value, "LONG", no_rsi=False)
+                                                 rsi_value, "LONG", no_rsi=False)
 
         store.append(candle)
 
     def _check_take_profit(self, symbol: str, candle: dict) -> None:
         trade = self.active_trades.get(symbol)
-        if not trade or "_reserved" in trade: return
-        if trade.get("st_mode", False): return
+        if not trade or "_reserved" in trade:
+            return
+        if trade.get("st_mode", False):
+            return
 
-        tp        = trade.get("take_profit")
+        tp = trade.get("take_profit")
         direction = trade.get("direction", "SHORT")
-        entry     = trade["entry"]
-        if tp is None: return
+        entry = trade["entry"]
+        if tp is None:
+            return
 
         if direction == "SHORT" and candle["low"] <= tp:
             _log("info", "TP-HIT", f"TAKE PROFIT HIT (intra-candle) | {symbol} | entry={smart_fmt(entry)} tp={smart_fmt(tp)}")
@@ -3689,11 +3925,13 @@ class TradingBot:
 
     def _check_stop_loss_on_close(self, symbol: str, closed_candle: dict) -> None:
         trade = self.active_trades.get(symbol)
-        if not trade or "_reserved" in trade: return
-        if trade.get("st_mode", False): return
+        if not trade or "_reserved" in trade:
+            return
+        if trade.get("st_mode", False):
+            return
 
-        sl          = trade["stop_loss"]
-        direction   = trade.get("direction", "SHORT")
+        sl = trade["stop_loss"]
+        direction = trade.get("direction", "SHORT")
         close_price = closed_candle["close"]
 
         if direction == "SHORT" and close_price >= sl:
@@ -3705,7 +3943,7 @@ class TradingBot:
             self._close_trade(symbol, trade, "STOP_LOSS")
 
     def _on_signal(self, symbol: str, signal_candle: dict, strategy_name: str,
-                   rsi_value: Optional[float], direction: str = "SHORT", 
+                   rsi_value: Optional[float], direction: str = "SHORT",
                    no_rsi: bool = False) -> None:
         entry = signal_candle["close"]
 
@@ -3725,7 +3963,7 @@ class TradingBot:
                     sl = signal_candle.get("pattern_high", signal_candle["high"])
             else:
                 store = self.candle_store.get(symbol)
-                sl    = list(store)[-2]["high"] if store and len(store) >= 2 else signal_candle["high"]
+                sl = list(store)[-2]["high"] if store and len(store) >= 2 else signal_candle["high"]
         else:
             if strategy_name in ("RESISTANCE_BREAKOUT_LONG", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"):
                 sl = signal_candle.get("pattern_low", signal_candle["low"])
@@ -3742,10 +3980,10 @@ class TradingBot:
                     sl = signal_candle.get("pattern_low", signal_candle["low"])
             else:
                 store = self.candle_store.get(symbol)
-                sl    = list(store)[-2]["low"] if store and len(store) >= 2 else signal_candle["low"]
+                sl = list(store)[-2]["low"] if store and len(store) >= 2 else signal_candle["low"]
 
         if abs(sl - entry) == 0:
-            self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} — skip")
+            self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} - skip")
             return
 
         tp = compute_take_profit(entry, sl, direction)
@@ -3796,8 +4034,8 @@ class TradingBot:
         rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
         stop_dist = abs(entry - sl)
         rr_actual = abs(entry - tp) / stop_dist if stop_dist > 0 else 0
-        direction_arrow = "↓ SHORT" if direction == "SHORT" else "↑ LONG"
-        
+        direction_arrow = "DOWN SHORT" if direction == "SHORT" else "UP LONG"
+
         strategy_category = ""
         if strategy_name in ("RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"):
             strategy_category = " [S/R FALSE BREAKOUT REVERSAL]"
@@ -3806,19 +4044,19 @@ class TradingBot:
         elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
             strategy_category = " [ENGULFING PATTERN]"
         elif strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
-            strategy_category = f" [HARAMI PATTERN - tol: {self.harami_tolerance*100:.2f}%]"
+            strategy_category = f" [HARAMI PATTERN - tol: {self.harami_tolerance * 100:.2f}%]"
         elif strategy_name in ("BEARISH_DOJI", "BULLISH_DOJI"):
-            strategy_category = f" [DOJI - body ≤ {DOJI_BODY_RATIO_MAX*100:.0f}%]"
+            strategy_category = f" [DOJI - body <= {DOJI_BODY_RATIO_MAX * 100:.0f}%]"
 
         print()
-        print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] — {strategy_name}{strategy_category}")
+        print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] - {strategy_name}{strategy_category}")
         print(f"           Entry       : {smart_fmt(entry)}")
         print(f"           Stop Loss   : {smart_fmt(sl)} (distance={smart_fmt(stop_dist)}) [CANDLE CLOSE]")
         print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
         print(f"           Risk        : ${risk_usd:,.2f} ({self.config['risk_pct']}%)")
         print(f"           RSI(14)     : {rsi_str}")
         if signal.get("breakout_level"):
-            stars = "★" * (signal.get("level_strength", 0) or 0)
+            stars = "*" * (signal.get("level_strength", 0) or 0)
             print(f"           S/R Level   : {smart_fmt(signal['breakout_level'])} {stars}")
             if signal.get("reversal_candle_close"):
                 print(f"           False Breakout Close: {smart_fmt(signal['reversal_candle_close'])}")
@@ -3837,33 +4075,45 @@ class TradingBot:
             self._execute_trade(symbol, signal)
 
         if self.on_signal_callback:
-            try: self.on_signal_callback(signal)
-            except Exception: pass
+            try:
+                self.on_signal_callback(signal)
+            except Exception:
+                pass
 
     def _execute_trade(self, symbol: str, signal: dict) -> None:
         try:
             with self._trade_lock:
-                if symbol in self.active_trades: return
+                if symbol in self.active_trades:
+                    return
                 self.active_trades[symbol] = {"_reserved": True}
 
             account_balance = self.rest.get_usd_balance() or 0.0
             capital = self.trading_capital
-            if capital <= 0: self._cleanup_trade(symbol); return
-            if account_balance < capital: capital = account_balance
-            if capital <= 0: self._cleanup_trade(symbol); return
+            if capital <= 0:
+                self._cleanup_trade(symbol)
+                return
+            if account_balance < capital:
+                capital = account_balance
+            if capital <= 0:
+                self._cleanup_trade(symbol)
+                return
 
             entry = signal["entry"]
             sl = signal["stop_loss"]
             tp = signal["take_profit"]
             direction = signal["direction"]
             pid = self.product_map.get(symbol)
-            if not pid: self._cleanup_trade(symbol); return
+            if not pid:
+                self._cleanup_trade(symbol)
+                return
 
             position_size, _ = compute_position_size(
                 entry_price=entry, stop_loss_price=sl,
                 account_balance=capital, risk_pct=self.risk_pct, leverage=self.leverage,
             )
-            if position_size < 1: self._cleanup_trade(symbol); return
+            if position_size < 1:
+                self._cleanup_trade(symbol)
+                return
 
             side = "sell" if direction == "SHORT" else "buy"
             entry_result = self.rest.place_order(
@@ -3871,19 +4121,21 @@ class TradingBot:
             )
 
             if not entry_result or "error" in entry_result:
-                self._cleanup_trade(symbol); return
+                self._cleanup_trade(symbol)
+                return
 
             order_result = entry_result.get("result", {})
             order_id = order_result.get("id")
             order_state = order_result.get("state", "")
 
             if order_state == "rejected" or not order_id:
-                self._cleanup_trade(symbol); return
+                self._cleanup_trade(symbol)
+                return
 
             filled, actual_filled_size = self.rest.wait_for_fill(order_id, symbol)
 
             if not filled or actual_filled_size < 1:
-                self._log("error", "TRADE", f"Fill not confirmed for {symbol} — attempting cancel...")
+                self._log("error", "TRADE", f"Fill not confirmed for {symbol} - attempting cancel...")
                 self.rest.cancel_order(order_id, pid)
                 self._log("error", "TRADE", f"IMPORTANT: Check {symbol} position manually. order_id={order_id}")
                 self._cleanup_trade(symbol)
@@ -3928,8 +4180,10 @@ class TradingBot:
                 self.notifier.send_trade_executed(trade_copy)
 
             if self.on_trade_callback:
-                try: self.on_trade_callback(signal)
-                except Exception: pass
+                try:
+                    self.on_trade_callback(signal)
+                except Exception:
+                    pass
 
         except Exception as exc:
             self._cleanup_trade(symbol)
@@ -3938,24 +4192,9 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA — TRADING BOT  v13.4           |")
-        print("|   S/R TIMING FIXED — TRADE ON CONFIRMATION CLOSE      |")
-        print("|                                                        |")
-        print("|   S/R BREAKOUT:                                        |")
-        print("|   Break candle closes beyond S/R → Next candle is     |")
-        print("|   confirmation → Confirm candle closes beyond break   |")
-        print("|   → IMMEDIATE TRADE on confirmation close             |")
-        print("|                                                        |")
-        print("|   S/R REVERSAL:                                        |")
-        print("|   False breakout → Next candle confirmation →         |")
-        print("|   → IMMEDIATE TRADE on confirmation close             |")
-        print("|                                                        |")
-        print("|   S/R REJECTION EMAILS:                               |")
-        print("|   Detailed reason for every failed S/R trade          |")
-        print("|   No duplicates per event                            |")
-        print("|                                                        |")
-        print("|   ALL STRATEGIES use unified trade execution          |")
-        print("|   SUPER-TREND MODE UNCHANGED                          |")
+        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v13.5 (FIXED)   |")
+        print("|   BUG FIX: daily loss limit no longer blocks trading  |")
+        print("|   when trading_capital is 0 / undefined               |")
         print("+========================================================+")
         print()
 
@@ -3971,21 +4210,23 @@ class TradingBot:
         print(f"  Take-Profit (def) : {TP_RR_RATIO:.1f}:1 (triggers on PRICE TOUCH)")
         print(f"  Take-Profit (ST)  : Both SuperTrends reverse direction")
         print(f"  Stop Loss         : Triggers on CANDLE CLOSE only (disabled in ST mode)")
-        print(f"  Daily loss cap    : {self.daily_loss_limit_pct*100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
+        print(f"  Daily loss cap    : {self.daily_loss_limit_pct * 100:.0f}%  =  ~${daily_limit_usd:,.2f} USD")
         print(f"  Leverage          : {self.leverage}x")
         print(f"  Max open trades   : {self.max_trades}")
         print(f"  SHORT TRADES      : {'ENABLED' if self.enable_short else 'DISABLED'}")
         print(f"  LONG TRADES       : {'ENABLED' if self.enable_long else 'DISABLED'}")
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
-        print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold — no trades)")
+        print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
         print(f"  S/R Rejection Log : Detailed reasons + email alerts")
         print(f"  S/R Merge         : DISABLED - every level separate")
         print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
-        print(f"  Price Precision   : auto dp via smart_fmt() — supports micro-price alts")
+        print(f"  Price Precision   : auto dp via smart_fmt() - supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
+        print(f"  Health Watchdog   : ENABLED (checks every {WATCHDOG_CHECK_INTERVAL // 60} min, "
+              f"emails on silent failure via GMAIL if enabled)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -4016,8 +4257,8 @@ def ask_timeframe() -> str:
 
 def ask_mode() -> Tuple[bool, str, str]:
     _divider("MODE")
-    print("  [1]  Paper Mode   — signals only, no real orders")
-    print("  [2]  Live Trading — real orders on Delta Exchange India")
+    print("  [1]  Paper Mode   - signals only, no real orders")
+    print("  [2]  Live Trading - real orders on Delta Exchange India")
     raw = input("  Enter 1 or 2 (default = 1) : ").strip()
     if raw == "2":
         _divider("API CREDENTIALS")
@@ -4037,14 +4278,14 @@ def ask_trade_directions() -> Tuple[bool, bool]:
     enable_short = input("  Enable SHORT trades? (Y/n) : ").strip().lower() != 'n'
     enable_long = input("  Enable LONG trades? (Y/n) : ").strip().lower() != 'n'
     if not enable_short and not enable_long:
-        print("\n  ⚠️  WARNING: Both short and long trades are disabled!")
+        print("\n  WARNING: Both short and long trades are disabled!")
         proceed = input("  Do you want to continue anyway? (y/N) : ").strip().lower()
         if proceed != 'y':
             print("  Restart and select at least one direction.")
             exit(0)
     print()
-    print(f"  Short trades: {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
-    print(f"  Long trades : {'ENABLED ✅' if enable_long else 'DISABLED ❌'}")
+    print(f"  Short trades: {'ENABLED' if enable_short else 'DISABLED'}")
+    print(f"  Long trades : {'ENABLED' if enable_long else 'DISABLED'}")
     print()
     return enable_short, enable_long
 
@@ -4082,7 +4323,8 @@ def ask_symbols(product_map: Dict[str, int]) -> List[str]:
     print("  Enter symbols (space/comma separated).")
     print("  Press Enter to AUTO-SELECT top 5 by volatility.")
     raw = input("  Symbols : ").strip().upper()
-    if not raw: return []
+    if not raw:
+        return []
     return [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
 
 
@@ -4101,12 +4343,14 @@ def ask_trading_capital(account_balance: float) -> float:
     _divider("TRADING CAPITAL")
     print(f"  Account balance : ${account_balance:,.2f} USD")
     raw = input(f"  Trading capital (default = ${account_balance:,.0f}) : ").strip()
-    if not raw: return account_balance
+    if not raw:
+        return account_balance
     try:
         capital = float(raw)
     except ValueError:
         capital = account_balance
-    if capital <= 0: return account_balance
+    if capital <= 0:
+        return account_balance
     if capital > account_balance:
         print(f"  [WARN] Capping to balance ${account_balance:,.2f}")
         capital = account_balance
@@ -4157,27 +4401,27 @@ def ask_harami_tolerance() -> float:
     try:
         tolerance = float(input("  Harami body tolerance (default = 0.001) : ").strip() or 0.001)
         if tolerance > 0.20:
-            print(f"  ⚠️  WARNING: {tolerance*100:.1f}% is very permissive!")
+            print(f"  WARNING: {tolerance * 100:.1f}% is very permissive!")
             proceed = input("  Continue with this value? (y/N) : ").strip().lower()
             if proceed != 'y':
                 return ask_harami_tolerance()
         tolerance = max(0.0001, tolerance)
     except ValueError:
         tolerance = 0.001
-    print(f"  Harami tolerance : {tolerance*100:.2f}%")
+    print(f"  Harami tolerance : {tolerance * 100:.2f}%")
     return tolerance
 
 
 def test_gmail():
-    print("\n  📧 TESTING GMAIL NOTIFICATIONS")
+    print("\n  TESTING GMAIL NOTIFICATIONS")
     print("  " + "=" * 50)
     sender = input("  Your Gmail address: ").strip()
     if not sender:
-        print("  ❌ Invalid email. Test cancelled.")
+        print("  Invalid email. Test cancelled.")
         return
     app_password = input("  Gmail App Password: ").strip()
     if not app_password:
-        print("  ❌ Invalid password. Test cancelled.")
+        print("  Invalid password. Test cancelled.")
         return
     notifier = GmailNotifier(
         sender_email=sender,
@@ -4185,7 +4429,7 @@ def test_gmail():
         recipient_emails=[sender],
         enabled=True,
     )
-    print("\n  📤 Sending test signal notification...")
+    print("\n  Sending test signal notification...")
     success = notifier.send_signal({
         "direction": "LONG",
         "symbol": "BTCUSD_PERP",
@@ -4202,66 +4446,9 @@ def test_gmail():
         "no_rsi": False,
     })
     if success:
-        print("  ✅ Test email sent successfully!")
-        print("\n  📤 Sending test SuperTrend confirmation notification...")
-        notifier.send_supertrend_strong(
-            symbol="BTCUSD_PERP", direction="LONG", entry=65000.0,
-            new_tp=0.0, st1=64200.0, st2=63800.0, timeframe="1h", mode="PAPER",
-        )
-        print("  ✅ SuperTrend test email sent!")
-        print("\n  📤 Sending test S/R level notification...")
-        notifier.send_sr_level_event(
-            symbol="BTCUSD_PERP",
-            event_type="NEW",
-            level_data={"price": 64800.0, "strength": 2, "touches": 3, "age": 5, "type": "RESISTANCE"},
-            all_supports=[
-                {"price": 62000.0, "strength": 3, "touches": 8, "age": 10},
-                {"price": 63500.0, "strength": 1, "touches": 2, "age": 3},
-            ],
-            all_resistances=[
-                {"price": 64800.0, "strength": 2, "touches": 3, "age": 5},
-                {"price": 66000.0, "strength": 4, "touches": 12, "age": 20},
-            ]
-        )
-        print("  ✅ S/R test email sent!")
-        print("\n  📤 Sending test S/R REPLACEMENT notification...")
-        notifier.send_sr_level_event(
-            symbol="BTCUSD_PERP",
-            event_type="REPLACED",
-            level_data={
-                "price": 65200.0,
-                "strength": 2,
-                "touches": 4,
-                "age": 0,
-                "type": "RESISTANCE",
-                "old_price": 64800.0,
-                "new_price": 65200.0,
-                "break_price": 64950.0,
-                "candle_type": "BREAKOUT"
-            },
-            all_supports=[
-                {"price": 62000.0, "strength": 3, "touches": 8, "age": 10},
-                {"price": 63500.0, "strength": 1, "touches": 2, "age": 3},
-            ],
-            all_resistances=[
-                {"price": 65200.0, "strength": 2, "touches": 4, "age": 0},
-                {"price": 66000.0, "strength": 4, "touches": 12, "age": 20},
-            ]
-        )
-        print("  ✅ S/R REPLACEMENT test email sent!")
-        print("\n  📤 Sending test S/R REJECTION notification...")
-        notifier.send_sr_rejection(
-            symbol="BTCUSD_PERP",
-            direction="LONG",
-            level_price=64800.0,
-            breakout_close=64950.0,
-            confirm_close=64850.0,
-            rejection_reason="Confirmation candle is not Bullish (close=64850.0, open=64900.0)",
-            strategy="RESISTANCE_BREAKOUT_LONG"
-        )
-        print("  ✅ S/R REJECTION test email sent!")
+        print("  Test email sent successfully!")
     else:
-        print("  ❌ Failed to send email. Check your App Password and settings.")
+        print("  Failed to send email. Check your App Password and settings.")
 
 
 # ================================================================
@@ -4271,28 +4458,7 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +======================================================+")
-    print("  |   DELTA EXCHANGE INDIA  —  TRADING BOT  v13.4       |")
-    print("  |   S/R TIMING FIXED — TRADE ON CONFIRMATION CLOSE    |")
-    print("  |                                                        |")
-    print("  |   S/R BREAKOUT:                                       |")
-    print("  |   Break candle closes beyond S/R → Next candle is    |")
-    print("  |   confirmation → Confirm candle closes beyond break  |")
-    print("  |   → IMMEDIATE TRADE on confirmation close            |")
-    print("  |                                                        |")
-    print("  |   S/R REVERSAL:                                       |")
-    print("  |   False breakout → Next candle confirmation →        |")
-    print("  |   → IMMEDIATE TRADE on confirmation close            |")
-    print("  |                                                        |")
-    print("  |   S/R REJECTION EMAILS:                              |")
-    print("  |   Detailed reason for every failed S/R trade         |")
-    print("  |   No duplicates per event                           |")
-    print("  |                                                        |")
-    print("  |   ALL STRATEGIES use unified trade execution          |")
-    print("  |   SUPER-TREND MODE UNCHANGED                          |")
-    print("  |                                                        |")
-    print("  |   STOP LOSS on CANDLE CLOSE | TP on PRICE TOUCH     |")
-    print("  |   DUAL SUPERTREND TP EXTENSION                       |")
-    print("  |   ST(14,2) + ST(21,1) — confirm & exit              |")
+    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v13.5 FIXED |")
     print("  +======================================================+")
 
     _divider("SETUP")
@@ -4340,8 +4506,8 @@ def main() -> None:
     daily_limit_usd = trading_capital * (daily_loss_limit_pct / 100)
     print(f"  Mode              : {'PAPER' if paper else 'LIVE TRADING'}")
     print(f"  Timeframe         : {timeframe}")
-    print(f"  Short Trades      : {'ENABLED ✅' if enable_short else 'DISABLED ❌'}")
-    print(f"  Long Trades       : {'ENABLED ✅' if enable_long else 'DISABLED ❌'}")
+    print(f"  Short Trades      : {'ENABLED' if enable_short else 'DISABLED'}")
+    print(f"  Long Trades       : {'ENABLED' if enable_long else 'DISABLED'}")
     print(f"  Symbols           : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
     print(f"  Leverage          : {leverage}x")
     print(f"  Trading capital   : ${trading_capital:,.2f}")
@@ -4352,29 +4518,12 @@ def main() -> None:
     print(f"  Daily loss cap    : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f}")
     print(f"  Max open trades   : {max_trades}")
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
-    print(f"  SuperTrend 1      : Length={ST1_LENGTH}, Factor={ST1_FACTOR}")
-    print(f"  SuperTrend 2      : Length={ST2_LENGTH}, Factor={ST2_FACTOR}")
-    print(f"  RSI LONG BLOCK    : RSI(14) < 24")
-    print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
-    print(f"  S/R Max Age       : {SR_MAX_LEVEL_AGE} candles base +15 per strength level")
-    print(f"  S/R Ready         : IMMEDIATELY (no aging required)")
-    print(f"  S/R Replacement   : Broken level → immediate replacement on failed confirmation")
-    print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
-    print(f"  S/R Rejection Log : Detailed reasons + email alerts")
-    print(f"  S/R Merge         : DISABLED - every level separate")
-    print(f"  CANDLESTICK PATTERNS (RSI-based):")
-    print(f"    • Bearish Engulfing: Bullish → Bearish engulf")
-    print(f"    • Bullish Engulfing: Bearish → Bullish engulf")
-    print(f"    • Bearish Harami: Bullish → Bearish inside body (tol: {harami_tolerance*100:.2f}%)")
-    print(f"    • Bullish Harami: Bearish → Bullish inside body (tol: {harami_tolerance*100:.2f}%)")
-    print(f"  Doji Strategy     : 2 candle breakout + Doji (body ≤ 30%) + Confirmation")
-    print(f"  Vol Expansion     : 21-candle range break (NO WICK CONDITIONS)")
-    print(f"  Range Break       : Rolling 7-candle range")
-    print(f"  S/R Breakout      : 100-candle S/R, NO MERGE")
-    print(f"  S/R Reversal      : False breakout + confirmation candle")
-    print(f"  S/R Min Strength  : {SR_MIN_STRENGTH} (★ or higher required)")
-    print(f"  Price Precision   : auto dp — altcoin micro-prices supported")
     print()
+
+    if trading_capital <= 0:
+        print("  [ERROR] Trading capital is $0 - the bot cannot start. Enter a positive amount.")
+        return
+
     confirm = input("  Type YES to start the bot : ").strip().upper()
     if confirm != "YES":
         print("  Cancelled.")
