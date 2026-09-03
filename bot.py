@@ -1,13 +1,3 @@
-# ================================================================
-#  DELTA EXCHANGE INDIA - TRADING BOT  v14.0 (RESILIENT)
-#  Full code with fixes for:
-#  - Forming-candle duplication bug eliminated
-#  - REST + WebSocket timestamps normalized to Unix seconds
-#  - Automatic stale-feed recovery (reconnect + resubscribe + backfill)
-#  - Watchdog distinguishes NO_CANDLES / STALE / EVAL_BLOCKED / WS_DOWN
-#  - Per-symbol processing error auto-reset after 3 consecutive failures
-# ================================================================
-
 import sys
 import io
 
