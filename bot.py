@@ -3789,17 +3789,118 @@ class TradingBot:
         self._log("info", "BOT", "Bot stopped.")
 
     def _fetch_all_historical(self) -> None:
+        """
+        Load historical OHLCV candles for every symbol, and immediately run
+        the existing S/R detection logic (SRLevelManager.update_levels) on
+        the confirmed-closed portion of that history, so S/R levels are
+        already populated and available to the existing S/R strategies
+        before the bot ever waits for its first live candle close.
+
+        This function only changes WHEN/how the existing S/R detection is
+        first invoked (at startup, on historical data) - it does not alter
+        SRLevelManager's detection logic itself, nor any strategy, signal,
+        execution, TP/SL, risk, or watchdog behavior. After startup, the
+        existing per-live-candle-close flow in _process_closed_candle()
+        continues to call sr_manager.update_levels() exactly as before.
+        """
         self._log("info", "CANDLES", f"Loading {CANDLE_LIMIT} candles x {self.timeframe} for {len(self.symbols)} symbol(s)")
+        tf_secs = self._tf.secs
+
         for sym in self.symbols:
             try:
-                candles = self.rest.get_candles_with_retry(sym, self.api_resolution, CANDLE_LIMIT)
-                if candles:
-                    for c in candles:
-                        self.candle_store[sym].append(c)
-                    self._last_closed_time[sym] = candles[-1]["time"]
-                    self._log("info", "CANDLES", f"  [OK] {sym}: {len(candles)} candles loaded | last_close={smart_fmt(candles[-1]['close'])} | t={candles[-1]['time']}")
-                else:
+                raw_candles = self.rest.get_candles_with_retry(sym, self.api_resolution, CANDLE_LIMIT)
+                if not raw_candles:
                     self._log("warning", "CANDLES", f"  [WARN] {sym}: 0 candles after retries.")
+                    continue
+
+                # Step 2: normalize timestamps, sort, remove duplicates.
+                # get_candles() already normalizes/sorts/dedupes internally,
+                # but we defensively repeat it here so this startup path is
+                # self-contained and correct even if the candle list arrives
+                # from elsewhere in the future.
+                normalized: List[dict] = []
+                for row in raw_candles:
+                    ts = normalize_timestamp_to_seconds(row.get("time"))
+                    if ts is None:
+                        continue
+                    c = dict(row)
+                    c["time"] = ts
+                    if validate_candle(c, sym):
+                        normalized.append(c)
+
+                dedup: Dict[int, dict] = {}
+                for c in normalized:
+                    dedup[c["time"]] = c
+                sorted_candles = sorted(dedup.values(), key=lambda x: x["time"])
+
+                if not sorted_candles:
+                    self._log("warning", "CANDLES", f"  [WARN] {sym}: no valid candles after normalization.")
+                    continue
+
+                # Step 3 & 4: exclude the currently forming/incomplete
+                # candle - keep only candles whose own period has fully
+                # elapsed by wall-clock time, i.e. genuinely confirmed
+                # closed candles.
+                now_ts = time.time()
+                confirmed_closed = [
+                    c for c in sorted_candles
+                    if (c["time"] + tf_secs) <= now_ts
+                ]
+
+                if not confirmed_closed:
+                    self._log("warning", "CANDLES", f"  [WARN] {sym}: no confirmed closed candles (all excluded as forming).")
+                    continue
+
+                for c in confirmed_closed:
+                    self.candle_store[sym].append(c)
+                self._last_closed_time[sym] = confirmed_closed[-1]["time"]
+                self._log("info", "CANDLES",
+                          f"  [OK] {sym}: {len(confirmed_closed)} confirmed closed candles loaded | "
+                          f"last_close={smart_fmt(confirmed_closed[-1]['close'])} | t={confirmed_closed[-1]['time']}")
+
+                # Step 5, 6 & 7: immediately run the EXISTING S/R detection
+                # logic (SRLevelManager.update_levels - unchanged) on all
+                # confirmed historical closed candles, storing whatever it
+                # detects in the existing S/R manager for this symbol, so
+                # those levels are available to the existing S/R strategies
+                # right away - no changes to detection conditions/logic.
+                self._log("info", "S/R-INIT",
+                          f"[{sym}] Historical S/R detection started ({len(confirmed_closed)} confirmed closed candles)")
+
+                sr_manager = self.sr_managers.get(sym)
+                if sr_manager:
+                    try:
+                        sr_manager.update_levels(confirmed_closed)
+                    except Exception as e:
+                        _log_exc("S/R-INIT", f"[{sym}] historical S/R detection failed: {e}")
+
+                    with sr_manager._lock:
+                        support_snapshot = sorted(sr_manager.support_levels, key=lambda x: x["price"])
+                        resistance_snapshot = sorted(sr_manager.resistance_levels, key=lambda x: x["price"])
+
+                    if support_snapshot:
+                        support_str = ", ".join(
+                            f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
+                            for l in support_snapshot
+                        )
+                        self._log("info", "S/R-INIT", f"[{sym}] Detected SUPPORT levels: {support_str}")
+                    else:
+                        self._log("info", "S/R-INIT", f"[{sym}] No support levels detected from historical closed candles.")
+
+                    if resistance_snapshot:
+                        resistance_str = ", ".join(
+                            f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
+                            for l in resistance_snapshot
+                        )
+                        self._log("info", "S/R-INIT", f"[{sym}] Detected RESISTANCE levels: {resistance_str}")
+                    else:
+                        self._log("info", "S/R-INIT", f"[{sym}] No resistance levels detected from historical closed candles.")
+
+                    if not support_snapshot and not resistance_snapshot:
+                        self._log("warning", "S/R-INIT", f"[{sym}] No valid S/R detected from historical closed candles.")
+                else:
+                    self._log("warning", "S/R-INIT", f"[{sym}] No S/R manager found for symbol - skipping historical S/R detection.")
+
             except Exception as e:
                 _log_exc("CANDLES", f"  [ERROR] {sym}: historical load failed, continuing with other symbols: {e}")
 
@@ -4804,7 +4905,7 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.0 (RESILIENT) |")
+        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.1 (RESILIENT) |")
         print("|   FIX: forming-candle duplication bug eliminated - the   |")
         print("|   candle store no longer fills with duplicate-timestamp |")
         print("|   entries from repeated live ticks                       |")
@@ -4816,6 +4917,9 @@ class TradingBot:
         print("|   candle ticks included) is tracked separately from     |")
         print("|   closed-candle timing, so a candle that simply hasn't  |")
         print("|   closed yet never triggers a false recovery             |")
+        print("|   NEW: historical S/R levels are detected immediately    |")
+        print("|   at startup from confirmed closed candles - no need to |")
+        print("|   wait for the first live candle close                   |")
         print("+========================================================+")
         print()
 
@@ -4841,6 +4945,7 @@ class TradingBot:
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
+        print(f"  S/R Init          : Historical S/R detected immediately at startup")
         print(f"  S/R Rejection Log : Detailed reasons + email alerts")
         print(f"  S/R Merge         : DISABLED - every level separate")
         print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
@@ -5085,7 +5190,7 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +========================================================+")
-    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.0 RESILIENT |")
+    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.1 RESILIENT |")
     print("  +========================================================+")
 
     _divider("SETUP")
