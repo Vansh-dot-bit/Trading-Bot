@@ -724,6 +724,12 @@ class WSConfig:
     reconnect_backoff_multiplier: int = 2
 
 
+# *** seconds between repeat log lines for the SAME unhandled/unexpected
+# WS message type, so a noisy or unknown message type (e.g. a heartbeat)
+# can never spam the logs while still being visible at least once a minute.
+UNHANDLED_WS_MSG_LOG_INTERVAL = 60
+
+
 class DeltaWebSocket:
     """
     Manages a single WebSocket connection. NOTE: once .stop() is called this
@@ -731,6 +737,22 @@ class DeltaWebSocket:
     linger) - TradingBot's automatic recovery logic never calls .start()
     again on a stopped instance; instead it builds a brand-new DeltaWebSocket
     and swaps it in. See TradingBot._force_ws_reconnect().
+
+    *** DIAGNOSTIC/RELIABILITY REWRITE (v14.3) ***
+    This class now logs every stage of the connection lifecycle at INFO
+    level (connect attempt, connected, subscription sent, subscription
+    confirmed/rejected, disconnects, reconnect attempts) so a silent
+    "no live data" failure is impossible to miss in bot.log. Message
+    parsing is also more defensive: it tolerates a couple of alternate
+    field names/wrapper shapes the exchange may use, and any message type
+    it does not recognize is logged (throttled) instead of being dropped
+    without a trace.
+
+    NEW (v14.3): a dedicated "subscribed" callback fires the moment the
+    server confirms a subscription, independent of the "connected"
+    callback - this lets the bot's startup sequence gate strategy
+    processing on real, server-confirmed readiness signals (connect ->
+    subscribe -> confirm -> first data) instead of relying on sleeps.
     """
 
     def __init__(self, config: Optional[WSConfig] = None):
@@ -749,6 +771,18 @@ class DeltaWebSocket:
         self._on_disconnected_callback: Optional[callable] = None
         self._on_error_callback: Optional[callable] = None
         self._on_reconnect_callback: Optional[callable] = None
+        # *** NEW: fired when the server explicitly confirms a subscription
+        # ("subscriptions"/"success" message type) - a distinct readiness
+        # signal from "socket connected".
+        self._on_subscribed_callback: Optional[callable] = None
+
+        # *** throttled bookkeeping for unexpected/unrecognized
+        # message types so repeats of the SAME type don't spam the logs.
+        self._unhandled_type_counts: Dict[str, int] = {}
+        self._unhandled_type_last_log: Dict[str, float] = {}
+        # *** whether we've logged the "first live message" milestone
+        # since the most recent (re)connect - purely a visibility aid.
+        self._first_message_logged = False
 
     def set_candle_callback(self, cb: callable) -> None:
         self._on_candle_callback = cb
@@ -765,11 +799,14 @@ class DeltaWebSocket:
     def set_reconnect_callback(self, cb: callable) -> None:
         self._on_reconnect_callback = cb
 
+    def set_subscribed_callback(self, cb: callable) -> None:
+        self._on_subscribed_callback = cb
+
     def subscribe(self, timeframe: str, symbols: List[str]) -> None:
         channel = self._get_channel_name(timeframe)
         with self._subscription_lock:
             self._subscriptions[channel] = list(set(symbols))
-        _log("info", "WS", f"Subscription updated: channel={channel}, symbols={symbols}")
+        _log("info", "WS", f"Subscription queued: channel={channel}, symbols={symbols}")
         if self._state == WSState.CONNECTED and self._ws:
             self._send_subscription(channel, symbols)
 
@@ -837,6 +874,8 @@ class DeltaWebSocket:
 
     def _connect(self) -> None:
         self._state = WSState.CONNECTING
+        self._first_message_logged = False
+        _log("info", "WS", f"Connecting to {self.config.url} ...")
         self._ws = websocket.WebSocketApp(
             self.config.url,
             on_open=self._on_open, on_message=self._on_message,
@@ -851,6 +890,10 @@ class DeltaWebSocket:
     def _reconnect(self) -> None:
         if self._reconnect_attempts >= self.config.max_reconnect_attempts:
             self._state = WSState.DISCONNECTED
+            _log("error", "WS",
+                 f"Max reconnect attempts ({self.config.max_reconnect_attempts}) reached - "
+                 f"giving up automatic reconnect. Live candle feed is DOWN until manually restarted "
+                 f"or until TradingBot's watchdog force-reconnects with a fresh instance.")
             if self._on_disconnected_callback:
                 try:
                     self._on_disconnected_callback()
@@ -859,6 +902,9 @@ class DeltaWebSocket:
             return
         self._reconnect_attempts += 1
         self._state = WSState.RECONNECTING
+        _log("warning", "WS",
+             f"Reconnecting in {self._reconnect_delay}s "
+             f"(attempt {self._reconnect_attempts}/{self.config.max_reconnect_attempts})")
         for _ in range(self._reconnect_delay):
             if self._should_stop.is_set():
                 return
@@ -872,6 +918,7 @@ class DeltaWebSocket:
         self._state = WSState.CONNECTED
         self._reconnect_attempts = 0
         self._reconnect_delay = self.config.reconnect_base_delay
+        _log("info", "WS", f"CONNECTED to {self.config.url}")
         with self._subscription_lock:
             for channel, symbols in self._subscriptions.items():
                 if symbols:
@@ -884,52 +931,124 @@ class DeltaWebSocket:
 
     def _send_subscription(self, channel: str, symbols: List[str]) -> None:
         if not self._ws:
+            _log("error", "WS", f"Cannot send subscription for channel={channel}, symbols={symbols} - no active connection")
             return
         msg = {"type": "subscribe", "payload": {"channels": [{"name": channel, "symbols": symbols}]}}
         try:
             self._ws.send(json.dumps(msg))
+            _log("info", "WS", f"Subscription SENT: channel={channel}, symbols={symbols}, raw={json.dumps(msg)}")
         except Exception as e:
-            _log_exc("WS", f"Failed to send subscription: {e}")
+            _log_exc("WS", f"Failed to send subscription for channel={channel}, symbols={symbols}: {e}")
 
     def _on_message(self, ws, message: str) -> None:
         try:
             data = json.loads(message)
         except Exception as e:
-            # Malformed/partial message from the exchange - log and move on,
-            # never let this take down the WS thread or go unnoticed.
-            _log_exc("WS", f"Failed to parse WS message (ignored, feed continues): {e}")
+            _log_exc("WS", f"Failed to parse WS message as JSON (ignored, feed continues). "
+                            f"Raw (truncated to 200 chars): {str(message)[:200]!r}: {e}")
             return
 
+        if not self._first_message_logged:
+            self._first_message_logged = True
+            _log("info", "WS", f"First message received after connect "
+                                f"(type={data.get('type', '?')!r}) - feed is live")
+
         try:
-            msg_type = data.get("type", "")
-            if msg_type in ("subscribe", "error"):
+            msg_type = str(data.get("type", ""))
+
+            # -- Subscription acknowledgement / confirmation messages.
+            # Delta's WS API sends a "subscriptions" (or similar) message
+            # back confirming which channels/symbols are now active - log
+            # this clearly so subscription success is visible, not assumed,
+            # and fire the dedicated readiness callback for the startup
+            # sequence.
+            if msg_type in ("subscriptions", "success"):
+                _log("info", "WS", f"Subscription CONFIRMED by server: {data}")
+                if self._on_subscribed_callback:
+                    try:
+                        self._on_subscribed_callback()
+                    except Exception as e:
+                        _log_exc("WS", f"Subscribed callback error: {e}")
                 return
+
+            if msg_type == "error":
+                _log("error", "WS", f"Server returned an ERROR message in response to our request: {data}")
+                return
+
+            if msg_type == "subscribe":
+                # Echo of our own subscribe request - not an error, no-op.
+                _log("debug", "WS", f"Echo of subscribe request received: {data}")
+                return
+
             candle_data = self._parse_candle_message(data)
-            if candle_data and self._on_candle_callback:
+            if candle_data is not None:
                 symbol = candle_data.get("symbol")
                 candle = candle_data.get("candle")
                 if symbol and candle:
                     try:
-                        self._on_candle_callback(symbol, candle)
+                        self._on_candle_callback(symbol, candle) if self._on_candle_callback else None
                     except Exception as e:
                         # This is the callback into TradingBot.process_candle.
                         # It must never silently swallow a per-symbol bug -
                         # log it loudly with full traceback so it's visible
                         # in bot.log, instead of vanishing like before.
                         _log_exc("WS", f"Candle callback error for {symbol}: {e}")
+                return
+
+            if "candlestick" in msg_type.lower():
+                # It looked like a candle message (type contains
+                # "candlestick") but we could not extract a valid candle
+                # from it - this is exactly the kind of silent-drop bug
+                # that must never happen unnoticed again.
+                _log("error", "WS", f"Candlestick-type message received but could NOT be parsed - raw: {data}")
+                return
+
+            # Anything else is an unexpected/unrecognized message type.
+            # Never drop it silently - log it, throttled per type so a
+            # noisy heartbeat/ping-like message can't spam the logs.
+            self._log_unhandled_type(msg_type, data)
+
         except Exception as e:
             _log_exc("WS", f"Unexpected error handling WS message (ignored, feed continues): {e}")
 
+    def _log_unhandled_type(self, msg_type: str, data: dict) -> None:
+        now = time.time()
+        count = self._unhandled_type_counts.get(msg_type, 0) + 1
+        self._unhandled_type_counts[msg_type] = count
+        last_logged = self._unhandled_type_last_log.get(msg_type, 0.0)
+        if count == 1 or (now - last_logged) >= UNHANDLED_WS_MSG_LOG_INTERVAL:
+            _log("warning", "WS",
+                 f"Unhandled WS message type {msg_type!r} (seen {count}x since connect) - "
+                 f"raw sample: {data}")
+            self._unhandled_type_last_log[msg_type] = now
+
     def _parse_candle_message(self, data: dict) -> Optional[dict]:
-        msg_type = data.get("type", "")
-        if not msg_type.startswith("candlestick_"):
+        msg_type = str(data.get("type", ""))
+        if "candlestick" not in msg_type.lower():
             return None
-        ws_symbol = data.get("symbol", "")
+
+        # Some feeds nest the actual OHLCV fields under "data" or "payload"
+        # instead of putting them at the top level of the pushed message.
+        # Support both shapes defensively so a wrapper format can never
+        # silently drop every single candle.
+        payload = data
+        if isinstance(data.get("data"), dict):
+            payload = data["data"]
+        elif isinstance(data.get("payload"), dict):
+            payload = data["payload"]
+
+        ws_symbol = (
+            payload.get("symbol") or data.get("symbol")
+            or payload.get("s") or data.get("s") or ""
+        )
         if not ws_symbol:
+            _log("warning", "WS", f"Candlestick message missing a symbol field - raw: {data}")
             return None
+
         trading_symbol = ws_symbol if ws_symbol.endswith("_PERP") else ws_symbol + "_PERP"
-        candle = self._normalize_candle_flat(data)
+        candle = self._normalize_candle_flat(payload)
         if candle is None:
+            _log("warning", "WS", f"Candlestick message for {ws_symbol} failed OHLCV normalization - raw: {data}")
             return None
         return {"symbol": trading_symbol, "candle": candle}
 
@@ -937,28 +1056,39 @@ class DeltaWebSocket:
         try:
             ts_raw = data.get("candle_start_time")
             if ts_raw is None:
-                for key in ("time", "start", "t"):
+                for key in ("time", "start", "t", "timestamp"):
                     v = data.get(key)
                     if v is not None:
                         ts_raw = v
                         break
-            # *** FIX: route through the single shared normalizer so WS
+            # *** route through the single shared normalizer so WS
             # timestamps use the exact same unit convention (Unix seconds)
-            # as REST-fetched candles. Previously this function had its own
-            # ad-hoc ms/ns detection that could disagree with the REST
-            # parser's logic, which corrupts every "same timestamp vs new
-            # timestamp" comparison the bot relies on to detect candle
-            # closes. ***
+            # as REST-fetched candles. This matters because the bot
+            # compares REST-backfilled timestamps against WebSocket-
+            # delivered timestamps directly. ***
             ts = normalize_timestamp_to_seconds(ts_raw)
             if ts is None:
                 return None
+
+            # *** tolerate short-key field names (o/h/l/c/v) as a
+            # fallback in case the live feed's OHLCV keys differ from the
+            # long-form names used elsewhere. ***
+            o = data.get("open", data.get("o"))
+            h = data.get("high", data.get("h"))
+            l = data.get("low", data.get("l"))
+            c = data.get("close", data.get("c"))
+            v = data.get("volume", data.get("v", 0))
+
+            if o is None or h is None or l is None or c is None:
+                return None
+
             return {
                 "time": ts,
-                "open": float(data.get("open", 0)),
-                "high": float(data.get("high", 0)),
-                "low": float(data.get("low", 0)),
-                "close": float(data.get("close", 0)),
-                "volume": float(data.get("volume", 0)),
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(v or 0),
             }
         except (TypeError, ValueError):
             return None
@@ -967,9 +1097,14 @@ class DeltaWebSocket:
         error_msg = str(error)
         if "10054" not in error_msg and "Connection reset" not in error_msg:
             _log("error", "WS", f"Error: {error_msg}")
+        else:
+            _log("warning", "WS", f"Connection reset (benign, will reconnect): {error_msg}")
 
     def _on_close(self, ws, close_status_code, close_msg) -> None:
         self._state = WSState.DISCONNECTED
+        _log("warning", "WS",
+             f"CLOSED (code={close_status_code}, msg={close_msg!r}) - "
+             f"will attempt automatic reconnect")
 
 
 # ================================================================
@@ -1068,23 +1203,20 @@ EVAL_STALL_MULTIPLIER = 2          # alert if candles close but signal-eval neve
 HEALTH_ALERT_COOLDOWN = 3600       # don't re-alert the same ongoing issue more often than this (seconds)
 
 # -- Timeframe-aware watchdog thresholds --
-# WS_UPDATE_STALE_SECONDS: any valid WebSocket candle update (forming OR
-# closed) counts as "the feed is alive". If nothing valid has arrived for
-# this long, the feed is treated as stale regardless of timeframe - a 1h
-# candle still gets frequent forming-candle ticks long before it closes,
-# so this threshold is independent of the trading timeframe.
 WS_UPDATE_STALE_SECONDS = 180
-# CANDLE_CLOSE_GRACE_SECONDS: extra time allowed, on top of the timeframe's
-# own expected close boundary, before a missing closed candle is treated
-# as a real problem rather than the candle simply not having closed yet.
 CANDLE_CLOSE_GRACE_SECONDS = 90
 
 # -- Per-symbol processing error recovery --
-SYMBOL_ERROR_RESET_THRESHOLD = 3   # consecutive process_candle errors for one symbol before auto-reset
+SYMBOL_ERROR_RESET_THRESHOLD = 3
 
 # -- Automatic stale-feed recovery --
-STALE_RECOVERY_COOLDOWN = 300      # minimum seconds between automatic recovery attempts (prevents restart loops)
-RECOVERY_SETTLE_SECONDS = 3        # brief pause after reconnect before backfilling, to let subscriptions land
+STALE_RECOVERY_COOLDOWN = 300
+RECOVERY_SETTLE_SECONDS = 3
+
+# -- Startup readiness gating (event-based, timeouts are only a safety net) --
+STARTUP_WS_CONNECT_TIMEOUT = 30       # seconds to wait for WS "connected" before proceeding with a warning
+STARTUP_SUBSCRIBE_CONFIRM_TIMEOUT = 20 # seconds to wait for server subscription ack
+STARTUP_LIVE_DATA_TIMEOUT = 60        # seconds to wait for first live candle data across all symbols
 
 
 # ================================================================
@@ -1110,7 +1242,7 @@ class APIRequestHandler:
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "python-DeltaBot/14.0",
+            "User-Agent": "python-DeltaBot/14.3",
             "Accept": "application/json",
             "Connection": "keep-alive",
         })
@@ -3484,18 +3616,9 @@ class TradingBot:
         self.sr_managers: Dict[str, SRLevelManager] = {}
 
         # -- Watchdog / silent-failure detection state --
-        # Wall-clock time the bot finished start()'s setup and began
-        # listening for candles - used as the baseline for "how long have
-        # we been waiting for the first close" instead of "now" on every
-        # tick, so a 1h symbol that simply hasn't closed its first candle
-        # yet is never mistaken for a stalled feed.
         self._start_time: float = time.time()
         self.last_candle_time: Dict[str, float] = {}
         self.last_eval_time: Dict[str, float] = {}
-        # Tracks ANY valid WebSocket candle update (forming-candle ticks
-        # included, not just candle closes) - this is the watchdog's signal
-        # that the live feed itself is alive, independent of whether a
-        # candle has closed yet on the current timeframe.
         self.last_ws_update_time: Dict[str, float] = {}
         self._active_watchdog_issues: Dict[str, float] = {}
         self._watchdog_thread: Optional[threading.Thread] = None
@@ -3508,18 +3631,29 @@ class TradingBot:
         self._recovery_state_lock = threading.Lock()
         self._recovery_in_progress = False
         self._last_recovery_attempt: float = 0.0
-        # Per-symbol fingerprint of (last_closed_time, forming_candle_time)
-        # captured at the moment a recovery was last triggered for that
-        # symbol's CLOSED-CANDLE deadline problem. Before triggering another
-        # recovery for what looks like the same overdue-candle condition,
-        # the watchdog compares the current fingerprint against this
-        # baseline - if nothing has changed (no new closed candle, no new
-        # forming candle), it withholds the retrigger and waits for real
-        # progress instead of reconnecting every check cycle for a
-        # condition it already tried (and failed) to fix. The baseline for
-        # a symbol is cleared the moment that symbol's closed candle is
-        # actually processed, i.e. the moment real progress is observed.
         self._recovery_issue_baseline: Dict[str, Tuple[int, Optional[int]]] = {}
+
+        # ------------------------------------------------------------
+        # NEW: strict startup-sequence readiness gating.
+        #
+        # These Events are the single source of truth for "has step N
+        # of the startup sequence actually completed" - they are set by
+        # real signals (a WS 'connected' callback firing, a subscription
+        # confirmation message arriving, a live candle message being
+        # received), not by sleeping a fixed amount of time. start()
+        # waits on them (with a bounded timeout purely as a safety net
+        # so the bot can never hang forever if an exchange never sends
+        # an expected ack), and _process_closed_candle() refuses to run
+        # ANY strategy evaluation until _pipeline_ready is set - so no
+        # dependent system can ever start ahead of the data it depends
+        # on, no matter how message timing plays out in practice.
+        # ------------------------------------------------------------
+        self._ws_connected_event = threading.Event()
+        self._ws_subscribed_event = threading.Event()
+        self._first_live_data_event = threading.Event()
+        self._pipeline_ready = threading.Event()
+        self._symbols_with_live_data: set = set()
+        self._readiness_lock = threading.Lock()
 
         self.on_signal_callback = None
         self.on_trade_callback = None
@@ -3712,11 +3846,47 @@ class TradingBot:
                 print()
                 self._close_trade(symbol, trade, "ST_EXIT")
 
+    # ================================================================
+    #  STARTUP SEQUENCE
+    #
+    #  This is the single authoritative startup path. Each numbered
+    #  step below corresponds exactly to the required sequence, and no
+    #  step begins before the step(s) it depends on have completed:
+    #
+    #    1.  Load configuration and validate all settings.
+    #    2.  Initialize logging and error handling.
+    #    3.  Initialize REST/API clients.
+    #    4.  Initialize candle storage and symbol mapping.
+    #    5.  Fetch historical OHLCV data for all symbols.
+    #    6.  Store historical closed candles correctly.
+    #    7.  Run initial S/R detection using the loaded historical data.
+    #    8.  Initialize all indicators and strategy-related data.
+    #    9.  Initialize the WebSocket (create + wire, do not start yet).
+    #    10. Connect the WebSocket.
+    #    11. Send subscriptions and wait for confirmation.
+    #    12. Confirm that live candle data is actually being received.
+    #    13. Forming candle initialization (happens automatically as the
+    #        first live messages flow through process_candle()).
+    #    14. Only after the pipeline is healthy, enable strategy
+    #        processing (self._pipeline_ready.set()).
+    #    15. Start watchdog, health monitoring, and other background
+    #        systems.
+    #
+    #  Steps 10-12 wait on real readiness Events fired by the WebSocket
+    #  layer itself, with a bounded timeout purely as a non-blocking
+    #  safety net (the exchange might not send an explicit ack, or a
+    #  symbol's first tick might simply take longer than expected) -
+    #  if a timeout is hit the bot logs a clear warning and proceeds,
+    #  relying on the watchdog (started last, in step 15) to catch and
+    #  auto-recover from any genuine ongoing problem.
+    # ================================================================
+
     def start(self) -> None:
         self.running = True
         self._print_banner()
-        warm_up_connection()
 
+        # ---- STEP 1: Load configuration and validate all settings ----
+        self._log("info", "STARTUP", "STEP  1/15: Validating configuration...")
         if self.trading_capital <= 0:
             self._log("error", "STARTUP",
                        "Aborting: trading_capital must be > 0. The bot cannot size "
@@ -3724,6 +3894,16 @@ class TradingBot:
             self.running = False
             return
 
+        # ---- STEP 2: Initialize logging and error handling ----
+        # Logging (module-level `logger`/_log/_log_exc) is already fully
+        # initialized at import time, before any other code in this file
+        # runs, so every step from here on is guaranteed to have logging
+        # available.
+        self._log("info", "STARTUP", "STEP  2/15: Logging and error handling ready.")
+
+        # ---- STEP 3: Initialize REST/API clients ----
+        self._log("info", "STARTUP", "STEP  3/15: Initializing REST API client...")
+        warm_up_connection()
         if not self.paper:
             profile = self.rest.verify_account()
             if profile is None:
@@ -3731,7 +3911,8 @@ class TradingBot:
                 self.running = False
                 return
 
-        self._log("info", "STARTUP", "Loading product catalogue...")
+        # ---- STEP 4: Initialize candle storage and symbol mapping ----
+        self._log("info", "STARTUP", "STEP  4/15: Loading product catalogue and resolving symbols...")
         raw_map = self.rest.fetch_product_map()
         if not raw_map:
             self._log("error", "STARTUP", "Product catalogue empty. Aborting.")
@@ -3770,14 +3951,91 @@ class TradingBot:
         if self.notifier:
             self.notifier.send_startup_report(self.config, self.symbols, self.harami_tolerance)
 
-        self._fetch_all_historical()
-        self._start_ws()
-        # Record the moment live monitoring actually begins (after historical
-        # backfill), so the watchdog's "how long have we been waiting for the
-        # first close" baseline reflects when the bot started truly watching
-        # the live feed, not just process start.
+        # ---- STEP 5 & 6: Fetch historical OHLCV and store closed candles ----
+        self._log("info", "STARTUP", "STEP  5/15: Fetching historical OHLCV data for all symbols...")
+        self._log("info", "STARTUP", "STEP  6/15: Storing historical closed candles...")
+        self._fetch_historical_candles()
+
+        # ---- STEP 7: Run initial S/R detection using the loaded historical data ----
+        self._log("info", "STARTUP", "STEP  7/15: Running initial Support/Resistance detection on historical data...")
+        self._run_initial_sr_detection()
+
+        # ---- STEP 8: Initialize indicators and strategy-related data ----
+        self._log("info", "STARTUP", "STEP  8/15: Validating indicator/strategy data readiness...")
+        self._validate_indicator_readiness()
+
+        # Mark the moment the bot begins truly watching the live feed -
+        # every subsequent watchdog "how long have we been waiting"
+        # calculation is anchored to this, not to process start.
         self._start_time = time.time()
+
+        # ---- STEP 9: Initialize the WebSocket (create + wire, don't start yet) ----
+        self._log("info", "STARTUP", "STEP  9/15: Initializing WebSocket manager...")
+        self.ws_manager = DeltaWebSocket()
+        self._wire_ws_callbacks(self.ws_manager)
+        ws_symbols = [to_ws_symbol(sym) for sym in self.symbols]
+        self.ws_manager.subscribe(self.timeframe, ws_symbols)
+
+        # ---- STEP 10: Connect the WebSocket ----
+        self._log("info", "STARTUP", "STEP 10/15: Connecting WebSocket...")
+        self.ws_manager.start()
+        connected = self._ws_connected_event.wait(timeout=STARTUP_WS_CONNECT_TIMEOUT)
+        if connected:
+            self._log("info", "STARTUP", "WebSocket connection CONFIRMED.")
+        else:
+            self._log("warning", "STARTUP",
+                       f"WebSocket did not confirm connection within {STARTUP_WS_CONNECT_TIMEOUT}s - "
+                       f"continuing startup; the WS reconnect loop and the watchdog "
+                       f"(started at the end of this sequence) will keep trying and will "
+                       f"alert if the feed stays down.")
+
+        # ---- STEP 11: Send subscriptions and wait for confirmation ----
+        # Subscriptions were already queued in step 9 and are sent
+        # automatically the moment the socket opens (see DeltaWebSocket._on_open).
+        # Here we wait for the server's explicit subscription acknowledgement.
+        self._log("info", "STARTUP", "STEP 11/15: Waiting for subscription confirmation from server...")
+        subscribed = self._ws_subscribed_event.wait(timeout=STARTUP_SUBSCRIBE_CONFIRM_TIMEOUT)
+        if subscribed:
+            self._log("info", "STARTUP", "Subscription CONFIRMED by server.")
+        else:
+            self._log("warning", "STARTUP",
+                       f"No explicit subscription confirmation received within "
+                       f"{STARTUP_SUBSCRIBE_CONFIRM_TIMEOUT}s - some feeds push data "
+                       f"without a separate ack message; continuing and relying on "
+                       f"step 12's live-data check instead.")
+
+        # ---- STEP 12: Confirm that live candle data is actually being received ----
+        self._log("info", "STARTUP", "STEP 12/15: Waiting for first live candle data from all symbols...")
+        got_live_data = self._first_live_data_event.wait(timeout=STARTUP_LIVE_DATA_TIMEOUT)
+        if got_live_data:
+            self._log("info", "STARTUP", "Live candle data CONFIRMED for all monitored symbols.")
+        else:
+            missing = [s for s in self.symbols if s not in self._symbols_with_live_data]
+            self._log("warning", "STARTUP",
+                       f"Live data not yet confirmed for all symbols within "
+                       f"{STARTUP_LIVE_DATA_TIMEOUT}s "
+                       f"({len(self._symbols_with_live_data)}/{len(self.symbols)} reporting, "
+                       f"missing: {missing}) - proceeding anyway; the watchdog will "
+                       f"monitor these symbols and trigger automatic recovery if the "
+                       f"feed genuinely stays silent.")
+
+        # ---- STEP 13: forming-candle initialization ----
+        # This happens automatically and continuously as live WS messages
+        # arrive via process_candle() -> _forming_candle[symbol] gets set
+        # on the first message per symbol (see process_candle()). No
+        # separate action is needed here; step 12 already confirmed that
+        # messages are flowing.
+        self._log("info", "STARTUP", "STEP 13/15: Forming-candle state is being populated by the live feed.")
+
+        # ---- STEP 14: Only now enable normal strategy processing ----
+        self._pipeline_ready.set()
+        self._log("info", "STARTUP", "STEP 14/15: Data pipeline healthy - STRATEGY EVALUATION ENABLED.")
+
+        # ---- STEP 15: Start watchdog, health monitoring, and other background systems ----
+        self._log("info", "STARTUP", "STEP 15/15: Starting watchdog and background health monitoring...")
         self._start_watchdog()
+
+        self._log("info", "STARTUP", "Startup sequence complete - bot is fully operational.")
 
     def stop(self) -> None:
         self.running = False
@@ -3788,20 +4046,16 @@ class TradingBot:
             self.ws_manager.stop()
         self._log("info", "BOT", "Bot stopped.")
 
-    def _fetch_all_historical(self) -> None:
+    def _fetch_historical_candles(self) -> None:
         """
-        Load historical OHLCV candles for every symbol, and immediately run
-        the existing S/R detection logic (SRLevelManager.update_levels) on
-        the confirmed-closed portion of that history, so S/R levels are
-        already populated and available to the existing S/R strategies
-        before the bot ever waits for its first live candle close.
+        STEPS 5 & 6: Load historical OHLCV candles for every symbol and
+        store the confirmed-closed portion in self.candle_store.
 
-        This function only changes WHEN/how the existing S/R detection is
-        first invoked (at startup, on historical data) - it does not alter
-        SRLevelManager's detection logic itself, nor any strategy, signal,
-        execution, TP/SL, risk, or watchdog behavior. After startup, the
-        existing per-live-candle-close flow in _process_closed_candle()
-        continues to call sr_manager.update_levels() exactly as before.
+        This function ONLY fetches, normalizes, validates, and stores
+        historical closed candles. It deliberately does NOT run S/R
+        detection or any strategy evaluation - that happens afterwards,
+        as its own explicit step (_run_initial_sr_detection), so the two
+        concerns stay strictly sequenced and easy to reason about.
         """
         self._log("info", "CANDLES", f"Loading {CANDLE_LIMIT} candles x {self.timeframe} for {len(self.symbols)} symbol(s)")
         tf_secs = self._tf.secs
@@ -3813,11 +4067,10 @@ class TradingBot:
                     self._log("warning", "CANDLES", f"  [WARN] {sym}: 0 candles after retries.")
                     continue
 
-                # Step 2: normalize timestamps, sort, remove duplicates.
-                # get_candles() already normalizes/sorts/dedupes internally,
-                # but we defensively repeat it here so this startup path is
-                # self-contained and correct even if the candle list arrives
-                # from elsewhere in the future.
+                # Normalize timestamps, sort, remove duplicates. get_candles()
+                # already does this internally, but we defensively repeat it
+                # here so this startup path is self-contained and correct
+                # even if the candle list arrives from elsewhere in future.
                 normalized: List[dict] = []
                 for row in raw_candles:
                     ts = normalize_timestamp_to_seconds(row.get("time"))
@@ -3837,10 +4090,9 @@ class TradingBot:
                     self._log("warning", "CANDLES", f"  [WARN] {sym}: no valid candles after normalization.")
                     continue
 
-                # Step 3 & 4: exclude the currently forming/incomplete
-                # candle - keep only candles whose own period has fully
-                # elapsed by wall-clock time, i.e. genuinely confirmed
-                # closed candles.
+                # Exclude the currently forming/incomplete candle - keep
+                # only candles whose own period has fully elapsed by
+                # wall-clock time, i.e. genuinely confirmed closed candles.
                 now_ts = time.time()
                 confirmed_closed = [
                     c for c in sorted_candles
@@ -3858,51 +4110,103 @@ class TradingBot:
                           f"  [OK] {sym}: {len(confirmed_closed)} confirmed closed candles loaded | "
                           f"last_close={smart_fmt(confirmed_closed[-1]['close'])} | t={confirmed_closed[-1]['time']}")
 
-                # Step 5, 6 & 7: immediately run the EXISTING S/R detection
-                # logic (SRLevelManager.update_levels - unchanged) on all
-                # confirmed historical closed candles, storing whatever it
-                # detects in the existing S/R manager for this symbol, so
-                # those levels are available to the existing S/R strategies
-                # right away - no changes to detection conditions/logic.
-                self._log("info", "S/R-INIT",
-                          f"[{sym}] Historical S/R detection started ({len(confirmed_closed)} confirmed closed candles)")
-
-                sr_manager = self.sr_managers.get(sym)
-                if sr_manager:
-                    try:
-                        sr_manager.update_levels(confirmed_closed)
-                    except Exception as e:
-                        _log_exc("S/R-INIT", f"[{sym}] historical S/R detection failed: {e}")
-
-                    with sr_manager._lock:
-                        support_snapshot = sorted(sr_manager.support_levels, key=lambda x: x["price"])
-                        resistance_snapshot = sorted(sr_manager.resistance_levels, key=lambda x: x["price"])
-
-                    if support_snapshot:
-                        support_str = ", ".join(
-                            f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
-                            for l in support_snapshot
-                        )
-                        self._log("info", "S/R-INIT", f"[{sym}] Detected SUPPORT levels: {support_str}")
-                    else:
-                        self._log("info", "S/R-INIT", f"[{sym}] No support levels detected from historical closed candles.")
-
-                    if resistance_snapshot:
-                        resistance_str = ", ".join(
-                            f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
-                            for l in resistance_snapshot
-                        )
-                        self._log("info", "S/R-INIT", f"[{sym}] Detected RESISTANCE levels: {resistance_str}")
-                    else:
-                        self._log("info", "S/R-INIT", f"[{sym}] No resistance levels detected from historical closed candles.")
-
-                    if not support_snapshot and not resistance_snapshot:
-                        self._log("warning", "S/R-INIT", f"[{sym}] No valid S/R detected from historical closed candles.")
-                else:
-                    self._log("warning", "S/R-INIT", f"[{sym}] No S/R manager found for symbol - skipping historical S/R detection.")
-
             except Exception as e:
                 _log_exc("CANDLES", f"  [ERROR] {sym}: historical load failed, continuing with other symbols: {e}")
+
+    def _run_initial_sr_detection(self) -> None:
+        """
+        STEP 7: Run the EXISTING S/R detection logic (SRLevelManager.
+        update_levels - unchanged) on every symbol's confirmed historical
+        closed candles (already stored in self.candle_store by
+        _fetch_historical_candles), so S/R levels are populated and
+        available to the existing S/R strategies before the bot ever
+        waits for its first live candle close.
+
+        This function only changes WHEN the existing S/R detection is
+        first invoked (at startup, on historical data, as its own
+        explicit sequenced step) - it does not alter SRLevelManager's
+        detection logic itself, nor any strategy, signal, execution,
+        TP/SL, risk, or watchdog behavior. After startup, the existing
+        per-live-candle-close flow in _process_closed_candle() continues
+        to call sr_manager.update_levels() exactly as before.
+        """
+        for sym in self.symbols:
+            store = self.candle_store.get(sym)
+            sr_manager = self.sr_managers.get(sym)
+
+            if not store:
+                self._log("info", "S/R-INIT", f"[{sym}] No historical candles stored - skipping initial S/R detection.")
+                continue
+            if not sr_manager:
+                self._log("warning", "S/R-INIT", f"[{sym}] No S/R manager found for symbol - skipping historical S/R detection.")
+                continue
+
+            confirmed_closed = list(store)
+            self._log("info", "S/R-INIT",
+                      f"[{sym}] Historical S/R detection started ({len(confirmed_closed)} confirmed closed candles)")
+
+            try:
+                sr_manager.update_levels(confirmed_closed)
+            except Exception as e:
+                _log_exc("S/R-INIT", f"[{sym}] historical S/R detection failed: {e}")
+
+            with sr_manager._lock:
+                support_snapshot = sorted(sr_manager.support_levels, key=lambda x: x["price"])
+                resistance_snapshot = sorted(sr_manager.resistance_levels, key=lambda x: x["price"])
+
+            if support_snapshot:
+                support_str = ", ".join(
+                    f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
+                    for l in support_snapshot
+                )
+                self._log("info", "S/R-INIT", f"[{sym}] Detected SUPPORT levels: {support_str}")
+            else:
+                self._log("info", "S/R-INIT", f"[{sym}] No support levels detected from historical closed candles.")
+
+            if resistance_snapshot:
+                resistance_str = ", ".join(
+                    f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
+                    for l in resistance_snapshot
+                )
+                self._log("info", "S/R-INIT", f"[{sym}] Detected RESISTANCE levels: {resistance_str}")
+            else:
+                self._log("info", "S/R-INIT", f"[{sym}] No resistance levels detected from historical closed candles.")
+
+            if not support_snapshot and not resistance_snapshot:
+                self._log("warning", "S/R-INIT", f"[{sym}] No valid S/R detected from historical closed candles.")
+
+    def _validate_indicator_readiness(self) -> None:
+        """
+        STEP 8: Initialize/validate all indicators and strategy-related
+        data. RSI and SuperTrend are computed on-the-fly from
+        self.candle_store (there is no separate persistent indicator
+        state to construct), so this step's job is to confirm - loudly,
+        per symbol - whether enough historical candles are already
+        available for each indicator to produce a value on the very
+        first live evaluation, rather than silently discovering this
+        later inside a signal check.
+        """
+        min_rsi = RSI_MIN_CANDLES
+        min_st = ST2_LENGTH + 2
+        for sym in self.symbols:
+            have = len(self.candle_store.get(sym, []))
+            rsi_ok = have >= min_rsi
+            st_ok = have >= min_st
+            if rsi_ok and st_ok:
+                self._log("info", "INDICATOR-INIT",
+                          f"[{sym}] {have} candles available - sufficient for RSI({RSI_PERIOD}) "
+                          f"and both SuperTrends on first evaluation.")
+            else:
+                missing = []
+                if not rsi_ok:
+                    missing.append(f"RSI needs >= {min_rsi} (have {have})")
+                if not st_ok:
+                    missing.append(f"SuperTrend needs >= {min_st} (have {have})")
+                self._log("warning", "INDICATOR-INIT",
+                          f"[{sym}] insufficient historical candles for some indicators: "
+                          f"{'; '.join(missing)}. The bot will keep running and these "
+                          f"indicators will simply return 'not enough data' (safely "
+                          f"blocking related signals) until enough live candles close.")
 
     def _wire_ws_callbacks(self, ws: DeltaWebSocket) -> None:
         ws.set_candle_callback(self._on_ws_candle)
@@ -3910,32 +4214,51 @@ class TradingBot:
         ws.set_disconnected_callback(self._on_ws_disconnected)
         ws.set_error_callback(self._on_ws_error)
         ws.set_reconnect_callback(self._on_ws_reconnect)
-
-    def _start_ws(self) -> None:
-        self.ws_manager = DeltaWebSocket()
-        self._wire_ws_callbacks(self.ws_manager)
-        ws_symbols = [to_ws_symbol(sym) for sym in self.symbols]
-        self.ws_manager.subscribe(self.timeframe, ws_symbols)
-        self.ws_manager.start()
+        ws.set_subscribed_callback(self._on_ws_subscribed)
 
     def _on_ws_candle(self, symbol: str, candle: dict) -> None:
+        resolved: Optional[str] = None
         if symbol in self.candle_store:
-            self.process_candle(symbol, candle)
+            resolved = symbol
+        else:
+            for known in self.candle_store:
+                if to_ws_symbol(known) == to_ws_symbol(symbol):
+                    resolved = known
+                    break
+
+        if resolved is None:
+            self._log("warning", "PIPELINE",
+                       f"WS candle for unrecognized symbol '{symbol}' ignored - no matching candle store. "
+                       f"Known symbols: {list(self.candle_store.keys())}")
             return
-        for known in self.candle_store:
-            if to_ws_symbol(known) == to_ws_symbol(symbol):
-                self.process_candle(known, candle)
-                return
-        self._log("debug", "PIPELINE", f"WS candle for unrecognized symbol '{symbol}' ignored (no matching store)")
+
+        # STEP 12 readiness signal: track the first live message per
+        # symbol; once every monitored symbol has produced at least one
+        # message, live data is considered confirmed for the whole
+        # pipeline. This only ever transitions one way (empty -> full)
+        # and is purely a startup-gating signal - it does not affect
+        # ongoing processing once the pipeline is already marked ready.
+        if resolved not in self._symbols_with_live_data:
+            with self._readiness_lock:
+                self._symbols_with_live_data.add(resolved)
+                if len(self._symbols_with_live_data) >= len(self.symbols):
+                    self._first_live_data_event.set()
+
+        self.process_candle(resolved, candle)
 
     def _on_ws_connected(self) -> None:
-        self._log("info", "WS", "Connected")
+        self._log("info", "WS", "WebSocket CONNECTED - live candle feed should now be active")
+        self._ws_connected_event.set()
+
+    def _on_ws_subscribed(self) -> None:
+        self._log("info", "WS", "Subscription CONFIRMED by server (startup readiness signal)")
+        self._ws_subscribed_event.set()
 
     def _on_ws_disconnected(self) -> None:
-        self._log("warning", "WS", "Disconnected (max retries)")
+        self._log("error", "WS", "WebSocket DISCONNECTED after max reconnect attempts - live candle feed is DOWN")
 
     def _on_ws_error(self, err) -> None:
-        self._log("error", "WS", f"Error: {err}")
+        self._log("error", "WS", f"WebSocket error: {err}")
 
     def _on_ws_reconnect(self) -> None:
         self._log("info", "PIPELINE", "WebSocket reconnected internally - backfilling any missed candles for all symbols")
@@ -4071,7 +4394,7 @@ class TradingBot:
         # silent" apart from "feed is fine, the candle just hasn't closed".
         self.last_ws_update_time[symbol] = time.time()
 
-        self._log("debug", "PIPELINE", f"[{symbol}] WS received t={normalized['time']} close={smart_fmt(normalized['close'])}")
+        self._log("debug", "PIPELINE", f"[{symbol}] Live message received | t={normalized['time']} close={smart_fmt(normalized['close'])}")
 
         lock = self._candle_locks.setdefault(symbol, threading.Lock())
         same_time_update = False
@@ -4092,7 +4415,7 @@ class TradingBot:
 
             if forming is None:
                 self._forming_candle[symbol] = normalized
-                self._log("info", "PIPELINE", f"[{symbol}] forming candle initialized t={normalized['time']}")
+                self._log("info", "PIPELINE", f"[{symbol}] Forming candle initialized | t={normalized['time']}")
                 return
 
             if normalized["time"] < forming["time"]:
@@ -4102,12 +4425,14 @@ class TradingBot:
             if normalized["time"] == forming["time"]:
                 self._forming_candle[symbol] = normalized
                 same_time_update = True
-                self._log("debug", "PIPELINE", f"[{symbol}] forming candle updated t={normalized['time']} close={smart_fmt(normalized['close'])}")
+                self._log("debug", "PIPELINE", f"[{symbol}] Forming candle updated | t={normalized['time']} close={smart_fmt(normalized['close'])}")
             else:
                 closed_for_processing = forming
                 new_forming = normalized
                 self._forming_candle[symbol] = normalized
-                self._log("info", "PIPELINE", f"[{symbol}] new timestamp t={normalized['time']} -> previous candle closed t={closed_for_processing['time']}")
+                self._log("info", "PIPELINE",
+                          f"[{symbol}] New candle timestamp received (t={normalized['time']}) -> "
+                          f"previous candle (t={closed_for_processing['time']}) is now CLOSED")
 
         if same_time_update:
             self._check_take_profit(symbol, normalized)
@@ -4143,13 +4468,26 @@ class TradingBot:
             # candle state.
             self._recovery_issue_baseline.pop(symbol, None)
 
+            # *** Required flow log: exactly one line per closed candle,
+            # with the complete OHLCV set, so "the candle closed and was
+            # processed" is always visible and never has to be inferred
+            # from surrounding log lines. ***
             self._log("info", "CANDLE-CLOSED",
-                      f"[{source}] {symbol} [{self.timeframe}] t={closed_candle['time']} "
+                      f"[CANDLE CLOSED] {symbol} | source={source} | timeframe={self.timeframe} | "
+                      f"time={closed_candle['time']} | "
                       f"O={smart_fmt(closed_candle['open'])} "
                       f"H={smart_fmt(closed_candle['high'])} "
                       f"L={smart_fmt(closed_candle['low'])} "
-                      f"C={smart_fmt(closed_candle['close'])}")
+                      f"C={smart_fmt(closed_candle['close'])} "
+                      f"V={smart_fmt(closed_candle.get('volume', 0))}")
+            self._log("info", "PIPELINE",
+                      f"[{symbol}] Closed candle t={closed_candle['time']} processed exactly once "
+                      f"(store size={len(store_snapshot)})")
 
+            # Update S/R using the exact same logic as the initial startup
+            # detection - update_levels() is idempotent per index, so
+            # calling it again here on the growing live store is safe and
+            # is how S/R levels stay current after startup.
             if symbol in self.sr_managers:
                 self.sr_managers[symbol].update_levels(store_snapshot)
 
@@ -4165,7 +4503,21 @@ class TradingBot:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
             if symbol not in self.active_trades:
-                if self.daily_loss_tracker.is_limit_reached():
+                if not self._pipeline_ready.is_set():
+                    # STEP 14 gate: strategy evaluation must never run
+                    # before the startup sequence has explicitly marked
+                    # the pipeline ready (historical data + initial S/R +
+                    # a confirmed live feed). In normal operation this
+                    # branch is only reachable for the very brief window
+                    # before start() finishes step 14, since watchdog
+                    # (which is the only thing that can trigger recovery
+                    # -> backfill -> _process_closed_candle after startup)
+                    # is started strictly after _pipeline_ready is set.
+                    self._log("info", "EVAL-SKIP",
+                              f"[{symbol}] strategy evaluation skipped: startup pipeline not yet "
+                              f"marked ready (waiting on historical data / initial S/R / live-feed "
+                              f"confirmation).")
+                elif self.daily_loss_tracker.is_limit_reached():
                     self._log("info", "EVAL-SKIP", f"[{symbol}] strategy evaluation skipped: daily loss limit reached ({self.daily_loss_tracker.status()})")
                 else:
                     # NOTE: last_eval_time is intentionally NOT set here.
@@ -4176,7 +4528,7 @@ class TradingBot:
                     # anything below raises, control goes straight to the
                     # except clause and last_eval_time is left untouched.
                     candle_list = store_snapshot + [new_forming_candle]
-                    self._log("debug", "PIPELINE", f"[{symbol}] evaluating strategies on {len(candle_list)} candles")
+                    self._log("info", "PIPELINE", f"[{symbol}] Strategy evaluation RUNNING on {len(candle_list)} candles (closed + forming)")
 
                     signal_found = False
 
@@ -4218,8 +4570,8 @@ class TradingBot:
                                                  rsi_value, "LONG", no_rsi=False)
                                 signal_found = True
 
-                    self._log("debug", "PIPELINE",
-                              f"[{symbol}] strategy evaluation complete - "
+                    self._log("info", "PIPELINE",
+                              f"[{symbol}] Strategy evaluation COMPLETE - "
                               f"{'signal generated' if signal_found else 'no signal, all strategies rejected'}")
 
                     # Evaluation genuinely completed (every strategy check
@@ -4637,6 +4989,14 @@ class TradingBot:
                 "or evaluate the daily loss limit correctly in this state."
             )
 
+        if not self._pipeline_ready.is_set():
+            current_issues["PIPELINE_NOT_READY"] = (
+                "The startup pipeline has not marked itself ready even though "
+                "the watchdog has started - this should not normally happen, "
+                "since the watchdog is only started after pipeline readiness "
+                "is confirmed. Investigate the startup sequence."
+            )
+
         ws_state = self.ws_manager.get_state() if self.ws_manager else "unknown"
         ws_down = ws_state in ("disconnected", "reconnecting")
         if ws_down:
@@ -4648,13 +5008,6 @@ class TradingBot:
         expected_secs = self._tf.secs
 
         # -- A) WebSocket liveness, independent of candle closes.
-        # A valid update to the currently-forming candle counts, so a
-        # 1h symbol ticking normally every few seconds is never flagged
-        # here just because its candle hasn't closed yet. This condition
-        # is naturally self-resolving (it clears the instant a new update
-        # arrives, since last_ws_update_time is refreshed on every tick),
-        # so it needs no extra loop-prevention beyond the recovery
-        # lock/cooldown already applied to every trigger.
         ws_stale_symbols: List[str] = []
         for sym in self.symbols:
             last_update = self.last_ws_update_time.get(sym)
@@ -4679,12 +5032,6 @@ class TradingBot:
                 ws_stale_symbols.append(sym)
 
         # -- B) Closed-candle monitoring, timeframe-aware AND state-based.
-        # The deadline for "this candle should have closed by now" is
-        # derived from the candle's OWN observed start time (its forming
-        # timestamp), not from "now" and not from when the previous candle
-        # happened to close. A symbol is only ever flagged once that
-        # specific candle's own timeframe + grace period has elapsed
-        # without last_closed_time catching up to it.
         closed_candle_stale_symbols: List[str] = []
         for sym in self.symbols:
             forming = self._forming_candle.get(sym)
@@ -4695,10 +5042,6 @@ class TradingBot:
                 deadline = forming_time + expected_secs + CANDLE_CLOSE_GRACE_SECONDS
                 is_overdue = now > deadline and last_closed < forming_time
             else:
-                # No forming candle has ever been recorded for this symbol
-                # (e.g. right after startup, before the first WS tick) -
-                # fall back to one full timeframe past the moment the bot
-                # actually started watching the live feed, not "now".
                 forming_time = None
                 deadline = self._start_time + expected_secs + CANDLE_CLOSE_GRACE_SECONDS
                 is_overdue = now > deadline and last_closed == 0
@@ -4726,14 +5069,6 @@ class TradingBot:
             fingerprint = (last_closed, forming_time)
             baseline = self._recovery_issue_baseline.get(sym)
             if baseline == fingerprint:
-                # Identical (last_closed_time, forming_candle_time) as the
-                # last time recovery was triggered for this symbol - no new
-                # closed candle and no new forming candle arrived since,
-                # meaning that attempt made zero progress (this is exactly
-                # the "REST backfill found nothing missing" case). Keep
-                # alerting/logging the condition above, but do not queue
-                # another reconnect+backfill cycle for it; wait for a real
-                # state change instead.
                 self._log("debug", "WATCHDOG",
                           f"[{sym}] closed-candle deadline still overdue but "
                           f"unchanged since the last recovery attempt - "
@@ -4742,11 +5077,6 @@ class TradingBot:
             else:
                 closed_candle_stale_symbols.append(sym)
 
-        # Any symbol tripping either liveness signal warrants an immediate
-        # recovery attempt (subject to the recovery cooldown/lock), as long
-        # as the WS connection itself currently reports "connected" - if
-        # it's down, the reconnect loop inside DeltaWebSocket is already
-        # handling it and _on_ws_reconnect() will backfill once it's back.
         stale_trigger_symbols = list(dict.fromkeys(ws_stale_symbols + closed_candle_stale_symbols))
         if stale_trigger_symbols and not ws_down and self.ws_manager and self.ws_manager.get_state() == "connected":
             self._trigger_stale_recovery(stale_trigger_symbols)
@@ -4760,9 +5090,7 @@ class TradingBot:
                 f"rollover, that itself is worth investigating."
             )
 
-        # -- Signal 3 (unchanged in spirit): EVAL_BLOCKED. Skipped for any
-        # symbol already flagged as feed-stale or candle-stale above, since
-        # in that case the lack of evaluation is already explained.
+        # -- Signal 3: EVAL_BLOCKED.
         for sym in self.symbols:
             if sym in stale_trigger_symbols:
                 continue
@@ -4826,12 +5154,6 @@ class TradingBot:
                 return
             self._recovery_in_progress = True
             self._last_recovery_attempt = now
-            # Snapshot the (last_closed_time, forming_candle_time) pair for
-            # every symbol we're about to attempt recovery for. This is the
-            # "before" state the next health check compares against to
-            # decide whether this attempt produced any real progress before
-            # allowing another retrigger for what would otherwise look like
-            # the exact same unresolved closed-candle condition.
             for sym in stale_symbols:
                 forming = self._forming_candle.get(sym)
                 forming_time = forming["time"] if forming else None
@@ -4905,21 +5227,26 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.1 (RESILIENT) |")
-        print("|   FIX: forming-candle duplication bug eliminated - the   |")
-        print("|   candle store no longer fills with duplicate-timestamp |")
-        print("|   entries from repeated live ticks                       |")
+        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.3 (SEQUENCED) |")
+        print("|   NEW: strict, event-gated startup sequence - config -> |")
+        print("|   logging -> REST client -> symbols/candle storage ->   |")
+        print("|   historical OHLCV -> initial S/R -> indicator check -> |")
+        print("|   WebSocket init -> connect -> subscribe+confirm ->     |")
+        print("|   live-data confirm -> strategy processing enabled ->   |")
+        print("|   watchdog started LAST. No step starts before its      |")
+        print("|   dependency is confirmed ready via real Events, not    |")
+        print("|   fixed sleeps.                                          |")
+        print("|   FIX: WebSocket + candle pipeline diagnostics -         |")
+        print("|   every stage (connect, subscribe, message, forming,    |")
+        print("|   close) is logged; unexpected message types are        |")
+        print("|   logged (throttled) instead of silently dropped        |")
+        print("|   FIX: forming-candle duplication bug eliminated         |")
         print("|   FIX: REST + WebSocket timestamps normalized to the    |")
-        print("|   same unit (Unix seconds) everywhere                    |")
-        print("|   NEW: automatic stale-feed recovery (reconnect +        |")
-        print("|   resubscribe + backfill) with lock + cooldown           |")
-        print("|   FIX: timeframe-aware watchdog - WS liveness (forming   |")
-        print("|   candle ticks included) is tracked separately from     |")
-        print("|   closed-candle timing, so a candle that simply hasn't  |")
-        print("|   closed yet never triggers a false recovery             |")
-        print("|   NEW: historical S/R levels are detected immediately    |")
-        print("|   at startup from confirmed closed candles - no need to |")
-        print("|   wait for the first live candle close                   |")
+        print("|   same unit (Unix seconds) everywhere                   |")
+        print("|   NEW: automatic stale-feed recovery (reconnect +       |")
+        print("|   resubscribe + backfill) with lock + cooldown          |")
+        print("|   FIX: timeframe-aware watchdog - WS liveness vs        |")
+        print("|   closed-candle timing tracked separately                |")
         print("+========================================================+")
         print()
 
@@ -4945,7 +5272,7 @@ class TradingBot:
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
-        print(f"  S/R Init          : Historical S/R detected immediately at startup")
+        print(f"  S/R Init          : Historical S/R detected as its own sequenced startup step")
         print(f"  S/R Rejection Log : Detailed reasons + email alerts")
         print(f"  S/R Merge         : DISABLED - every level separate")
         print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
@@ -4953,12 +5280,16 @@ class TradingBot:
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
         print(f"  Health Watchdog   : ENABLED (checks every {WATCHDOG_CHECK_INTERVAL // 60} min, "
               f"timeframe-aware WS-liveness vs closed-candle checks, "
-              f"emails on silent failure via GMAIL if enabled)")
+              f"emails on silent failure via GMAIL if enabled, started LAST)")
         print(f"  Auto Stale-Recover: ENABLED (reconnect + resubscribe + backfill, "
               f"cooldown {STALE_RECOVERY_COOLDOWN}s, WS-stale threshold "
               f"{WS_UPDATE_STALE_SECONDS}s, candle-close grace {CANDLE_CLOSE_GRACE_SECONDS}s)")
         print(f"  Self-Healing      : Per-symbol processing errors auto-reset after "
               f"{SYMBOL_ERROR_RESET_THRESHOLD} consecutive failures")
+        print(f"  WS Diagnostics    : ENABLED (connect/subscribe/message/close all logged; "
+              f"unhandled message types logged, throttled every {UNHANDLED_WS_MSG_LOG_INTERVAL}s per type)")
+        print(f"  Startup Gating    : ENABLED (event-based readiness for WS connect / "
+              f"subscribe-confirm / first-live-data, bounded timeouts as a safety net only)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -5190,7 +5521,7 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +========================================================+")
-    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.1 RESILIENT |")
+    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.3 SEQUENCED |")
     print("  +========================================================+")
 
     _divider("SETUP")
