@@ -74,12 +74,6 @@ def _log(level: str, tag: str, msg: str) -> None:
 
 
 def _log_exc(tag: str, msg: str) -> None:
-    """
-    Log an error together with its full traceback. Used everywhere we catch
-    a broad Exception, so a bug never disappears into a one-line message
-    (or, worse, into total silence) - every unexpected exception in this
-    bot is loud, in both console and bot.log.
-    """
     logger.error(f"[{tag}] {msg}\n{traceback.format_exc()}")
 
 
@@ -88,11 +82,6 @@ def _log_exc(tag: str, msg: str) -> None:
 # ================================================================
 
 def smart_fmt(price: float) -> str:
-    """
-    Dynamically selects decimal places based on price magnitude so that
-    small-priced altcoins (e.g. 0.13498, 1.05928, 0.00142) are displayed
-    with full precision while large prices (BTC at 65 000) stay clean.
-    """
     if price == 0:
         return "0"
     abs_p = abs(price)
@@ -125,23 +114,10 @@ def smart_fmt(price: float) -> str:
 
 
 # ================================================================
-#  3c.  TIMESTAMP NORMALIZATION  (fix: consistent units everywhere)
+#  3c.  TIMESTAMP NORMALIZATION
 # ================================================================
 
 def normalize_timestamp_to_seconds(raw_ts) -> Optional[int]:
-    """
-    Normalize a timestamp of unknown unit (seconds, milliseconds,
-    microseconds, or nanoseconds) into whole Unix seconds.
-
-    Both the REST candle parser and the WebSocket candle parser now funnel
-    every timestamp through this single function, so a candle's "time" is
-    guaranteed to mean the same thing (Unix seconds) no matter which feed
-    it came from. This matters because the bot compares REST-backfilled
-    timestamps against WebSocket-delivered timestamps directly (e.g. to
-    decide whether a live candle continues the current forming bar or
-    closes it) - if the two feeds used different units, those comparisons
-    would silently produce nonsense.
-    """
     try:
         ts = float(raw_ts)
     except (TypeError, ValueError):
@@ -149,13 +125,12 @@ def normalize_timestamp_to_seconds(raw_ts) -> Optional[int]:
     if ts <= 0:
         return None
     ts = int(ts)
-    if ts >= 1_000_000_000_000_000_000:      # nanoseconds (~19 digits)
+    if ts >= 1_000_000_000_000_000_000:
         ts //= 1_000_000_000
-    elif ts >= 1_000_000_000_000_000:        # microseconds (~16 digits)
+    elif ts >= 1_000_000_000_000_000:
         ts //= 1_000_000
-    elif ts >= 1_000_000_000_000:            # milliseconds (~13 digits)
+    elif ts >= 1_000_000_000_000:
         ts //= 1_000
-    # else: already plain Unix seconds (~10 digits)
     if ts <= 0:
         return None
     return ts
@@ -166,11 +141,6 @@ def normalize_timestamp_to_seconds(raw_ts) -> Optional[int]:
 # ================================================================
 
 class GmailNotifier:
-    """
-    Gmail notification handler for trading signals and events.
-    Uses Gmail App Password (not regular password) for security.
-    """
-
     def __init__(
         self,
         sender_email: str,
@@ -184,23 +154,33 @@ class GmailNotifier:
         self.enabled = enabled
         self._last_sr_alert: Dict[str, str] = {}
         self._last_rejection_alert: Dict[str, str] = {}
-        # Self-healing: if Gmail keeps failing (bad password revoked,
-        # network issue, etc.) don't let every single caller pay the SMTP
-        # timeout cost - back off automatically and recover automatically.
         self._consecutive_failures = 0
         self._disabled_until: float = 0.0
         self._max_consecutive_failures = 5
-        self._backoff_seconds = 600  # 10 minutes
+        self._backoff_seconds = 600
+        self._failures_lock = threading.Lock()
+
+    def _dispatch_async(self, subject: str, body: str) -> None:
+        def _runner():
+            try:
+                self._send_email(subject, body)
+            except Exception as e:
+                _log_exc("GMAIL", f"Background email send raised unexpectedly: {e}")
+
+        t = threading.Thread(target=_runner, daemon=True, name="GmailSendAsync")
+        t.start()
 
     def _send_email(self, subject: str, body: str) -> bool:
         if not self.enabled:
             return False
 
         now = time.time()
-        if self._disabled_until and now < self._disabled_until:
+        with self._failures_lock:
+            disabled_until = self._disabled_until
+        if disabled_until and now < disabled_until:
             _log("warning", "GMAIL",
                  f"Skipping send (in backoff after repeated failures) - "
-                 f"will retry automatically in {int(self._disabled_until - now)}s")
+                 f"will retry automatically in {int(disabled_until - now)}s")
             return False
 
         try:
@@ -214,14 +194,18 @@ class GmailNotifier:
                 server.login(self.sender_email, self.gmail_app_password)
                 server.send_message(msg)
             _log("info", "GMAIL", f"Email sent: {subject}")
-            self._consecutive_failures = 0
-            self._disabled_until = 0.0
+            with self._failures_lock:
+                self._consecutive_failures = 0
+                self._disabled_until = 0.0
             return True
         except Exception as e:
-            self._consecutive_failures += 1
-            _log_exc("GMAIL", f"Failed to send email ({self._consecutive_failures} consecutive failures): {e}")
-            if self._consecutive_failures >= self._max_consecutive_failures:
-                self._disabled_until = now + self._backoff_seconds
+            with self._failures_lock:
+                self._consecutive_failures += 1
+                failures = self._consecutive_failures
+                if failures >= self._max_consecutive_failures:
+                    self._disabled_until = now + self._backoff_seconds
+            _log_exc("GMAIL", f"Failed to send email ({failures} consecutive failures): {e}")
+            if failures >= self._max_consecutive_failures:
                 _log("error", "GMAIL",
                      f"Too many consecutive Gmail failures - backing off for "
                      f"{self._backoff_seconds}s before trying again automatically.")
@@ -299,7 +283,8 @@ SuperTrend : Monitored post-entry"""
         if "confirmation_close" in signal:
             body += f"\nConfirm Close: {smart_fmt(signal['confirmation_close'])}"
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_supertrend_strong(self, symbol: str, direction: str, entry: float,
                                 new_tp: float, st1: float, st2: float,
@@ -338,7 +323,8 @@ EXIT STRATEGY
 Will exit when BOTH SuperTrends reverse direction:
 - {'Flip to GREEN for exit' if direction == 'SHORT' else 'Flip to RED for exit'}"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_supertrend_exit(self, symbol: str, direction: str, entry: float,
                               exit_price: float, realized_pnl: float,
@@ -375,7 +361,8 @@ RESULT
 Realized PnL: {pnl_text}
 Result      : {result_text}"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_trade_executed(self, trade: dict) -> bool:
         if not self.enabled:
@@ -414,7 +401,8 @@ SuperTrend : Monitoring post-entry"""
         if no_rsi:
             body += "\nRSI Filter : DISABLED"
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_trade_closed(self, trade: dict, close_reason: str, pnl_usd: float) -> bool:
         if not self.enabled:
@@ -443,7 +431,8 @@ RESULT
 Realized PnL: {pnl_text}
 Result      : {'PROFIT' if is_profit else 'LOSS'}"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_daily_loss_warning(self, daily_loss_usd: float, daily_limit_usd: float) -> bool:
         if not self.enabled:
@@ -458,7 +447,8 @@ Daily Limit  : ${daily_limit_usd:.2f}
 Percentage   : {percent:.1f}%
 Status       : {'NEAR LIMIT - Caution!' if percent >= 80 else 'Monitoring'}"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_daily_limit_hit(self, daily_loss_usd: float, daily_limit_usd: float) -> bool:
         if not self.enabled:
@@ -472,7 +462,8 @@ Daily Limit  : ${daily_limit_usd:.2f}
 Status       : TRADING HALTED UNTIL TOMORROW (UTC)
 Action       : No new trades will be placed"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_startup_report(self, config: dict, symbols: List[str], harami_tolerance: float) -> bool:
         if not self.enabled:
@@ -502,7 +493,8 @@ MONITORED SYMBOLS ({len(symbols)})
 -----------------------------
 {symbols_list}"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_sr_level_event(self, symbol: str, event_type: str, level_data: dict,
                              all_supports: List[dict], all_resistances: List[dict]) -> bool:
@@ -606,19 +598,14 @@ LEGEND
 * = Strength (more * = stronger level)
 Touches = Number of times price has touched this level
 Age = Candles since level was created
-Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)
+Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
 
-NOTE: Levels are NOT merged. Each detected swing is a separate level."""
-
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_sr_rejection(self, symbol: str, direction: str, level_price: float,
                            breakout_close: float, confirm_close: float,
                            rejection_reason: str, strategy: str = "S/R_BREAKOUT") -> bool:
-        """
-        Send a rejection email for failed S/R breakout/breakdown attempts.
-        Prevents duplicate emails for the same event.
-        """
         if not self.enabled:
             return False
 
@@ -661,15 +648,10 @@ NOTES
 - S/R level may be replaced if confirmation failed
 - Check logs for more details"""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
     def send_health_alert(self, issue_key: str, message: str, resolved: bool = False) -> bool:
-        """
-        Sends an alert when the watchdog detects a condition that could mean
-        the bot is silently failing to trade (stalled candle feed, evaluation
-        never running, WebSocket down, daily-loss gate stuck active, etc.),
-        or a "resolved" follow-up once that condition clears.
-        """
         if not self.enabled:
             return False
 
@@ -698,7 +680,8 @@ You will get a RESOLVED email automatically once this condition clears.
 This alert will not repeat for the same ongoing issue for at least
 {HEALTH_ALERT_COOLDOWN // 60} minutes."""
 
-        return self._send_email(subject, body)
+        self._dispatch_async(subject, body)
+        return True
 
 
 # ================================================================
@@ -724,37 +707,10 @@ class WSConfig:
     reconnect_backoff_multiplier: int = 2
 
 
-# *** seconds between repeat log lines for the SAME unhandled/unexpected
-# WS message type, so a noisy or unknown message type (e.g. a heartbeat)
-# can never spam the logs while still being visible at least once a minute.
 UNHANDLED_WS_MSG_LOG_INTERVAL = 60
 
 
 class DeltaWebSocket:
-    """
-    Manages a single WebSocket connection. NOTE: once .stop() is called this
-    instance is permanently done (by design, so a dead socket can't silently
-    linger) - TradingBot's automatic recovery logic never calls .start()
-    again on a stopped instance; instead it builds a brand-new DeltaWebSocket
-    and swaps it in. See TradingBot._force_ws_reconnect().
-
-    *** DIAGNOSTIC/RELIABILITY REWRITE (v14.3) ***
-    This class now logs every stage of the connection lifecycle at INFO
-    level (connect attempt, connected, subscription sent, subscription
-    confirmed/rejected, disconnects, reconnect attempts) so a silent
-    "no live data" failure is impossible to miss in bot.log. Message
-    parsing is also more defensive: it tolerates a couple of alternate
-    field names/wrapper shapes the exchange may use, and any message type
-    it does not recognize is logged (throttled) instead of being dropped
-    without a trace.
-
-    NEW (v14.3): a dedicated "subscribed" callback fires the moment the
-    server confirms a subscription, independent of the "connected"
-    callback - this lets the bot's startup sequence gate strategy
-    processing on real, server-confirmed readiness signals (connect ->
-    subscribe -> confirm -> first data) instead of relying on sleeps.
-    """
-
     def __init__(self, config: Optional[WSConfig] = None):
         self.config = config or WSConfig()
         self._state = WSState.DISCONNECTED
@@ -771,17 +727,10 @@ class DeltaWebSocket:
         self._on_disconnected_callback: Optional[callable] = None
         self._on_error_callback: Optional[callable] = None
         self._on_reconnect_callback: Optional[callable] = None
-        # *** NEW: fired when the server explicitly confirms a subscription
-        # ("subscriptions"/"success" message type) - a distinct readiness
-        # signal from "socket connected".
         self._on_subscribed_callback: Optional[callable] = None
 
-        # *** throttled bookkeeping for unexpected/unrecognized
-        # message types so repeats of the SAME type don't spam the logs.
         self._unhandled_type_counts: Dict[str, int] = {}
         self._unhandled_type_last_log: Dict[str, float] = {}
-        # *** whether we've logged the "first live message" milestone
-        # since the most recent (re)connect - purely a visibility aid.
         self._first_message_logged = False
 
     def set_candle_callback(self, cb: callable) -> None:
@@ -956,12 +905,6 @@ class DeltaWebSocket:
         try:
             msg_type = str(data.get("type", ""))
 
-            # -- Subscription acknowledgement / confirmation messages.
-            # Delta's WS API sends a "subscriptions" (or similar) message
-            # back confirming which channels/symbols are now active - log
-            # this clearly so subscription success is visible, not assumed,
-            # and fire the dedicated readiness callback for the startup
-            # sequence.
             if msg_type in ("subscriptions", "success"):
                 _log("info", "WS", f"Subscription CONFIRMED by server: {data}")
                 if self._on_subscribed_callback:
@@ -976,7 +919,6 @@ class DeltaWebSocket:
                 return
 
             if msg_type == "subscribe":
-                # Echo of our own subscribe request - not an error, no-op.
                 _log("debug", "WS", f"Echo of subscribe request received: {data}")
                 return
 
@@ -988,24 +930,13 @@ class DeltaWebSocket:
                     try:
                         self._on_candle_callback(symbol, candle) if self._on_candle_callback else None
                     except Exception as e:
-                        # This is the callback into TradingBot.process_candle.
-                        # It must never silently swallow a per-symbol bug -
-                        # log it loudly with full traceback so it's visible
-                        # in bot.log, instead of vanishing like before.
                         _log_exc("WS", f"Candle callback error for {symbol}: {e}")
                 return
 
             if "candlestick" in msg_type.lower():
-                # It looked like a candle message (type contains
-                # "candlestick") but we could not extract a valid candle
-                # from it - this is exactly the kind of silent-drop bug
-                # that must never happen unnoticed again.
                 _log("error", "WS", f"Candlestick-type message received but could NOT be parsed - raw: {data}")
                 return
 
-            # Anything else is an unexpected/unrecognized message type.
-            # Never drop it silently - log it, throttled per type so a
-            # noisy heartbeat/ping-like message can't spam the logs.
             self._log_unhandled_type(msg_type, data)
 
         except Exception as e:
@@ -1027,10 +958,6 @@ class DeltaWebSocket:
         if "candlestick" not in msg_type.lower():
             return None
 
-        # Some feeds nest the actual OHLCV fields under "data" or "payload"
-        # instead of putting them at the top level of the pushed message.
-        # Support both shapes defensively so a wrapper format can never
-        # silently drop every single candle.
         payload = data
         if isinstance(data.get("data"), dict):
             payload = data["data"]
@@ -1061,18 +988,10 @@ class DeltaWebSocket:
                     if v is not None:
                         ts_raw = v
                         break
-            # *** route through the single shared normalizer so WS
-            # timestamps use the exact same unit convention (Unix seconds)
-            # as REST-fetched candles. This matters because the bot
-            # compares REST-backfilled timestamps against WebSocket-
-            # delivered timestamps directly. ***
             ts = normalize_timestamp_to_seconds(ts_raw)
             if ts is None:
                 return None
 
-            # *** tolerate short-key field names (o/h/l/c/v) as a
-            # fallback in case the live feed's OHLCV keys differ from the
-            # long-form names used elsewhere. ***
             o = data.get("open", data.get("o"))
             h = data.get("high", data.get("h"))
             l = data.get("low", data.get("l"))
@@ -1164,26 +1083,21 @@ TP_MAX_PCT = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
 
 MIN_ENGULF_BODY_PCT = 0.30
-
-# -- Harami pattern tolerance --
 HARAMI_BODY_TOLERANCE = 0.001
-
-# -- Range Break Strategy Constants --
 RANGE_BREAK_LOOKBACK = 7
-
-# -- Volatility Expansion Strategy Constants --
 VOL_EXP_LOOKBACK = 21
 
-# -- Support/Resistance Strategy Constants --
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
-SR_MERGE_THRESHOLD = 0.005  # DEPRECATED - NO LONGER USED FOR MERGING
-SR_MIN_LEVEL_AGE = 0  # No aging requirement - use immediately
-SR_MAX_LEVEL_AGE = 100  # Max age in candles
+SR_MERGE_THRESHOLD = 0.005
+SR_MIN_LEVEL_AGE = 0
+SR_MAX_LEVEL_AGE = 100
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
 
-# -- SuperTrend parameters --
+# FINAL MINIMUM DISTANCE FILTER - 1.5% minimum separation between final levels
+MIN_SR_DISTANCE_PERCENT = 1.5
+
 ST1_LENGTH = 14
 ST1_FACTOR = 2.0
 ST2_LENGTH = 21
@@ -1196,27 +1110,18 @@ TIMEFRAME_MAP: Dict[str, Dict] = {
     "1h": {"resolution": "1h", "api_resolution": "1h", "ws_channel": "candlestick_1h", "secs": 3600},
 }
 
-# -- Watchdog / silent-failure health-check constants --
-WATCHDOG_CHECK_INTERVAL = 300      # how often the watchdog runs its checks (seconds)
-STALE_CANDLE_MULTIPLIER = 3        # legacy/unused by the timeframe-aware check below; kept for compatibility
-EVAL_STALL_MULTIPLIER = 2          # alert if candles close but signal-eval never runs for N x timeframe
-HEALTH_ALERT_COOLDOWN = 3600       # don't re-alert the same ongoing issue more often than this (seconds)
-
-# -- Timeframe-aware watchdog thresholds --
+WATCHDOG_CHECK_INTERVAL = 300
+STALE_CANDLE_MULTIPLIER = 3
+EVAL_STALL_MULTIPLIER = 2
+HEALTH_ALERT_COOLDOWN = 3600
 WS_UPDATE_STALE_SECONDS = 180
 CANDLE_CLOSE_GRACE_SECONDS = 90
-
-# -- Per-symbol processing error recovery --
 SYMBOL_ERROR_RESET_THRESHOLD = 3
-
-# -- Automatic stale-feed recovery --
 STALE_RECOVERY_COOLDOWN = 300
 RECOVERY_SETTLE_SECONDS = 3
-
-# -- Startup readiness gating (event-based, timeouts are only a safety net) --
-STARTUP_WS_CONNECT_TIMEOUT = 30       # seconds to wait for WS "connected" before proceeding with a warning
-STARTUP_SUBSCRIBE_CONFIRM_TIMEOUT = 20 # seconds to wait for server subscription ack
-STARTUP_LIVE_DATA_TIMEOUT = 60        # seconds to wait for first live candle data across all symbols
+STARTUP_WS_CONNECT_TIMEOUT = 30
+STARTUP_SUBSCRIBE_CONFIRM_TIMEOUT = 20
+STARTUP_LIVE_DATA_TIMEOUT = 60
 
 
 # ================================================================
@@ -1242,7 +1147,7 @@ class APIRequestHandler:
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "python-DeltaBot/14.3",
+            "User-Agent": "python-DeltaBot/14.9",
             "Accept": "application/json",
             "Connection": "keep-alive",
         })
@@ -1741,14 +1646,6 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
 
 
 def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    """
-    S/R Breakdown SHORT strategy:
-    - Break candle (candles[-3]) closes below Support
-    - Confirmation candle (candles[-2]) is Bearish
-    - Confirmation candle closes below break candle close
-    - Enter SHORT on confirmation candle close (IMMEDIATE)
-    - Stop Loss = confirmation candle high
-    """
     if len(candles) < 4:
         return False, None, ""
 
@@ -1802,14 +1699,6 @@ def check_short_signal_support_resistance_manager(candles: List[dict], sr_manage
 
 
 def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    """
-    Resistance False Breakout Reversal SHORT:
-    - False breakout candle (candles[-3]) breaks above Resistance then closes below it
-    - Confirmation candle (candles[-2]) is Bearish
-    - Confirmation candle closes below false breakout candle close
-    - Enter SHORT on confirmation candle close (IMMEDIATE)
-    - Stop Loss = false breakout candle high
-    """
     if len(candles) < 4:
         return False, None, ""
 
@@ -1986,14 +1875,6 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
 
 
 def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    """
-    Resistance Breakout LONG strategy:
-    - Break candle (candles[-3]) closes above Resistance
-    - Confirmation candle (candles[-2]) is Bullish
-    - Confirmation candle closes above break candle close
-    - Enter LONG on confirmation candle close (IMMEDIATE)
-    - Stop Loss = confirmation candle low
-    """
     if len(candles) < 4:
         return False, None, ""
 
@@ -2047,14 +1928,6 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
 
 
 def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    """
-    Support False Breakout Reversal LONG:
-    - False breakout candle (candles[-3]) breaks below Support then closes above it
-    - Confirmation candle (candles[-2]) is Bullish
-    - Confirmation candle closes above false breakout candle close
-    - Enter LONG on confirmation candle close (IMMEDIATE)
-    - Stop Loss = false breakout candle low
-    """
     if len(candles) < 4:
         return False, None, ""
 
@@ -2284,10 +2157,6 @@ def check_short_signal_no_rsi(
     harami_tolerance: float = HARAMI_BODY_TOLERANCE,
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
-    """
-    Check NO-RSI short strategies with detailed rejection logging.
-    S/R strategies now execute immediately on confirmation candle close.
-    """
     triggered, signal_candle, strategy = check_short_signal_range_break(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
@@ -2536,10 +2405,6 @@ def check_long_signal_no_rsi(
     harami_tolerance: float = HARAMI_BODY_TOLERANCE,
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
-    """
-    Check NO-RSI long strategies with detailed rejection logging.
-    S/R strategies now execute immediately on confirmation candle close.
-    """
     triggered, signal_candle, strategy = check_long_signal_range_break(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
@@ -2747,7 +2612,7 @@ def check_long_signal_no_rsi(
 
 
 # ================================================================
-#  14. SUPPORT/RESISTANCE LEVEL MANAGER
+#  14. SUPPORT/RESISTANCE LEVEL MANAGER (FIXED - WITH RECLASSIFICATION)
 # ================================================================
 
 class SRLevelManager:
@@ -2756,6 +2621,7 @@ class SRLevelManager:
                  min_age: int = SR_MIN_LEVEL_AGE,
                  max_age: int = SR_MAX_LEVEL_AGE,
                  min_strength: int = SR_MIN_STRENGTH,
+                 min_distance_percent: float = MIN_SR_DISTANCE_PERCENT,
                  notifier: Optional[GmailNotifier] = None):
         self.symbol = symbol
         self.lookback = lookback
@@ -2763,58 +2629,591 @@ class SRLevelManager:
         self.min_age = 0
         self.max_age = max_age
         self.min_strength = min_strength
+        self.min_distance_percent = min_distance_percent
         self.notifier = notifier
 
         self.resistance_levels: List[Dict] = []
         self.support_levels: List[Dict] = []
         self.pending_swing_highs: List[float] = []
         self.pending_swing_lows: List[float] = []
-        self.last_processed_index = 0
-        self._lock = threading.Lock()
 
-    def update_levels(self, candles: List[dict]) -> None:
+        # Track which candle indices have been fully processed
+        self._processed_indices: set = set()
+        self._last_processed_index = -1
+
+        self._lock = threading.RLock()
+
+    def _progress_log(self, msg: str) -> None:
+        logger.debug(f"[S/R-DEBUG][{self.symbol}] {msg}")
+
+    def _log_new_level(self, level_type: str, price: float) -> None:
+        """Log a new level detection."""
+        _log("info", "S/R", f"[{self.symbol}] NEW {level_type} | {smart_fmt(price)}")
+
+    def _log_merged_levels(self, level_type: str, prices: List[float], merged_price: float) -> None:
+        """Log when levels are merged."""
+        price_strs = [smart_fmt(p) for p in prices]
+        _log("info", "S/R", f"[{self.symbol}] MERGED | {' + '.join(price_strs)} → {smart_fmt(merged_price)}")
+
+    def _log_filtered_levels(self, level_type: str, prices: List[float], merged_price: float) -> None:
+        """Log when levels are filtered by proximity."""
+        price_strs = [smart_fmt(p) for p in prices]
+        _log("info", "S/R", f"[{self.symbol}] FILTERED | {' + '.join(price_strs)} → {smart_fmt(merged_price)} | <{self.min_distance_percent}%")
+
+    def _log_reclassified_level(self, old_type: str, new_type: str, price: float, current_price: float) -> None:
+        """Log when a level is reclassified."""
+        _log("info", "S/R", f"[{self.symbol}] RECLASSIFIED | {old_type} → {new_type} | {smart_fmt(price)} | price={smart_fmt(current_price)}")
+
+    def _log_final_levels(self) -> None:
+        """Log final support and resistance levels."""
+        support_strs = [smart_fmt(l["price"]) for l in sorted(self.support_levels, key=lambda x: x["price"])]
+        resistance_strs = [smart_fmt(l["price"]) for l in sorted(self.resistance_levels, key=lambda x: x["price"])]
+
+        s_str = ", ".join(support_strs) if support_strs else "none"
+        r_str = ", ".join(resistance_strs) if resistance_strs else "none"
+
+        _log("info", "S/R", f"[{self.symbol}] FINAL | S: {s_str} | R: {r_str}")
+
+    def _reclassify_levels_by_price(self, current_price: float) -> None:
+        """
+        Reclassify all levels based on current price:
+        - Level below current price → SUPPORT
+        - Level above current price → RESISTANCE
+        This ensures correct classification after price moves significantly.
+        """
         with self._lock:
-            if len(candles) < self.lookback:
-                return
+            reclassified = []
 
-            current_idx = len(candles) - 1
-            if current_idx == self.last_processed_index:
-                return
+            # Process resistance levels
+            new_resistances = []
+            for level in self.resistance_levels:
+                price = level["price"]
+                if price < current_price:
+                    # Should be support
+                    level_copy = dict(level)
+                    level_copy["type"] = "SUPPORT"
+                    self.support_levels.append(level_copy)
+                    self._log_reclassified_level("RESISTANCE", "SUPPORT", price, current_price)
+                    reclassified.append(level_copy)
+                else:
+                    new_resistances.append(level)
+            self.resistance_levels = new_resistances
 
-            self._check_broken_levels(candles)
+            # Process support levels
+            new_supports = []
+            for level in self.support_levels:
+                price = level["price"]
+                if price > current_price:
+                    # Should be resistance
+                    level_copy = dict(level)
+                    level_copy["type"] = "RESISTANCE"
+                    self.resistance_levels.append(level_copy)
+                    self._log_reclassified_level("SUPPORT", "RESISTANCE", price, current_price)
+                    reclassified.append(level_copy)
+                else:
+                    new_supports.append(level)
+            self.support_levels = new_supports
 
-            new_swing_highs, new_swing_lows = self._detect_new_swings(candles)
-            new_levels_created = []
+            # Remove duplicates (if a level was in both lists)
+            self._deduplicate_levels()
 
-            for price in new_swing_highs:
-                for level in self.resistance_levels:
-                    if level["price"] == price and level["age"] == 0 and level["strength"] == 1:
-                        new_levels_created.append(level)
+            if reclassified:
+                self._progress_log(f"Reclassified {len(reclassified)} levels based on price {smart_fmt(current_price)}")
+
+    def _deduplicate_levels(self) -> None:
+        """Remove duplicate levels within tolerance from both lists."""
+        # Deduplicate supports
+        unique_supports = {}
+        for level in self.support_levels:
+            price = level["price"]
+            # Find if there's already a level within tolerance
+            found = False
+            for existing in list(unique_supports.values()):
+                if abs(existing["price"] - price) / max(price, 1) < self.merge_threshold:
+                    # Keep the one with higher strength
+                    if level.get("strength", 1) > existing.get("strength", 1):
+                        unique_supports[id(level)] = level
+                    found = True
+                    break
+            if not found:
+                unique_supports[id(level)] = level
+        self.support_levels = list(unique_supports.values())
+
+        # Deduplicate resistances
+        unique_resistances = {}
+        for level in self.resistance_levels:
+            price = level["price"]
+            found = False
+            for existing in list(unique_resistances.values()):
+                if abs(existing["price"] - price) / max(price, 1) < self.merge_threshold:
+                    if level.get("strength", 1) > existing.get("strength", 1):
+                        unique_resistances[id(level)] = level
+                    found = True
+                    break
+            if not found:
+                unique_resistances[id(level)] = level
+        self.resistance_levels = list(unique_resistances.values())
+
+    def _merge_levels(self, levels: List[Dict], level_type: str) -> List[Dict]:
+        """Merge nearby levels using weighted average based on touches."""
+        if not levels:
+            return []
+
+        # Sort by price
+        sorted_levels = sorted(levels, key=lambda x: x["price"])
+        merged = []
+        i = 0
+
+        while i < len(sorted_levels):
+            current = sorted_levels[i]
+            group = [current]
+            j = i + 1
+
+            # Find all levels within merge threshold
+            while j < len(sorted_levels):
+                # Check if next level is within threshold of current group
+                group_avg = sum(l["price"] for l in group) / len(group)
+                if abs(sorted_levels[j]["price"] - group_avg) / max(group_avg, 1) <= self.merge_threshold:
+                    group.append(sorted_levels[j])
+                    j += 1
+                else:
+                    break
+
+            if len(group) == 1:
+                merged.append(group[0])
+            else:
+                # Merge the group into one level using weighted average
+                total_touches = sum(l.get("touches", 1) for l in group)
+                total_strength = sum(l.get("strength", 1) for l in group)
+                merged_price = 0.0
+                total_weight = 0.0
+
+                for l in group:
+                    weight = l.get("touches", 1) * l.get("strength", 1)
+                    merged_price += l["price"] * weight
+                    total_weight += weight
+
+                if total_weight > 0:
+                    merged_price /= total_weight
+                else:
+                    merged_price = sum(l["price"] for l in group) / len(group)
+
+                # Create merged level
+                merged_level = {
+                    "price": round(merged_price, 8),
+                    "age": min(l.get("age", 0) for l in group),
+                    "strength": min(5, total_strength),
+                    "touches": total_touches,
+                    "type": level_type,
+                    "_merged_from": len(group),
+                    "_original_prices": [l["price"] for l in group],
+                }
+
+                # Log the merge
+                self._log_merged_levels(level_type, [l["price"] for l in group], merged_price)
+                self._progress_log(f"Merged {level_type} levels: {[smart_fmt(l['price']) for l in group]} → {smart_fmt(merged_price)} (touches={total_touches}, strength={min(5, total_strength)})")
+
+                merged.append(merged_level)
+
+            i = j
+
+        return merged
+
+    def _apply_final_proximity_filter(self, levels: List[Dict], level_type: str) -> List[Dict]:
+        """
+        Apply iterative minimum-distance filter to ensure no two levels of the same type
+        are closer than min_distance_percent. Runs iteratively until no pairs remain.
+        """
+        if not levels:
+            return []
+
+        # Make a mutable copy
+        working = levels.copy()
+        merged_count = 0
+        iterations = 0
+
+        while True:
+            iterations += 1
+            if len(working) <= 1:
+                break
+
+            # Sort by price
+            working.sort(key=lambda x: x["price"])
+            merged_this_round = []
+            new_working = []
+            i = 0
+
+            while i < len(working):
+                current = working[i]
+                group = [current]
+                j = i + 1
+
+                # Find all levels within the minimum distance threshold
+                while j < len(working):
+                    # Calculate percentage distance between current group avg and next level
+                    group_avg = sum(l["price"] for l in group) / len(group)
+                    dist_pct = abs(working[j]["price"] - group_avg) / max(group_avg, 1) * 100
+
+                    if dist_pct < self.min_distance_percent:
+                        group.append(working[j])
+                        j += 1
+                    else:
                         break
 
-            for price in new_swing_lows:
-                for level in self.support_levels:
-                    if level["price"] == price and level["age"] == 0 and level["strength"] == 1:
-                        new_levels_created.append(level)
-                        break
+                if len(group) == 1:
+                    new_working.append(group[0])
+                else:
+                    # Merge the group into one stronger level
+                    merged_this_round.extend(group)
 
-            self.pending_swing_highs.extend(new_swing_highs)
-            self.pending_swing_lows.extend(new_swing_lows)
+                    # Weighted average for the final price
+                    total_weight = 0.0
+                    merged_price = 0.0
+                    total_touches = 0
+                    total_strength = 0
+                    min_age = float('inf')
 
-            self._update_level_strength(candles)
-            expired_levels = self._age_levels()
+                    for l in group:
+                        weight = l.get("touches", 1) * l.get("strength", 1)
+                        merged_price += l["price"] * weight
+                        total_weight += weight
+                        total_touches += l.get("touches", 1)
+                        total_strength += l.get("strength", 1)
+                        if l.get("age", 0) < min_age:
+                            min_age = l.get("age", 0)
 
-            self._send_level_notifications(new_levels_created, expired_levels)
+                    if total_weight > 0:
+                        merged_price /= total_weight
+                    else:
+                        merged_price = sum(l["price"] for l in group) / len(group)
 
-            self.last_processed_index = current_idx
-            self._log_levels()
+                    # Create merged level
+                    merged_level = {
+                        "price": round(merged_price, 8),
+                        "age": min_age if min_age != float('inf') else 0,
+                        "strength": min(5, total_strength),
+                        "touches": total_touches,
+                        "type": level_type,
+                        "_proximity_merged_from": len(group),
+                        "_proximity_prices": [l["price"] for l in group],
+                    }
 
-    def _check_broken_levels(self, candles: List[dict]) -> None:
-        """
-        Check if any resistance was broken but the LONG confirmation failed,
-        or any support was broken but the SHORT confirmation failed.
-        If so, immediately replace the broken level.
-        """
+                    # Log the proximity filter
+                    self._log_filtered_levels(level_type, [l["price"] for l in group], merged_price)
+                    self._progress_log(f"Proximity filtered {level_type}: {[smart_fmt(l['price']) for l in group]} → {smart_fmt(merged_price)} (touches={total_touches}, strength={min(5, total_strength)})")
+
+                    new_working.append(merged_level)
+                    merged_count += len(group) - 1
+
+                i = j
+
+            working = new_working
+
+            # If no merges happened this round, we're done
+            if not merged_this_round:
+                break
+
+            # If we've done too many iterations, break to avoid infinite loops
+            if iterations > 100:
+                self._progress_log(f"Proximity filter exceeded max iterations, stopping")
+                break
+
+        return working
+
+    def update_levels(self, candles: List[dict], initializing: bool = False) -> None:
+        """Main entry point for S/R level updates."""
+        if len(candles) < self.lookback:
+            self._progress_log(f"Not enough candles: {len(candles)} < {self.lookback}")
+            return
+
+        with self._lock:
+            if initializing:
+                # INITIAL MODE: Process the complete history from scratch
+                self._progress_log(f"INITIAL SCAN STARTED | Candles={len(candles)}")
+                self._reset_all_levels()
+                self._processed_indices.clear()
+                self._last_processed_index = -1
+
+                self._run_initial_scan(candles)
+
+                # Mark all historical candles as processed
+                for i in range(len(candles)):
+                    self._processed_indices.add(i)
+                self._last_processed_index = len(candles) - 1
+
+                # Merge levels after initial scan (local proximity)
+                self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
+                self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
+
+                # RECLASSIFY: Fix classification based on current price
+                current_price = candles[-1]["close"] if candles else 0
+                if current_price > 0:
+                    self._reclassify_levels_by_price(current_price)
+
+                # Apply final minimum-distance filter iteratively
+                self._progress_log(f"Final proximity filter | Threshold={self.min_distance_percent}%")
+                before_r = len(self.resistance_levels)
+                before_s = len(self.support_levels)
+
+                self.resistance_levels = self._apply_final_proximity_filter(self.resistance_levels, "RESISTANCE")
+                self.support_levels = self._apply_final_proximity_filter(self.support_levels, "SUPPORT")
+
+                after_r = len(self.resistance_levels)
+                after_s = len(self.support_levels)
+
+                if before_r != after_r:
+                    self._progress_log(f"RESISTANCE filtered: {before_r} → {after_r}")
+                if before_s != after_s:
+                    self._progress_log(f"SUPPORT filtered: {before_s} → {after_s}")
+
+                # Log final levels
+                self._log_final_levels()
+            else:
+                # LIVE MODE: Process only newly closed candles
+                current_idx = len(candles) - 1
+
+                # Find unprocessed indices
+                unprocessed = []
+                for i in range(self._last_processed_index + 1, current_idx + 1):
+                    if i not in self._processed_indices:
+                        unprocessed.append(i)
+
+                if not unprocessed:
+                    self._progress_log("No new candles to process")
+                    return
+
+                self._progress_log(f"LIVE INCREMENTAL UPDATE | New Candles={len(unprocessed)} | Range={unprocessed[0]}→{unprocessed[-1]}")
+
+                # Process each unprocessed candle
+                for idx in unprocessed:
+                    # Need enough context for swing detection
+                    context_start = max(0, idx - SR_SWING_SENSITIVITY - 1)
+                    context_end = min(len(candles), idx + SR_SWING_SENSITIVITY + 2)
+                    context = candles[context_start:context_end]
+
+                    self._process_candle_at_index(idx, context, candles)
+
+                    # Mark as processed
+                    self._processed_indices.add(idx)
+                    self._last_processed_index = max(self._last_processed_index, idx)
+
+                # Age all levels by 1 for each new candle
+                self._age_levels()
+
+                # Update strength for levels near current price
+                if candles:
+                    self._update_level_strength(candles)
+
+                # Merge levels after live update (local proximity)
+                self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
+                self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
+
+                # RECLASSIFY: Fix classification based on current price
+                current_price = candles[-1]["close"] if candles else 0
+                if current_price > 0:
+                    self._reclassify_levels_by_price(current_price)
+
+                # Apply final minimum-distance filter iteratively on live updates
+                before_r = len(self.resistance_levels)
+                before_s = len(self.support_levels)
+
+                self.resistance_levels = self._apply_final_proximity_filter(self.resistance_levels, "RESISTANCE")
+                self.support_levels = self._apply_final_proximity_filter(self.support_levels, "SUPPORT")
+
+                after_r = len(self.resistance_levels)
+                after_s = len(self.support_levels)
+
+                if before_r != after_r or before_s != after_s:
+                    self._progress_log(f"Live update filtered | RESISTANCE: {before_r}→{after_r} | SUPPORT: {before_s}→{after_s}")
+
+                # Log final levels
+                self._log_final_levels()
+
+    def _reset_all_levels(self) -> None:
+        """Reset all level data for a fresh initial scan."""
+        self.resistance_levels.clear()
+        self.support_levels.clear()
+        self.pending_swing_highs.clear()
+        self.pending_swing_lows.clear()
+
+    def _run_initial_scan(self, candles: List[dict]) -> None:
+        """Perform a complete historical scan for S/R levels."""
+        n = len(candles)
+        sensitivity = SR_SWING_SENSITIVITY
+
+        self._progress_log(f"Initial scan over {n} candles with sensitivity={sensitivity}")
+
+        # Detect all swing points in the entire historical dataset
+        for i in range(sensitivity, n - sensitivity):
+            # Check for swing high
+            is_high = True
+            for j in range(1, sensitivity + 1):
+                if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
+                    is_high = False
+                    break
+            if is_high:
+                price = candles[i]["high"]
+                # Check if this level already exists (prevent duplicates)
+                if not self._level_exists(self.resistance_levels, price):
+                    new_level = {
+                        "price": price,
+                        "age": 0,
+                        "strength": 1,
+                        "touches": 1,
+                        "type": "RESISTANCE",
+                        "index": i
+                    }
+                    self.resistance_levels.append(new_level)
+                    self.pending_swing_highs.append(price)
+                    self._log_new_level("RESISTANCE", price)
+                    self._progress_log(f"New RESISTANCE at {smart_fmt(price)} (index {i})")
+
+            # Check for swing low
+            is_low = True
+            for j in range(1, sensitivity + 1):
+                if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
+                    is_low = False
+                    break
+            if is_low:
+                price = candles[i]["low"]
+                if not self._level_exists(self.support_levels, price):
+                    new_level = {
+                        "price": price,
+                        "age": 0,
+                        "strength": 1,
+                        "touches": 1,
+                        "type": "SUPPORT",
+                        "index": i
+                    }
+                    self.support_levels.append(new_level)
+                    self.pending_swing_lows.append(price)
+                    self._log_new_level("SUPPORT", price)
+                    self._progress_log(f"New SUPPORT at {smart_fmt(price)} (index {i})")
+
+        # Update strength and touches based on price proximity
+        self._update_level_strength(candles)
+
+        self._progress_log(f"Initial scan complete: {len(self.support_levels)} supports, {len(self.resistance_levels)} resistances")
+
+    def _process_candle_at_index(self, idx: int, context: List[dict], full_candles: List[dict]) -> None:
+        """Process a single candle for S/R detection in live mode."""
+        if len(context) < SR_SWING_SENSITIVITY * 2 + 1:
+            return
+
+        sensitivity = SR_SWING_SENSITIVITY
+        # The candle we're checking is at position sensitivity in the context
+        check_pos = sensitivity
+
+        # Check for swing high
+        is_high = True
+        for j in range(1, sensitivity + 1):
+            if (check_pos - j < 0 or check_pos + j >= len(context)):
+                is_high = False
+                break
+            if context[check_pos]["high"] <= context[check_pos - j]["high"] or context[check_pos]["high"] <= context[check_pos + j]["high"]:
+                is_high = False
+                break
+        if is_high:
+            price = context[check_pos]["high"]
+            if not self._level_exists(self.resistance_levels, price):
+                new_level = {
+                    "price": price,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1,
+                    "type": "RESISTANCE"
+                }
+                self.resistance_levels.append(new_level)
+                self.pending_swing_highs.append(price)
+                self._log_new_level("RESISTANCE", price)
+                self._progress_log(f"New RESISTANCE at {smart_fmt(price)}")
+
+        # Check for swing low
+        is_low = True
+        for j in range(1, sensitivity + 1):
+            if (check_pos - j < 0 or check_pos + j >= len(context)):
+                is_low = False
+                break
+            if context[check_pos]["low"] >= context[check_pos - j]["low"] or context[check_pos]["low"] >= context[check_pos + j]["low"]:
+                is_low = False
+                break
+        if is_low:
+            price = context[check_pos]["low"]
+            if not self._level_exists(self.support_levels, price):
+                new_level = {
+                    "price": price,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1,
+                    "type": "SUPPORT"
+                }
+                self.support_levels.append(new_level)
+                self.pending_swing_lows.append(price)
+                self._log_new_level("SUPPORT", price)
+                self._progress_log(f"New SUPPORT at {smart_fmt(price)}")
+
+    def _level_exists(self, levels: List[Dict], price: float, tolerance: float = 0.002) -> bool:
+        """Check if a level with this price already exists."""
+        for level in levels:
+            if abs(level["price"] - price) / max(price, 1) < tolerance:
+                return True
+        return False
+
+    def _update_level_strength(self, candles: List[dict]) -> None:
+        """Update strength and touches for all levels based on price proximity."""
+        if not candles:
+            return
+        current_price = candles[-1]["close"]
+        threshold = current_price * SR_PRICE_TOUCH_THRESHOLD
+
+        # Update resistance levels
+        for level in self.resistance_levels:
+            if abs(level["price"] - current_price) <= threshold:
+                level["strength"] = min(5, level["strength"] + 1)
+                level["touches"] += 1
+                level["age"] = 0
+                self._progress_log(f"RESISTANCE touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
+
+        # Update support levels
+        for level in self.support_levels:
+            if abs(level["price"] - current_price) <= threshold:
+                level["strength"] = min(5, level["strength"] + 1)
+                level["touches"] += 1
+                level["age"] = 0
+                self._progress_log(f"SUPPORT touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
+
+    def _age_levels(self) -> List[Dict]:
+        """Age all levels by 1 and remove expired ones."""
+        expired_levels = []
+
+        # Age resistance levels
+        new_resistances = []
+        for level in self.resistance_levels:
+            effective_max_age = self.max_age + (level["strength"] * 15)
+            level["age"] += 1
+            if level["age"] <= effective_max_age:
+                new_resistances.append(level)
+            else:
+                expired_levels.append(level)
+                self._progress_log(f"RESISTANCE expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
+        self.resistance_levels = new_resistances
+
+        # Age support levels
+        new_supports = []
+        for level in self.support_levels:
+            effective_max_age = self.max_age + (level["strength"] * 15)
+            level["age"] += 1
+            if level["age"] <= effective_max_age:
+                new_supports.append(level)
+            else:
+                expired_levels.append(level)
+                self._progress_log(f"SUPPORT expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
+        self.support_levels = new_supports
+
+        return expired_levels
+
+    def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
+        """Check for broken levels and handle replacements."""
         if len(candles) < 3:
             return
 
@@ -2824,19 +3223,17 @@ class SRLevelManager:
         if not break_candle or not confirm_candle:
             return
 
+        # Check resistance levels
         for i, level in enumerate(self.resistance_levels):
             resistance_price = level["price"]
-
             if break_candle["close"] > resistance_price:
                 confirm_failed = (
                     not is_bullish(confirm_candle) or
                     confirm_candle["close"] <= break_candle["close"]
                 )
-
                 if confirm_failed:
                     old_resistance = self.resistance_levels.pop(i)
                     new_price = break_candle["high"]
-
                     new_level = {
                         "price": new_price,
                         "age": 0,
@@ -2849,12 +3246,9 @@ class SRLevelManager:
                         "candle_type": "BREAKOUT"
                     }
                     self.resistance_levels.append(new_level)
-
                     _log("info", f"S/R [{self.symbol}]",
-                         f"RESISTANCE REPLACED: {smart_fmt(old_resistance['price'])} -> {smart_fmt(new_price)} "
-                         f"(confirmation failed)")
-
-                    if self.notifier:
+                         f"RESISTANCE REPLACED: {smart_fmt(old_resistance['price'])} -> {smart_fmt(new_price)}")
+                    if self.notifier and not initializing:
                         self.notifier.send_sr_level_event(
                             symbol=self.symbol,
                             event_type="REPLACED",
@@ -2864,19 +3258,17 @@ class SRLevelManager:
                         )
                     break
 
+        # Check support levels
         for i, level in enumerate(self.support_levels):
             support_price = level["price"]
-
             if break_candle["close"] < support_price:
                 confirm_failed = (
                     not is_bearish(confirm_candle) or
                     confirm_candle["close"] >= break_candle["close"]
                 )
-
                 if confirm_failed:
                     old_support = self.support_levels.pop(i)
                     new_price = break_candle["low"]
-
                     new_level = {
                         "price": new_price,
                         "age": 0,
@@ -2889,12 +3281,9 @@ class SRLevelManager:
                         "candle_type": "BREAKDOWN"
                     }
                     self.support_levels.append(new_level)
-
                     _log("info", f"S/R [{self.symbol}]",
-                         f"SUPPORT REPLACED: {smart_fmt(old_support['price'])} -> {smart_fmt(new_price)} "
-                         f"(confirmation failed)")
-
-                    if self.notifier:
+                         f"SUPPORT REPLACED: {smart_fmt(old_support['price'])} -> {smart_fmt(new_price)}")
+                    if self.notifier and not initializing:
                         self.notifier.send_sr_level_event(
                             symbol=self.symbol,
                             event_type="REPLACED",
@@ -2903,123 +3292,6 @@ class SRLevelManager:
                             all_resistances=self.resistance_levels
                         )
                     break
-
-    def _detect_new_swings(self, candles: List[dict]) -> Tuple[List[float], List[float]]:
-        n = len(candles)
-        if n < self.lookback:
-            return [], []
-
-        new_highs = []
-        new_lows = []
-        check_range = min(10, n - 1)
-        sensitivity = SR_SWING_SENSITIVITY
-
-        for i in range(n - check_range, n - sensitivity):
-            if i < sensitivity or i >= n - sensitivity:
-                continue
-
-            is_high = True
-            for j in range(1, sensitivity + 1):
-                if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
-                    is_high = False
-                    break
-            if is_high:
-                price = candles[i]["high"]
-                new_level = {
-                    "price": price,
-                    "age": 0,
-                    "strength": 1,
-                    "touches": 1,
-                    "type": "RESISTANCE"
-                }
-                self.resistance_levels.append(new_level)
-                new_highs.append(price)
-                _log("info", f"S/R [{self.symbol}]", f"New RESISTANCE: {smart_fmt(price)} (*)")
-
-            is_low = True
-            for j in range(1, sensitivity + 1):
-                if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
-                    is_low = False
-                    break
-            if is_low:
-                price = candles[i]["low"]
-                new_level = {
-                    "price": price,
-                    "age": 0,
-                    "strength": 1,
-                    "touches": 1,
-                    "type": "SUPPORT"
-                }
-                self.support_levels.append(new_level)
-                new_lows.append(price)
-                _log("info", f"S/R [{self.symbol}]", f"New SUPPORT: {smart_fmt(price)} (*)")
-
-        return new_highs, new_lows
-
-    def _update_level_strength(self, candles: List[dict]) -> None:
-        if not candles:
-            return
-        current_price = candles[-1]["close"]
-        threshold = current_price * SR_PRICE_TOUCH_THRESHOLD
-
-        for level in self.resistance_levels:
-            if abs(level["price"] - current_price) <= threshold:
-                level["strength"] = min(5, level["strength"] + 1)
-                level["touches"] += 1
-                level["age"] = 0
-                _log("info", f"S/R [{self.symbol}]",
-                     f"RESISTANCE touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
-
-        for level in self.support_levels:
-            if abs(level["price"] - current_price) <= threshold:
-                level["strength"] = min(5, level["strength"] + 1)
-                level["touches"] += 1
-                level["age"] = 0
-                _log("info", f"S/R [{self.symbol}]",
-                     f"SUPPORT touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
-
-    def _age_levels(self) -> List[Dict]:
-        expired_levels = []
-
-        new_resistances = []
-        for level in self.resistance_levels:
-            effective_max_age = self.max_age + (level["strength"] * 15)
-            level["age"] += 1
-            if level["age"] <= effective_max_age:
-                new_resistances.append(level)
-            else:
-                expired_levels.append(level)
-                _log("info", f"S/R [{self.symbol}]",
-                     f"RESISTANCE expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
-        self.resistance_levels = new_resistances
-
-        new_supports = []
-        for level in self.support_levels:
-            effective_max_age = self.max_age + (level["strength"] * 15)
-            level["age"] += 1
-            if level["age"] <= effective_max_age:
-                new_supports.append(level)
-            else:
-                expired_levels.append(level)
-                _log("info", f"S/R [{self.symbol}]",
-                     f"SUPPORT expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
-        self.support_levels = new_supports
-
-        return expired_levels
-
-    def _send_level_notifications(self, new_levels: List[Dict], expired_levels: List[Dict]) -> None:
-        if not self.notifier:
-            return
-        for level in new_levels:
-            self.notifier.send_sr_level_event(
-                symbol=self.symbol, event_type="NEW", level_data=level,
-                all_supports=self.support_levels, all_resistances=self.resistance_levels
-            )
-        for level in expired_levels:
-            self.notifier.send_sr_level_event(
-                symbol=self.symbol, event_type="EXPIRED", level_data=level,
-                all_supports=self.support_levels, all_resistances=self.resistance_levels
-            )
 
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
         with self._lock:
@@ -3043,29 +3315,14 @@ class SRLevelManager:
                            and l["strength"] >= self.min_strength]
             return supports, resistances
 
-    def _log_levels(self) -> None:
-        with self._lock:
-            if self.support_levels or self.resistance_levels:
-                support_str = []
-                for l in self.support_levels[-5:]:
-                    support_str.append(f"{smart_fmt(l['price'])} ({'*' * l['strength']}) [age:{l['age']}]")
-
-                resistance_str = []
-                for l in self.resistance_levels[-5:]:
-                    resistance_str.append(f"{smart_fmt(l['price'])} ({'*' * l['strength']}) [age:{l['age']}]")
-
-                if support_str:
-                    _log("info", f"S/R [{self.symbol}]", f"SUPPORT: {', '.join(support_str)}")
-                if resistance_str:
-                    _log("info", f"S/R [{self.symbol}]", f"RESISTANCE: {', '.join(resistance_str)}")
-
     def reset(self) -> None:
         with self._lock:
             self.resistance_levels.clear()
             self.support_levels.clear()
             self.pending_swing_highs.clear()
             self.pending_swing_lows.clear()
-            self.last_processed_index = 0
+            self._processed_indices.clear()
+            self._last_processed_index = -1
             _log("info", f"S/R [{self.symbol}]", "Levels reset")
 
 
@@ -3136,12 +3393,6 @@ def get_time_range_with_retry_shift(
 # ================================================================
 
 def _extract_timestamp(src: dict):
-    """
-    Returns the RAW timestamp value found under any of the known keys, or
-    None if none present. Unit normalization is intentionally NOT done here
-    - it happens once, centrally, in normalize_timestamp_to_seconds() so
-    REST and WebSocket timestamps can never disagree on units.
-    """
     for key in ("start", "time", "open_time", "t", "timestamp"):
         v = src.get(key)
         if v is not None:
@@ -3390,10 +3641,6 @@ class DeltaREST:
                 candle = _parse_rest_candle_row(row, candle_symbol)
                 if candle and validate_candle(candle, candle_symbol):
                     candles.append(candle)
-            # De-dup by timestamp (defensive - the exchange should not send
-            # duplicates, but a retried/overlapping request window could)
-            # and enforce strict chronological order before handing candles
-            # back to the caller.
             dedup: Dict[int, dict] = {}
             for c in candles:
                 dedup[c["time"]] = c
@@ -3539,8 +3786,6 @@ class DailyLossTracker:
         with self._lock:
             self._check_day_rollover()
             limit = self.trading_capital * self.limit_pct
-            # FIX: a zero or undefined limit must never count as "reached" -
-            # otherwise 0.0 >= 0 is True and this blocks every trade forever.
             if limit <= 0:
                 return False
             if self.daily_loss_usd >= limit:
@@ -3593,7 +3838,6 @@ class TradingBot:
         self.product_map: Dict[str, int] = {}
         self.candle_store: Dict[str, deque] = {}
 
-        # -- Candle pipeline state (forming vs closed) --
         self._forming_candle: Dict[str, Optional[dict]] = {}
         self._last_closed_time: Dict[str, int] = {}
         self._candle_locks: Dict[str, threading.Lock] = {}
@@ -3615,7 +3859,6 @@ class TradingBot:
         self.ws_manager: Optional[DeltaWebSocket] = None
         self.sr_managers: Dict[str, SRLevelManager] = {}
 
-        # -- Watchdog / silent-failure detection state --
         self._start_time: float = time.time()
         self.last_candle_time: Dict[str, float] = {}
         self.last_eval_time: Dict[str, float] = {}
@@ -3624,30 +3867,13 @@ class TradingBot:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._watchdog_stop = threading.Event()
 
-        # -- Per-symbol processing error recovery state --
         self._symbol_error_counts: Dict[str, int] = {}
 
-        # -- Automatic stale-feed recovery state --
         self._recovery_state_lock = threading.Lock()
         self._recovery_in_progress = False
         self._last_recovery_attempt: float = 0.0
         self._recovery_issue_baseline: Dict[str, Tuple[int, Optional[int]]] = {}
 
-        # ------------------------------------------------------------
-        # NEW: strict startup-sequence readiness gating.
-        #
-        # These Events are the single source of truth for "has step N
-        # of the startup sequence actually completed" - they are set by
-        # real signals (a WS 'connected' callback firing, a subscription
-        # confirmation message arriving, a live candle message being
-        # received), not by sleeping a fixed amount of time. start()
-        # waits on them (with a bounded timeout purely as a safety net
-        # so the bot can never hang forever if an exchange never sends
-        # an expected ack), and _process_closed_candle() refuses to run
-        # ANY strategy evaluation until _pipeline_ready is set - so no
-        # dependent system can ever start ahead of the data it depends
-        # on, no matter how message timing plays out in practice.
-        # ------------------------------------------------------------
         self._ws_connected_event = threading.Event()
         self._ws_subscribed_event = threading.Event()
         self._first_live_data_event = threading.Event()
@@ -3848,44 +4074,12 @@ class TradingBot:
 
     # ================================================================
     #  STARTUP SEQUENCE
-    #
-    #  This is the single authoritative startup path. Each numbered
-    #  step below corresponds exactly to the required sequence, and no
-    #  step begins before the step(s) it depends on have completed:
-    #
-    #    1.  Load configuration and validate all settings.
-    #    2.  Initialize logging and error handling.
-    #    3.  Initialize REST/API clients.
-    #    4.  Initialize candle storage and symbol mapping.
-    #    5.  Fetch historical OHLCV data for all symbols.
-    #    6.  Store historical closed candles correctly.
-    #    7.  Run initial S/R detection using the loaded historical data.
-    #    8.  Initialize all indicators and strategy-related data.
-    #    9.  Initialize the WebSocket (create + wire, do not start yet).
-    #    10. Connect the WebSocket.
-    #    11. Send subscriptions and wait for confirmation.
-    #    12. Confirm that live candle data is actually being received.
-    #    13. Forming candle initialization (happens automatically as the
-    #        first live messages flow through process_candle()).
-    #    14. Only after the pipeline is healthy, enable strategy
-    #        processing (self._pipeline_ready.set()).
-    #    15. Start watchdog, health monitoring, and other background
-    #        systems.
-    #
-    #  Steps 10-12 wait on real readiness Events fired by the WebSocket
-    #  layer itself, with a bounded timeout purely as a non-blocking
-    #  safety net (the exchange might not send an explicit ack, or a
-    #  symbol's first tick might simply take longer than expected) -
-    #  if a timeout is hit the bot logs a clear warning and proceeds,
-    #  relying on the watchdog (started last, in step 15) to catch and
-    #  auto-recover from any genuine ongoing problem.
     # ================================================================
 
     def start(self) -> None:
         self.running = True
         self._print_banner()
 
-        # ---- STEP 1: Load configuration and validate all settings ----
         self._log("info", "STARTUP", "STEP  1/15: Validating configuration...")
         if self.trading_capital <= 0:
             self._log("error", "STARTUP",
@@ -3894,14 +4088,7 @@ class TradingBot:
             self.running = False
             return
 
-        # ---- STEP 2: Initialize logging and error handling ----
-        # Logging (module-level `logger`/_log/_log_exc) is already fully
-        # initialized at import time, before any other code in this file
-        # runs, so every step from here on is guaranteed to have logging
-        # available.
         self._log("info", "STARTUP", "STEP  2/15: Logging and error handling ready.")
-
-        # ---- STEP 3: Initialize REST/API clients ----
         self._log("info", "STARTUP", "STEP  3/15: Initializing REST API client...")
         warm_up_connection()
         if not self.paper:
@@ -3911,7 +4098,6 @@ class TradingBot:
                 self.running = False
                 return
 
-        # ---- STEP 4: Initialize candle storage and symbol mapping ----
         self._log("info", "STARTUP", "STEP  4/15: Loading product catalogue and resolving symbols...")
         raw_map = self.rest.fetch_product_map()
         if not raw_map:
@@ -3951,32 +4137,24 @@ class TradingBot:
         if self.notifier:
             self.notifier.send_startup_report(self.config, self.symbols, self.harami_tolerance)
 
-        # ---- STEP 5 & 6: Fetch historical OHLCV and store closed candles ----
         self._log("info", "STARTUP", "STEP  5/15: Fetching historical OHLCV data for all symbols...")
         self._log("info", "STARTUP", "STEP  6/15: Storing historical closed candles...")
         self._fetch_historical_candles()
 
-        # ---- STEP 7: Run initial S/R detection using the loaded historical data ----
         self._log("info", "STARTUP", "STEP  7/15: Running initial Support/Resistance detection on historical data...")
         self._run_initial_sr_detection()
 
-        # ---- STEP 8: Initialize indicators and strategy-related data ----
         self._log("info", "STARTUP", "STEP  8/15: Validating indicator/strategy data readiness...")
         self._validate_indicator_readiness()
 
-        # Mark the moment the bot begins truly watching the live feed -
-        # every subsequent watchdog "how long have we been waiting"
-        # calculation is anchored to this, not to process start.
         self._start_time = time.time()
 
-        # ---- STEP 9: Initialize the WebSocket (create + wire, don't start yet) ----
         self._log("info", "STARTUP", "STEP  9/15: Initializing WebSocket manager...")
         self.ws_manager = DeltaWebSocket()
         self._wire_ws_callbacks(self.ws_manager)
         ws_symbols = [to_ws_symbol(sym) for sym in self.symbols]
         self.ws_manager.subscribe(self.timeframe, ws_symbols)
 
-        # ---- STEP 10: Connect the WebSocket ----
         self._log("info", "STARTUP", "STEP 10/15: Connecting WebSocket...")
         self.ws_manager.start()
         connected = self._ws_connected_event.wait(timeout=STARTUP_WS_CONNECT_TIMEOUT)
@@ -3989,10 +4167,6 @@ class TradingBot:
                        f"(started at the end of this sequence) will keep trying and will "
                        f"alert if the feed stays down.")
 
-        # ---- STEP 11: Send subscriptions and wait for confirmation ----
-        # Subscriptions were already queued in step 9 and are sent
-        # automatically the moment the socket opens (see DeltaWebSocket._on_open).
-        # Here we wait for the server's explicit subscription acknowledgement.
         self._log("info", "STARTUP", "STEP 11/15: Waiting for subscription confirmation from server...")
         subscribed = self._ws_subscribed_event.wait(timeout=STARTUP_SUBSCRIBE_CONFIRM_TIMEOUT)
         if subscribed:
@@ -4004,7 +4178,6 @@ class TradingBot:
                        f"without a separate ack message; continuing and relying on "
                        f"step 12's live-data check instead.")
 
-        # ---- STEP 12: Confirm that live candle data is actually being received ----
         self._log("info", "STARTUP", "STEP 12/15: Waiting for first live candle data from all symbols...")
         got_live_data = self._first_live_data_event.wait(timeout=STARTUP_LIVE_DATA_TIMEOUT)
         if got_live_data:
@@ -4019,19 +4192,11 @@ class TradingBot:
                        f"monitor these symbols and trigger automatic recovery if the "
                        f"feed genuinely stays silent.")
 
-        # ---- STEP 13: forming-candle initialization ----
-        # This happens automatically and continuously as live WS messages
-        # arrive via process_candle() -> _forming_candle[symbol] gets set
-        # on the first message per symbol (see process_candle()). No
-        # separate action is needed here; step 12 already confirmed that
-        # messages are flowing.
         self._log("info", "STARTUP", "STEP 13/15: Forming-candle state is being populated by the live feed.")
 
-        # ---- STEP 14: Only now enable normal strategy processing ----
         self._pipeline_ready.set()
         self._log("info", "STARTUP", "STEP 14/15: Data pipeline healthy - STRATEGY EVALUATION ENABLED.")
 
-        # ---- STEP 15: Start watchdog, health monitoring, and other background systems ----
         self._log("info", "STARTUP", "STEP 15/15: Starting watchdog and background health monitoring...")
         self._start_watchdog()
 
@@ -4047,16 +4212,6 @@ class TradingBot:
         self._log("info", "BOT", "Bot stopped.")
 
     def _fetch_historical_candles(self) -> None:
-        """
-        STEPS 5 & 6: Load historical OHLCV candles for every symbol and
-        store the confirmed-closed portion in self.candle_store.
-
-        This function ONLY fetches, normalizes, validates, and stores
-        historical closed candles. It deliberately does NOT run S/R
-        detection or any strategy evaluation - that happens afterwards,
-        as its own explicit step (_run_initial_sr_detection), so the two
-        concerns stay strictly sequenced and easy to reason about.
-        """
         self._log("info", "CANDLES", f"Loading {CANDLE_LIMIT} candles x {self.timeframe} for {len(self.symbols)} symbol(s)")
         tf_secs = self._tf.secs
 
@@ -4067,10 +4222,6 @@ class TradingBot:
                     self._log("warning", "CANDLES", f"  [WARN] {sym}: 0 candles after retries.")
                     continue
 
-                # Normalize timestamps, sort, remove duplicates. get_candles()
-                # already does this internally, but we defensively repeat it
-                # here so this startup path is self-contained and correct
-                # even if the candle list arrives from elsewhere in future.
                 normalized: List[dict] = []
                 for row in raw_candles:
                     ts = normalize_timestamp_to_seconds(row.get("time"))
@@ -4090,9 +4241,6 @@ class TradingBot:
                     self._log("warning", "CANDLES", f"  [WARN] {sym}: no valid candles after normalization.")
                     continue
 
-                # Exclude the currently forming/incomplete candle - keep
-                # only candles whose own period has fully elapsed by
-                # wall-clock time, i.e. genuinely confirmed closed candles.
                 now_ts = time.time()
                 confirmed_closed = [
                     c for c in sorted_candles
@@ -4105,6 +4253,7 @@ class TradingBot:
 
                 for c in confirmed_closed:
                     self.candle_store[sym].append(c)
+
                 self._last_closed_time[sym] = confirmed_closed[-1]["time"]
                 self._log("info", "CANDLES",
                           f"  [OK] {sym}: {len(confirmed_closed)} confirmed closed candles loaded | "
@@ -4114,25 +4263,14 @@ class TradingBot:
                 _log_exc("CANDLES", f"  [ERROR] {sym}: historical load failed, continuing with other symbols: {e}")
 
     def _run_initial_sr_detection(self) -> None:
-        """
-        STEP 7: Run the EXISTING S/R detection logic (SRLevelManager.
-        update_levels - unchanged) on every symbol's confirmed historical
-        closed candles (already stored in self.candle_store by
-        _fetch_historical_candles), so S/R levels are populated and
-        available to the existing S/R strategies before the bot ever
-        waits for its first live candle close.
+        self._log("info", "S/R-INIT", f"Starting historical S/R detection for {len(self.symbols)} symbol(s)")
 
-        This function only changes WHEN the existing S/R detection is
-        first invoked (at startup, on historical data, as its own
-        explicit sequenced step) - it does not alter SRLevelManager's
-        detection logic itself, nor any strategy, signal, execution,
-        TP/SL, risk, or watchdog behavior. After startup, the existing
-        per-live-candle-close flow in _process_closed_candle() continues
-        to call sr_manager.update_levels() exactly as before.
-        """
-        for sym in self.symbols:
+        for idx, sym in enumerate(self.symbols, start=1):
             store = self.candle_store.get(sym)
             sr_manager = self.sr_managers.get(sym)
+
+            self._log("info", "S/R-INIT",
+                      f"Processing progress: symbol {idx}/{len(self.symbols)} -> {sym}")
 
             if not store:
                 self._log("info", "S/R-INIT", f"[{sym}] No historical candles stored - skipping initial S/R detection.")
@@ -4143,10 +4281,10 @@ class TradingBot:
 
             confirmed_closed = list(store)
             self._log("info", "S/R-INIT",
-                      f"[{sym}] Historical S/R detection started ({len(confirmed_closed)} confirmed closed candles)")
+                      f"[{sym}] Started | Candles={len(confirmed_closed)}")
 
             try:
-                sr_manager.update_levels(confirmed_closed)
+                sr_manager.update_levels(confirmed_closed, initializing=True)
             except Exception as e:
                 _log_exc("S/R-INIT", f"[{sym}] historical S/R detection failed: {e}")
 
@@ -4157,35 +4295,25 @@ class TradingBot:
             if support_snapshot:
                 support_str = ", ".join(
                     f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
-                    for l in support_snapshot
+                    for l in support_snapshot[:5]
                 )
-                self._log("info", "S/R-INIT", f"[{sym}] Detected SUPPORT levels: {support_str}")
-            else:
-                self._log("info", "S/R-INIT", f"[{sym}] No support levels detected from historical closed candles.")
+                if len(support_snapshot) > 5:
+                    support_str += f", ... and {len(support_snapshot) - 5} more"
+                self._log("debug", "S/R-INIT", f"[{sym}] SUPPORT levels: {support_str}")
 
             if resistance_snapshot:
                 resistance_str = ", ".join(
                     f"{smart_fmt(l['price'])} ({'*' * l['strength']}, touches={l['touches']})"
-                    for l in resistance_snapshot
+                    for l in resistance_snapshot[:5]
                 )
-                self._log("info", "S/R-INIT", f"[{sym}] Detected RESISTANCE levels: {resistance_str}")
-            else:
-                self._log("info", "S/R-INIT", f"[{sym}] No resistance levels detected from historical closed candles.")
+                if len(resistance_snapshot) > 5:
+                    resistance_str += f", ... and {len(resistance_snapshot) - 5} more"
+                self._log("debug", "S/R-INIT", f"[{sym}] RESISTANCE levels: {resistance_str}")
 
-            if not support_snapshot and not resistance_snapshot:
-                self._log("warning", "S/R-INIT", f"[{sym}] No valid S/R detected from historical closed candles.")
+        self._log("info", "S/R-INIT",
+                  f"Completed successfully - historical S/R detection finished for all {len(self.symbols)} symbol(s)")
 
     def _validate_indicator_readiness(self) -> None:
-        """
-        STEP 8: Initialize/validate all indicators and strategy-related
-        data. RSI and SuperTrend are computed on-the-fly from
-        self.candle_store (there is no separate persistent indicator
-        state to construct), so this step's job is to confirm - loudly,
-        per symbol - whether enough historical candles are already
-        available for each indicator to produce a value on the very
-        first live evaluation, rather than silently discovering this
-        later inside a signal check.
-        """
         min_rsi = RSI_MIN_CANDLES
         min_st = ST2_LENGTH + 2
         for sym in self.symbols:
@@ -4232,12 +4360,6 @@ class TradingBot:
                        f"Known symbols: {list(self.candle_store.keys())}")
             return
 
-        # STEP 12 readiness signal: track the first live message per
-        # symbol; once every monitored symbol has produced at least one
-        # message, live data is considered confirmed for the whole
-        # pipeline. This only ever transitions one way (empty -> full)
-        # and is purely a startup-gating signal - it does not affect
-        # ongoing processing once the pipeline is already marked ready.
         if resolved not in self._symbols_with_live_data:
             with self._readiness_lock:
                 self._symbols_with_live_data.add(resolved)
@@ -4269,27 +4391,6 @@ class TradingBot:
                 _log_exc("BACKFILL", f"[{sym}] backfill after reconnect failed, continuing with other symbols: {e}")
 
     def _backfill_symbol(self, symbol: str) -> None:
-        """
-        Fetch fresh REST candles and process any confirmed-closed candles
-        the bot missed while the WebSocket feed was down/reconnecting.
-
-        A candle only counts as "confirmed closed" here if ALL of the
-        following hold:
-          - it is strictly newer than the last successfully processed
-            closed candle for this symbol,
-          - it is strictly older than the symbol's currently-forming
-            candle (never re-process what the live feed already owns),
-          - and its own period has fully elapsed by wall-clock time
-            (start + timeframe duration <= now) - this guards the case
-            where the currently-forming candle isn't tracked yet (e.g.
-            right after a fresh reconnect) so we never mistake a candle
-            that is still in progress for a closed one.
-
-        Candles are de-duplicated by timestamp and processed strictly in
-        chronological order, one at a time, so the transition back to the
-        live WebSocket feed has no gaps, no duplicates, and never touches
-        an unfinished bar.
-        """
         store = self.candle_store.get(symbol)
         if store is None:
             return
@@ -4304,15 +4405,12 @@ class TradingBot:
             self._log("warning", "BACKFILL", f"[{symbol}] backfill fetch returned no candles")
             return
 
-        # Re-normalize/re-validate defensively - backfill sits at the
-        # REST/WebSocket boundary and must never misclassify a candle.
         normalized: List[dict] = []
         for row in fresh:
             nc = self._validate_and_normalize(row, symbol)
             if nc is not None:
                 normalized.append(nc)
 
-        # De-dup by timestamp, then sort strictly chronologically.
         dedup: Dict[int, dict] = {}
         for c in normalized:
             dedup[c["time"]] = c
@@ -4325,11 +4423,11 @@ class TradingBot:
         confirmed_closed: List[dict] = []
         for c in deduped:
             if c["time"] <= last_closed_time:
-                continue  # already processed
+                continue
             if forming_time is not None and c["time"] >= forming_time:
-                continue  # owned by the live forming candle, not a confirmed close
+                continue
             if (c["time"] + tf_secs) > now:
-                continue  # this candle's period hasn't fully elapsed yet - still forming
+                continue
             confirmed_closed.append(c)
 
         if not confirmed_closed:
@@ -4345,17 +4443,11 @@ class TradingBot:
             with lock:
                 current_last = self._last_closed_time.get(symbol, 0)
             if closed["time"] <= current_last:
-                # Already processed (e.g. a concurrent live tick got here first) -
-                # never process the same closed candle twice.
                 continue
 
             if i + 1 < len(confirmed_closed):
                 next_candle = confirmed_closed[i + 1]
             else:
-                # Last missed candle: hand off to the REAL currently-forming
-                # candle (re-read in case it changed during backfill) so
-                # strategy evaluation sees a genuinely-forming last bar
-                # instead of treating a closed candle as the forming one.
                 with lock:
                     latest_forming = self._forming_candle.get(symbol)
                 next_candle = latest_forming if latest_forming is not None else closed
@@ -4387,11 +4479,6 @@ class TradingBot:
         if normalized is None:
             return
 
-        # Any valid WS candle update - forming or closed - proves the live
-        # feed is alive. This is tracked separately from last_candle_time
-        # (closed candles only) and from last_eval_time (successful
-        # strategy evaluation only), so the watchdog can tell "feed is
-        # silent" apart from "feed is fine, the candle just hasn't closed".
         self.last_ws_update_time[symbol] = time.time()
 
         self._log("debug", "PIPELINE", f"[{symbol}] Live message received | t={normalized['time']} close={smart_fmt(normalized['close'])}")
@@ -4459,19 +4546,8 @@ class TradingBot:
                 self.last_candle_time[symbol] = time.time()
                 store_snapshot = list(store)
 
-            # A closed candle was just genuinely processed for this symbol -
-            # that is real, confirmed progress, so any recovery-issue
-            # baseline recorded for it (used purely to stop the watchdog
-            # from retriggering recovery for an unchanged overdue-candle
-            # condition) is now stale and must be dropped. Done outside the
-            # lock above since it only touches watchdog bookkeeping, not
-            # candle state.
             self._recovery_issue_baseline.pop(symbol, None)
 
-            # *** Required flow log: exactly one line per closed candle,
-            # with the complete OHLCV set, so "the candle closed and was
-            # processed" is always visible and never has to be inferred
-            # from surrounding log lines. ***
             self._log("info", "CANDLE-CLOSED",
                       f"[CANDLE CLOSED] {symbol} | source={source} | timeframe={self.timeframe} | "
                       f"time={closed_candle['time']} | "
@@ -4484,12 +4560,8 @@ class TradingBot:
                       f"[{symbol}] Closed candle t={closed_candle['time']} processed exactly once "
                       f"(store size={len(store_snapshot)})")
 
-            # Update S/R using the exact same logic as the initial startup
-            # detection - update_levels() is idempotent per index, so
-            # calling it again here on the growing live store is safe and
-            # is how S/R levels stay current after startup.
             if symbol in self.sr_managers:
-                self.sr_managers[symbol].update_levels(store_snapshot)
+                self.sr_managers[symbol].update_levels(store_snapshot, initializing=False)
 
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
@@ -4504,15 +4576,6 @@ class TradingBot:
 
             if symbol not in self.active_trades:
                 if not self._pipeline_ready.is_set():
-                    # STEP 14 gate: strategy evaluation must never run
-                    # before the startup sequence has explicitly marked
-                    # the pipeline ready (historical data + initial S/R +
-                    # a confirmed live feed). In normal operation this
-                    # branch is only reachable for the very brief window
-                    # before start() finishes step 14, since watchdog
-                    # (which is the only thing that can trigger recovery
-                    # -> backfill -> _process_closed_candle after startup)
-                    # is started strictly after _pipeline_ready is set.
                     self._log("info", "EVAL-SKIP",
                               f"[{symbol}] strategy evaluation skipped: startup pipeline not yet "
                               f"marked ready (waiting on historical data / initial S/R / live-feed "
@@ -4520,13 +4583,6 @@ class TradingBot:
                 elif self.daily_loss_tracker.is_limit_reached():
                     self._log("info", "EVAL-SKIP", f"[{symbol}] strategy evaluation skipped: daily loss limit reached ({self.daily_loss_tracker.status()})")
                 else:
-                    # NOTE: last_eval_time is intentionally NOT set here.
-                    # It is only set below, after every strategy check has
-                    # completed without raising, so the watchdog can tell a
-                    # genuinely-completed evaluation apart from one that
-                    # merely started and then blew up partway through. If
-                    # anything below raises, control goes straight to the
-                    # except clause and last_eval_time is left untouched.
                     candle_list = store_snapshot + [new_forming_candle]
                     self._log("info", "PIPELINE", f"[{symbol}] Strategy evaluation RUNNING on {len(candle_list)} candles (closed + forming)")
 
@@ -4574,9 +4630,6 @@ class TradingBot:
                               f"[{symbol}] Strategy evaluation COMPLETE - "
                               f"{'signal generated' if signal_found else 'no signal, all strategies rejected'}")
 
-                    # Evaluation genuinely completed (every strategy check
-                    # ran without raising) - only now record it, so the
-                    # watchdog's EVAL_BLOCKED check reflects reality.
                     self.last_eval_time[symbol] = time.time()
             else:
                 self._log("info", "EVAL-SKIP", f"[{symbol}] strategy evaluation skipped: an active trade is already open for this symbol")
@@ -4585,9 +4638,6 @@ class TradingBot:
                 self._symbol_error_counts[symbol] = 0
 
         except Exception as e:
-            # last_eval_time was never touched above if the exception came
-            # from inside strategy evaluation, so the watchdog will
-            # correctly see evaluation as not-completed for this candle.
             self._handle_symbol_processing_error(symbol, e)
 
     def _check_take_profit(self, symbol: str, candle: dict) -> None:
@@ -4933,53 +4983,6 @@ class TradingBot:
                 time.sleep(1)
 
     def _run_health_checks(self) -> None:
-        """
-        Timeframe-aware, state-based health check.
-
-        Two kinds of liveness are tracked completely separately, because
-        they fail independently and mean different things:
-
-          A) WEBSOCKET ACTIVITY - is the live feed itself alive right now?
-             A valid update to the currently-forming candle counts as much
-             as a closed candle does, so a 1h symbol that is ticking
-             normally every few seconds is never mistaken for a dead feed
-             just because its candle hasn't closed yet.
-
-          B) CANDLE CLOSING - has the candle that is CURRENTLY forming
-             actually closed by the time it was supposed to? The deadline
-             for this is computed from that specific candle's own start
-             time: forming_candle_timestamp + timeframe_seconds + grace.
-             This is the only correct way to know when a given candle
-             "should" have closed - it does not assume anything about how
-             long ago the *previous* candle closed, so a normal 1h candle
-             that is merely 10 minutes into its hour is never flagged.
-
-        Recovery (reconnect + resubscribe + backfill) is triggered only
-        for a REAL problem:
-          - the WebSocket connection itself is down/reconnecting (WS_DOWN),
-          - the live feed has gone silent past WS_UPDATE_STALE_SECONDS
-            (WS_STALE_<symbol>), or
-          - a candle's own close deadline (its timestamp + timeframe +
-            grace) has passed without that candle actually closing
-            (STALE_<symbol> / NO_CANDLES_<symbol>).
-
-        Loop prevention: for the closed-candle deadline case specifically,
-        the watchdog remembers the (last_closed_time, forming_candle_time)
-        pair that was in effect the last time it triggered a recovery for
-        a symbol. If the next check finds that pair completely unchanged -
-        meaning no new closed candle and no new forming candle arrived,
-        i.e. the earlier recovery attempt produced zero progress, whether
-        because REST backfill found nothing to backfill or otherwise - it
-        withholds the retrigger and keeps waiting instead of reconnecting
-        again every single check cycle. The moment a symbol's closed
-        candle is actually processed, its baseline is cleared, so a
-        genuinely new stall is free to trigger recovery again.
-
-        last_eval_time is read-only here - it is only ever written by
-        _process_closed_candle() after a fully successful strategy
-        evaluation, so EVAL_BLOCKED reflects a genuine evaluation stall,
-        not a forming-candle tick.
-        """
         now = time.time()
         current_issues: Dict[str, str] = {}
 
@@ -5007,7 +5010,6 @@ class TradingBot:
 
         expected_secs = self._tf.secs
 
-        # -- A) WebSocket liveness, independent of candle closes.
         ws_stale_symbols: List[str] = []
         for sym in self.symbols:
             last_update = self.last_ws_update_time.get(sym)
@@ -5031,7 +5033,6 @@ class TradingBot:
                     )
                 ws_stale_symbols.append(sym)
 
-        # -- B) Closed-candle monitoring, timeframe-aware AND state-based.
         closed_candle_stale_symbols: List[str] = []
         for sym in self.symbols:
             forming = self._forming_candle.get(sym)
@@ -5090,7 +5091,6 @@ class TradingBot:
                 f"rollover, that itself is worth investigating."
             )
 
-        # -- Signal 3: EVAL_BLOCKED.
         for sym in self.symbols:
             if sym in stale_trigger_symbols:
                 continue
@@ -5227,26 +5227,10 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.3 (SEQUENCED) |")
-        print("|   NEW: strict, event-gated startup sequence - config -> |")
-        print("|   logging -> REST client -> symbols/candle storage ->   |")
-        print("|   historical OHLCV -> initial S/R -> indicator check -> |")
-        print("|   WebSocket init -> connect -> subscribe+confirm ->     |")
-        print("|   live-data confirm -> strategy processing enabled ->   |")
-        print("|   watchdog started LAST. No step starts before its      |")
-        print("|   dependency is confirmed ready via real Events, not    |")
-        print("|   fixed sleeps.                                          |")
-        print("|   FIX: WebSocket + candle pipeline diagnostics -         |")
-        print("|   every stage (connect, subscribe, message, forming,    |")
-        print("|   close) is logged; unexpected message types are        |")
-        print("|   logged (throttled) instead of silently dropped        |")
-        print("|   FIX: forming-candle duplication bug eliminated         |")
-        print("|   FIX: REST + WebSocket timestamps normalized to the    |")
-        print("|   same unit (Unix seconds) everywhere                   |")
-        print("|   NEW: automatic stale-feed recovery (reconnect +       |")
-        print("|   resubscribe + backfill) with lock + cooldown          |")
-        print("|   FIX: timeframe-aware watchdog - WS liveness vs        |")
-        print("|   closed-candle timing tracked separately                |")
+        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
+        print("|   FIX: Clean concise S/R logs showing:                  |")
+        print("|   NEW → MERGED → RECLASSIFIED → FILTERED → FINAL       |")
+        print("|   All S/R levels clearly tracked through the pipeline.  |")
         print("+========================================================+")
         print()
 
@@ -5272,12 +5256,16 @@ class TradingBot:
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
-        print(f"  S/R Init          : Historical S/R detected as its own sequenced startup step")
+        print(f"  S/R Init          : Complete historical scan (all swing points) - once at startup")
+        print(f"  S/R Live          : Incremental updates per new candle - maintains processed-state")
+        print(f"  S/R Merging       : ENABLED (weighted avg by touches/strength, threshold={SR_MERGE_THRESHOLD*100:.2f}%)")
+        print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price)")
+        print(f"  S/R Min Distance  : ENABLED ({MIN_SR_DISTANCE_PERCENT}% minimum separation - runs ITERATIVELY)")
+        print(f"  S/R Logging       : NEW → MERGED → RECLASSIFIED → FILTERED → FINAL (clean concise)")
         print(f"  S/R Rejection Log : Detailed reasons + email alerts")
-        print(f"  S/R Merge         : DISABLED - every level separate")
-        print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
+        print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'} (sent asynchronously)")
         print(f"  Price Precision   : auto dp via smart_fmt() - supports micro-price alts")
-        print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'}")
+        print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'} (non-blocking async send)")
         print(f"  Health Watchdog   : ENABLED (checks every {WATCHDOG_CHECK_INTERVAL // 60} min, "
               f"timeframe-aware WS-liveness vs closed-candle checks, "
               f"emails on silent failure via GMAIL if enabled, started LAST)")
@@ -5492,7 +5480,7 @@ def test_gmail():
         recipient_emails=[sender],
         enabled=True,
     )
-    print("\n  Sending test signal notification...")
+    print("\n  Sending test signal notification (async, non-blocking)...")
     success = notifier.send_signal({
         "direction": "LONG",
         "symbol": "BTCUSD_PERP",
@@ -5509,9 +5497,10 @@ def test_gmail():
         "no_rsi": False,
     })
     if success:
-        print("  Test email sent successfully!")
+        print("  Test email dispatched in the background - check bot.log for SUCCESS/FAILURE.")
+        time.sleep(3)
     else:
-        print("  Failed to send email. Check your App Password and settings.")
+        print("  Failed to dispatch email (notifier disabled).")
 
 
 # ================================================================
@@ -5521,7 +5510,7 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +========================================================+")
-    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.3 SEQUENCED |")
+    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.9 (FIXED)   |")
     print("  +========================================================+")
 
     _divider("SETUP")
