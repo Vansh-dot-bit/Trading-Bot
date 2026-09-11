@@ -465,7 +465,9 @@ Action       : No new trades will be placed"""
         self._dispatch_async(subject, body)
         return True
 
-    def send_startup_report(self, config: dict, symbols: List[str], harami_tolerance: float) -> bool:
+    def send_startup_report(self, config: dict, symbols: List[str],
+                            harami_tolerance: float,
+                            sr_levels: Optional[Dict[str, Dict[str, List[dict]]]] = None) -> bool:
         if not self.enabled:
             return False
         mode = "LIVE TRADING" if not config.get("paper_mode") else "PAPER MODE"
@@ -492,6 +494,35 @@ LONG TRADES    : {'ENABLED' if config.get('enable_long', True) else 'DISABLED'}
 MONITORED SYMBOLS ({len(symbols)})
 -----------------------------
 {symbols_list}"""
+
+        if sr_levels:
+            body += "\n\nFINAL FILTERED SUPPORT/RESISTANCE LEVELS"
+            body += "\n============================="
+            for sym in symbols:
+                levels = sr_levels.get(sym)
+                if not levels:
+                    continue
+                supports = sorted(levels.get("supports", []), key=lambda x: x["price"])
+                resistances = sorted(levels.get("resistances", []), key=lambda x: x["price"])
+
+                body += f"\n\n[{sym}]"
+                body += "\n  Supports:"
+                if supports:
+                    for lv in supports:
+                        stars = "*" * lv.get("strength", 1)
+                        body += (f"\n    {smart_fmt(lv['price']):>18}  {stars:<5}  "
+                                 f"Touches: {lv.get('touches', 0):>3}  Age: {lv.get('age', 0):>3}")
+                else:
+                    body += "\n    (none)"
+
+                body += "\n  Resistances:"
+                if resistances:
+                    for lv in resistances:
+                        stars = "*" * lv.get("strength", 1)
+                        body += (f"\n    {smart_fmt(lv['price']):>18}  {stars:<5}  "
+                                 f"Touches: {lv.get('touches', 0):>3}  Age: {lv.get('age', 0):>3}")
+                else:
+                    body += "\n    (none)"
 
         self._dispatch_async(subject, body)
         return True
@@ -606,50 +637,9 @@ Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
     def send_sr_rejection(self, symbol: str, direction: str, level_price: float,
                            breakout_close: float, confirm_close: float,
                            rejection_reason: str, strategy: str = "S/R_BREAKOUT") -> bool:
-        if not self.enabled:
-            return False
-
-        event_key = f"{symbol}_{direction}_{level_price:.10f}_{strategy}"
-        if self._last_rejection_alert.get(event_key) == rejection_reason:
-            return False
-
-        self._last_rejection_alert[event_key] = rejection_reason
-
-        if len(self._last_rejection_alert) > 200:
-            keys = list(self._last_rejection_alert.keys())
-            for k in keys[:-200]:
-                del self._last_rejection_alert[k]
-
-        direction_emoji = "\U0001F534" if direction == "SHORT" else "\U0001F7E2"
-        direction_text = "SHORT" if direction == "SHORT" else "LONG"
-
-        subject = f"[S/R-REJECTED] {direction_emoji} {symbol} {direction_text} - {rejection_reason[:30]}..."
-
-        body = f"""S/R TRADE REJECTED
------------------------------
-Symbol      : {symbol}
-Direction   : {direction_text}
-Strategy    : {strategy}
-Time        : {datetime.now(timezone.utc).isoformat()}
-
-LEVEL DETAILS
------------------------------
-S/R Level   : {smart_fmt(level_price)}
-Breakout Candle Close: {smart_fmt(breakout_close)}
-Confirmation Candle Close: {smart_fmt(confirm_close)}
-
-REJECTION REASON
------------------------------
-{rejection_reason}
-
-NOTES
------------------------------
-- Trade was NOT executed
-- S/R level may be replaced if confirmation failed
-- Check logs for more details"""
-
-        self._dispatch_async(subject, body)
-        return True
+        # Rejected trade notifications are intentionally suppressed.
+        # All rejection details remain in the logs only.
+        return False
 
     def send_health_alert(self, issue_key: str, message: str, resolved: bool = False) -> bool:
         if not self.enabled:
@@ -1077,7 +1067,11 @@ RSI_MIN_CANDLES = RSI_PERIOD + 1
 FILL_POLL_INTERVAL = 0.5
 FILL_POLL_TIMEOUT = 15
 
-DOJI_BODY_RATIO_MAX = 0.30
+# Doji body threshold: a candle is a Doji when
+# (|Close - Open| / (High - Low)) * 100 <= DOJI_BODY_RATIO_MAX * 100
+# i.e. body/range <= 0.20 (20%). Exactly 20% is still counted as a Doji.
+DOJI_BODY_RATIO_MAX = 0.20
+
 TP_RR_RATIO = 2.0
 TP_MAX_PCT = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
@@ -1102,6 +1096,10 @@ ST1_LENGTH = 14
 ST1_FACTOR = 2.0
 ST2_LENGTH = 21
 ST2_FACTOR = 1.0
+
+# Post-exit cooldown: wait this many complete closed candles before resuming
+# strategy evaluation for a symbol that just exited a trade.
+POST_EXIT_COOLDOWN_CANDLES = 2
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m": {"resolution": "1m", "api_resolution": "1m", "ws_channel": "candlestick_1m", "secs": 60},
@@ -1518,6 +1516,7 @@ def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
     r = candle_range(c)
     if r <= 0:
         return False
+    # A candle is a Doji when body/range <= body_ratio_max (<=20% included).
     return (candle_body(c) / r) <= body_ratio_max
 
 
@@ -2189,43 +2188,16 @@ def check_short_signal_no_rsi(
                 if break_candle["close"] >= support:
                     rejection_reason = f"Break candle close {smart_fmt(break_candle['close'])} did not close below Support {smart_fmt(support)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=support,
-                            breakout_close=break_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_BREAKDOWN_SHORT"
-                        )
                     continue
 
                 if not is_bearish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bearish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=support,
-                            breakout_close=break_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_BREAKDOWN_SHORT"
-                        )
                     continue
 
                 if confirm_candle["close"] >= break_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below break close {smart_fmt(break_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=support,
-                            breakout_close=break_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_BREAKDOWN_SHORT"
-                        )
                     continue
 
                 triggered, signal_candle, strategy = check_short_signal_support_resistance_manager(candles, sr_manager)
@@ -2238,27 +2210,9 @@ def check_short_signal_no_rsi(
             if not support_found:
                 rejection_reason = "No matching Support level found (strength >= 1)"
                 _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
-                if notifier:
-                    notifier.send_sr_rejection(
-                        symbol=symbol, direction="SHORT",
-                        level_price=0,
-                        breakout_close=break_candle["close"],
-                        confirm_close=confirm_candle["close"],
-                        rejection_reason=rejection_reason,
-                        strategy="SUPPORT_BREAKDOWN_SHORT"
-                    )
         else:
             rejection_reason = "No valid Support levels available (strength >= 1 required)"
             _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
-            if notifier and len(candles) >= 4:
-                notifier.send_sr_rejection(
-                    symbol=symbol, direction="SHORT",
-                    level_price=0,
-                    breakout_close=candles[-3]["close"],
-                    confirm_close=candles[-2]["close"],
-                    rejection_reason=rejection_reason,
-                    strategy="SUPPORT_BREAKDOWN_SHORT"
-                )
 
     if len(candles) >= 4:
         false_breakout_candle = candles[-3]
@@ -2275,57 +2229,21 @@ def check_short_signal_no_rsi(
                 if false_breakout_candle["high"] <= resistance:
                     rejection_reason = f"False breakout high {smart_fmt(false_breakout_candle['high'])} not above Resistance {smart_fmt(resistance)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=resistance,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-                        )
                     continue
 
                 if false_breakout_candle["close"] >= resistance:
                     rejection_reason = f"False breakout close {smart_fmt(false_breakout_candle['close'])} not below Resistance {smart_fmt(resistance)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=resistance,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-                        )
                     continue
 
                 if not is_bearish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bearish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=resistance,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-                        )
                     continue
 
                 if confirm_candle["close"] >= false_breakout_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout close {smart_fmt(false_breakout_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="SHORT",
-                            level_price=resistance,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-                        )
                     continue
 
                 triggered, signal_candle, strategy = check_short_signal_resistance_false_breakout(candles, sr_manager)
@@ -2338,27 +2256,9 @@ def check_short_signal_no_rsi(
             if not resistance_found:
                 rejection_reason = "No matching Resistance level found near false breakout high"
                 _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                if notifier:
-                    notifier.send_sr_rejection(
-                        symbol=symbol, direction="SHORT",
-                        level_price=0,
-                        breakout_close=false_breakout_candle["close"],
-                        confirm_close=confirm_candle["close"],
-                        rejection_reason=rejection_reason,
-                        strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-                    )
         else:
             rejection_reason = "No Resistance levels found near false breakout high (tolerance 2%)"
             _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-            if notifier:
-                notifier.send_sr_rejection(
-                    symbol=symbol, direction="SHORT",
-                    level_price=0,
-                    breakout_close=false_breakout_candle["close"],
-                    confirm_close=confirm_candle["close"],
-                    rejection_reason=rejection_reason,
-                    strategy="RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
-                )
 
     return False, None, "", None
 
@@ -2437,43 +2337,16 @@ def check_long_signal_no_rsi(
                 if break_candle["close"] <= resistance:
                     rejection_reason = f"Break candle close {smart_fmt(break_candle['close'])} did not close above Resistance {smart_fmt(resistance)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=resistance,
-                            breakout_close=break_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_BREAKOUT_LONG"
-                        )
                     continue
 
                 if not is_bullish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bullish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=resistance,
-                            breakout_close=break_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_BREAKOUT_LONG"
-                        )
                     continue
 
                 if confirm_candle["close"] <= break_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above break close {smart_fmt(break_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=resistance,
-                            breakout_close=break_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="RESISTANCE_BREAKOUT_LONG"
-                        )
                     continue
 
                 triggered, signal_candle, strategy = check_long_signal_support_resistance_manager(candles, sr_manager)
@@ -2486,27 +2359,9 @@ def check_long_signal_no_rsi(
             if not resistance_found:
                 rejection_reason = "No matching Resistance level found (strength >= 1)"
                 _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
-                if notifier:
-                    notifier.send_sr_rejection(
-                        symbol=symbol, direction="LONG",
-                        level_price=0,
-                        breakout_close=break_candle["close"],
-                        confirm_close=confirm_candle["close"],
-                        rejection_reason=rejection_reason,
-                        strategy="RESISTANCE_BREAKOUT_LONG"
-                    )
         else:
             rejection_reason = "No valid Resistance levels available (strength >= 1 required)"
             _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
-            if notifier and len(candles) >= 4:
-                notifier.send_sr_rejection(
-                    symbol=symbol, direction="LONG",
-                    level_price=0,
-                    breakout_close=candles[-3]["close"],
-                    confirm_close=candles[-2]["close"],
-                    rejection_reason=rejection_reason,
-                    strategy="RESISTANCE_BREAKOUT_LONG"
-                )
 
     if len(candles) >= 4:
         false_breakout_candle = candles[-3]
@@ -2523,57 +2378,21 @@ def check_long_signal_no_rsi(
                 if false_breakout_candle["low"] >= support:
                     rejection_reason = f"False breakout low {smart_fmt(false_breakout_candle['low'])} not below Support {smart_fmt(support)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=support,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-                        )
                     continue
 
                 if false_breakout_candle["close"] <= support:
                     rejection_reason = f"False breakout close {smart_fmt(false_breakout_candle['close'])} not above Support {smart_fmt(support)}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=support,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-                        )
                     continue
 
                 if not is_bullish(confirm_candle):
                     rejection_reason = f"Confirmation candle is not Bullish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=support,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-                        )
                     continue
 
                 if confirm_candle["close"] <= false_breakout_candle["close"]:
                     rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout close {smart_fmt(false_breakout_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    if notifier:
-                        notifier.send_sr_rejection(
-                            symbol=symbol, direction="LONG",
-                            level_price=support,
-                            breakout_close=false_breakout_candle["close"],
-                            confirm_close=confirm_candle["close"],
-                            rejection_reason=rejection_reason,
-                            strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-                        )
                     continue
 
                 triggered, signal_candle, strategy = check_long_signal_support_false_breakout(candles, sr_manager)
@@ -2586,33 +2405,15 @@ def check_long_signal_no_rsi(
             if not support_found:
                 rejection_reason = "No matching Support level found near false breakout low"
                 _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                if notifier:
-                    notifier.send_sr_rejection(
-                        symbol=symbol, direction="LONG",
-                        level_price=0,
-                        breakout_close=false_breakout_candle["close"],
-                        confirm_close=confirm_candle["close"],
-                        rejection_reason=rejection_reason,
-                        strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-                    )
         else:
             rejection_reason = "No Support levels found near false breakout low (tolerance 2%)"
             _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-            if notifier:
-                notifier.send_sr_rejection(
-                    symbol=symbol, direction="LONG",
-                    level_price=0,
-                    breakout_close=false_breakout_candle["close"],
-                    confirm_close=confirm_candle["close"],
-                    rejection_reason=rejection_reason,
-                    strategy="SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
-                )
 
     return False, None, "", None
 
 
 # ================================================================
-#  14. SUPPORT/RESISTANCE LEVEL MANAGER (FIXED - WITH RECLASSIFICATION)
+#  14. SUPPORT/RESISTANCE LEVEL MANAGER
 # ================================================================
 
 class SRLevelManager:
@@ -3664,36 +3465,6 @@ class DeltaREST:
             product_id=product_id, side=side, size=size, order_type="market_order"
         )
 
-    def get_position_realized_pnl(self, product_id: int) -> float:
-        try:
-            result = self.request_handler.request(
-                "GET", "/v2/positions", endpoint_type="private"
-            )
-            if result and "result" in result:
-                for pos in result["result"]:
-                    if pos.get("product_id") == product_id:
-                        realized_pnl = float(pos.get("realized_pnl", 0))
-                        _log("info", "PNL", f"Fetched realized PnL for product_id={product_id}: ${realized_pnl:.2f}")
-                        return realized_pnl
-                _log("warning", "PNL", f"No position found for product_id={product_id}")
-        except Exception as e:
-            _log_exc("PNL", f"Error fetching realized PnL: {e}")
-        return 0.0
-
-    def get_order_realized_pnl(self, order_id: int) -> float:
-        try:
-            result = self.request_handler.request(
-                "GET", f"/v2/orders/{order_id}", endpoint_type="private"
-            )
-            if result and "result" in result:
-                order = result["result"]
-                realized_pnl = float(order.get("realized_pnl", 0))
-                _log("info", "PNL", f"Fetched realized PnL for order_id={order_id}: ${realized_pnl:.2f}")
-                return realized_pnl
-        except Exception as e:
-            _log_exc("PNL", f"Error fetching order realized PnL: {e}")
-        return 0.0
-
 
 # ================================================================
 #  20. POSITION SIZER
@@ -3842,6 +3613,10 @@ class TradingBot:
         self._last_closed_time: Dict[str, int] = {}
         self._candle_locks: Dict[str, threading.Lock] = {}
 
+        # Post-exit cooldown tracking (per symbol)
+        # Maps symbol -> number of closed candles still to wait
+        self._post_exit_cooldown: Dict[str, int] = {}
+
         self._trade_lock = threading.Lock()
         self.active_trades: Dict[str, dict] = {}
 
@@ -3893,69 +3668,79 @@ class TradingBot:
             except Exception as e:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
 
-    def _get_realized_pnl_for_trade(self, trade: dict,
-                                     max_retries: int = 5,
-                                     retry_delay: float = 1.0) -> float:
-        if self.paper:
-            exit_price = trade.get("exit_price")
-            entry = trade.get("entry")
-            size = trade.get("size", 0)
+    def _compute_local_pnl(self, trade: dict, exit_price: float) -> float:
+        """
+        Compute PnL locally from entry price, exit price, and size.
+        LONG:  (exit_price - entry_price) * quantity
+        SHORT: (entry_price - exit_price) * quantity
+        Returns a signed float. Positive = profit, negative = loss, zero = break-even.
+        """
+        try:
+            entry = float(trade.get("entry", 0) or 0)
+            qty = float(trade.get("size", 0) or 0)
             direction = trade.get("direction", "SHORT")
-            if exit_price and entry and size > 0:
-                return (entry - exit_price) * size if direction == "SHORT" \
-                    else (exit_price - entry) * size
+            exit_p = float(exit_price or 0)
+        except (TypeError, ValueError):
             return 0.0
-
-        order_id = trade.get("order_id")
-        product_id = trade.get("product_id")
-
-        if order_id:
-            for attempt in range(1, max_retries + 1):
-                pnl = self.rest.get_order_realized_pnl(order_id)
-                if pnl != 0:
-                    _log("info", "PNL", f"Retrieved realized PnL from order_id {order_id} (attempt {attempt}): ${pnl:.2f}")
-                    return pnl
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-            _log("warning", "PNL", f"Could not fetch realized PnL from order_id {order_id} after {max_retries} attempts")
-
-        if product_id:
-            for attempt in range(1, max_retries + 1):
-                pnl = self.rest.get_position_realized_pnl(product_id)
-                if pnl != 0:
-                    _log("info", "PNL", f"Retrieved realized PnL from product_id {product_id} (attempt {attempt}): ${pnl:.2f}")
-                    return pnl
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-            _log("warning", "PNL", f"Could not fetch realized PnL from product_id {product_id} after {max_retries} attempts")
-
-        return 0.0
+        if qty <= 0 or entry <= 0 or exit_p <= 0:
+            return 0.0
+        if direction == "LONG":
+            return (exit_p - entry) * qty
+        else:
+            return (entry - exit_p) * qty
 
     def _close_trade(self, symbol: str, trade: dict, reason: str,
                       exit_price: Optional[float] = None) -> None:
         try:
             entry = trade["entry"]
             direction = trade.get("direction", "SHORT")
+            size = trade.get("size", 0)
 
             _log("info", "TRADE-CLOSE", f"Closing trade: {symbol} {direction} | Reason: {reason}")
 
+            # Determine the exit price to use for local PnL calculation.
+            # Priority:
+            #  1. Explicit exit_price argument (e.g. TP hit, ST exit with price)
+            #  2. TP level for TAKE_PROFIT
+            #  3. SL level for STOP_LOSS
+            #  4. Last known closed candle close for this symbol (fallback)
+            local_exit_price: Optional[float] = None
+            if exit_price is not None and exit_price > 0:
+                local_exit_price = float(exit_price)
+            elif reason == "TAKE_PROFIT" and trade.get("take_profit"):
+                local_exit_price = float(trade["take_profit"])
+            elif reason == "STOP_LOSS" and trade.get("stop_loss"):
+                local_exit_price = float(trade["stop_loss"])
+            else:
+                # Fall back to the most recent closed candle for this symbol.
+                store = self.candle_store.get(symbol)
+                if store:
+                    local_exit_price = float(list(store)[-1]["close"])
+
+            # Compute local PnL BEFORE closing the exchange position (so we
+            # still have the correct exit reference even if the close order
+            # or network call has issues).
+            if local_exit_price is not None and local_exit_price > 0:
+                realized_pnl = self._compute_local_pnl(trade, local_exit_price)
+            else:
+                realized_pnl = 0.0
+
             if not self.paper:
                 pid = trade.get("product_id")
-                size = trade.get("size", 1)
                 if pid and size > 0:
                     close_side = "buy" if direction == "SHORT" else "sell"
                     self.rest.close_position(pid, size, side=close_side)
                     _log("info", "TRADE-CLOSE", f"Closed position on Delta: product_id={pid}, size={size}, side={close_side}")
                     time.sleep(1)
 
-            realized_pnl = self._get_realized_pnl_for_trade(trade)
-
             trade["close_reason"] = reason
             trade["close_time"] = datetime.now(timezone.utc).isoformat()
             trade["realized_pnl"] = realized_pnl
+            if local_exit_price is not None:
+                trade["exit_price"] = local_exit_price
 
             if reason in ("TAKE_PROFIT", "ST_EXIT"):
-                tp = exit_price or trade.get("take_profit")
+                tp = local_exit_price or trade.get("take_profit")
                 trade["exit_price"] = tp
                 self.tp_events.append({
                     "time": datetime.now(timezone.utc).isoformat(),
@@ -3964,7 +3749,7 @@ class TradingBot:
                     "realized_pnl": realized_pnl, "reason": reason,
                 })
             else:
-                sl = trade["stop_loss"]
+                sl = local_exit_price or trade["stop_loss"]
                 trade["exit_price"] = sl
                 self.sl_events.append({
                     "time": datetime.now(timezone.utc).isoformat(),
@@ -3978,7 +3763,9 @@ class TradingBot:
             limit = self.trading_capital * self.daily_loss_limit_pct
             _log("info", "TRADE-CLOSE",
                  f"Trade Closed: {symbol} {direction} | Reason: {reason} | "
-                 f"Realized PnL: ${realized_pnl:.2f} | "
+                 f"Exit Price: {smart_fmt(local_exit_price) if local_exit_price else 'N/A'} | "
+                 f"Size: {size} | "
+                 f"Local Realized PnL: ${realized_pnl:.2f} | "
                  f"Daily Loss Total: ${self.daily_loss_tracker.daily_loss_usd:.2f} | "
                  f"Daily Loss Limit: ${limit:.2f}")
 
@@ -4003,11 +3790,43 @@ class TradingBot:
             _log_exc("TRADE-CLOSE", f"Unexpected error while closing {symbol} - attempting cleanup anyway: {e}")
         finally:
             self._cleanup_trade(symbol)
+            # Start post-exit cooldown for this symbol (2 complete candles).
+            self._start_post_exit_cooldown(symbol)
 
     def _cleanup_trade(self, symbol: str) -> None:
         with self._trade_lock:
             self.active_trades.pop(symbol, None)
         self._log("info", "CLEANUP", f"Trade record removed for {symbol}")
+
+    def _start_post_exit_cooldown(self, symbol: str) -> None:
+        """Begin a 2-closed-candle cooldown for the given symbol."""
+        self._post_exit_cooldown[symbol] = POST_EXIT_COOLDOWN_CANDLES
+        self._log(
+            "info", "COOLDOWN",
+            f"[{symbol}] Post-exit cooldown STARTED - will skip strategy evaluation "
+            f"for the next {POST_EXIT_COOLDOWN_CANDLES} complete closed candle(s)."
+        )
+
+    def _tick_post_exit_cooldown(self, symbol: str) -> None:
+        """Called for each new closed candle to advance the cooldown counter."""
+        remaining = self._post_exit_cooldown.get(symbol)
+        if remaining is None:
+            return
+        remaining -= 1
+        if remaining > 0:
+            self._post_exit_cooldown[symbol] = remaining
+            self._log(
+                "info", "COOLDOWN",
+                f"[{symbol}] Post-exit cooldown WAITING - {remaining} more closed "
+                f"candle(s) required before strategy evaluation resumes."
+            )
+        else:
+            self._post_exit_cooldown.pop(symbol, None)
+            self._log(
+                "info", "COOLDOWN",
+                f"[{symbol}] Post-exit cooldown COMPLETE - strategy evaluation will "
+                f"resume on the next closed candle."
+            )
 
     def _check_supertrend_conditions(self, symbol: str, closed_candles: List[dict]) -> None:
         trade = self.active_trades.get(symbol)
@@ -4065,12 +3884,15 @@ class TradingBot:
             )
             if reversed_trend:
                 _log("info", "ST-EXIT", f"[{symbol}] {direction} - Both SuperTrends REVERSED.")
+                # Use the last closed candle's close as the ST exit reference price.
+                st_exit_price = closed_candles[-1]["close"] if closed_candles else None
                 print()
                 print(f"  [ST REVERSAL EXIT] {symbol} {direction}")
                 flip_label = "both GREEN" if direction == "SHORT" else "both RED"
                 print(f"    SuperTrends flipped {flip_label} - closing position")
+                print(f"    Exit reference close: {smart_fmt(st_exit_price) if st_exit_price else 'N/A'}")
                 print()
-                self._close_trade(symbol, trade, "ST_EXIT")
+                self._close_trade(symbol, trade, "ST_EXIT", exit_price=st_exit_price)
 
     # ================================================================
     #  STARTUP SEQUENCE
@@ -4125,6 +3947,7 @@ class TradingBot:
             self._forming_candle[sym] = None
             self._last_closed_time[sym] = 0
             self._candle_locks[sym] = threading.Lock()
+            self._post_exit_cooldown[sym] = 0
 
         if not self.paper:
             for sym in self.symbols:
@@ -4134,15 +3957,28 @@ class TradingBot:
 
         self._print_startup_summary()
 
-        if self.notifier:
-            self.notifier.send_startup_report(self.config, self.symbols, self.harami_tolerance)
-
         self._log("info", "STARTUP", "STEP  5/15: Fetching historical OHLCV data for all symbols...")
         self._log("info", "STARTUP", "STEP  6/15: Storing historical closed candles...")
         self._fetch_historical_candles()
 
         self._log("info", "STARTUP", "STEP  7/15: Running initial Support/Resistance detection on historical data...")
         self._run_initial_sr_detection()
+
+        # Collect final filtered S/R levels for the startup email
+        sr_levels_for_email: Dict[str, Dict[str, List[dict]]] = {}
+        for sym in self.symbols:
+            sr_manager = self.sr_managers.get(sym)
+            if sr_manager:
+                with sr_manager._lock:
+                    sr_levels_for_email[sym] = {
+                        "supports": [dict(l) for l in sr_manager.support_levels],
+                        "resistances": [dict(l) for l in sr_manager.resistance_levels],
+                    }
+
+        if self.notifier:
+            self.notifier.send_startup_report(
+                self.config, self.symbols, self.harami_tolerance, sr_levels_for_email
+            )
 
         self._log("info", "STARTUP", "STEP  8/15: Validating indicator/strategy data readiness...")
         self._validate_indicator_readiness()
@@ -4575,7 +4411,20 @@ class TradingBot:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
             if symbol not in self.active_trades:
-                if not self._pipeline_ready.is_set():
+                # Advance post-exit cooldown for this symbol (if any) since a
+                # new closed candle has arrived. This happens even if we
+                # subsequently skip evaluation.
+                if self._post_exit_cooldown.get(symbol, 0) > 0:
+                    self._tick_post_exit_cooldown(symbol)
+
+                if self._post_exit_cooldown.get(symbol, 0) > 0:
+                    self._log(
+                        "info", "EVAL-SKIP",
+                        f"[{symbol}] strategy evaluation skipped: post-exit cooldown "
+                        f"still active ({self._post_exit_cooldown[symbol]} closed "
+                        f"candle(s) remaining)."
+                    )
+                elif not self._pipeline_ready.is_set():
                     self._log("info", "EVAL-SKIP",
                               f"[{symbol}] strategy evaluation skipped: startup pipeline not yet "
                               f"marked ready (waiting on historical data / initial S/R / live-feed "
@@ -4678,11 +4527,11 @@ class TradingBot:
 
             if direction == "SHORT" and close_price >= sl:
                 _log("info", "SL-CLOSE", f"STOP LOSS HIT (candle close) | {symbol} SHORT | close={smart_fmt(close_price)} >= sl={smart_fmt(sl)}")
-                self._close_trade(symbol, trade, "STOP_LOSS")
+                self._close_trade(symbol, trade, "STOP_LOSS", exit_price=close_price)
 
             elif direction == "LONG" and close_price <= sl:
                 _log("info", "SL-CLOSE", f"STOP LOSS HIT (candle close) | {symbol} LONG | close={smart_fmt(close_price)} <= sl={smart_fmt(sl)}")
-                self._close_trade(symbol, trade, "STOP_LOSS")
+                self._close_trade(symbol, trade, "STOP_LOSS", exit_price=close_price)
         except Exception as e:
             _log_exc("SL-CHECK", f"[{symbol}] stop-loss check failed (position left open, will retry next candle): {e}")
 
@@ -5096,6 +4945,8 @@ class TradingBot:
                 continue
             if sym in self.active_trades:
                 continue
+            if self._post_exit_cooldown.get(sym, 0) > 0:
+                continue
             if daily_limit_active:
                 continue
             last_candle = self.last_candle_time.get(sym)
@@ -5108,12 +4959,12 @@ class TradingBot:
                         current_issues[f"EVAL_BLOCKED_{sym}"] = (
                             f"[{sym}] closed candles are being processed but strategy "
                             f"evaluation has not run for {mins} min, with no valid skip "
-                            f"reason (no stale feed, no open trade, no daily-loss gate). "
-                            f"Something in the evaluation path may be silently failing. "
-                            f"The bot auto-resets this symbol's S/R state after "
-                            f"{SYMBOL_ERROR_RESET_THRESHOLD} consecutive processing errors - "
-                            f"check bot.log for '[PROCESS-CANDLE]' / '[EVAL-SKIP]' entries "
-                            f"for {sym}."
+                            f"reason (no stale feed, no open trade, no post-exit cooldown, "
+                            f"no daily-loss gate). Something in the evaluation path may "
+                            f"be silently failing. The bot auto-resets this symbol's S/R "
+                            f"state after {SYMBOL_ERROR_RESET_THRESHOLD} consecutive "
+                            f"processing errors - check bot.log for '[PROCESS-CANDLE]' / "
+                            f"'[EVAL-SKIP]' entries for {sym}."
                         )
 
         self._reconcile_watchdog_issues(current_issues)
@@ -5262,8 +5113,8 @@ class TradingBot:
         print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price)")
         print(f"  S/R Min Distance  : ENABLED ({MIN_SR_DISTANCE_PERCENT}% minimum separation - runs ITERATIVELY)")
         print(f"  S/R Logging       : NEW → MERGED → RECLASSIFIED → FILTERED → FINAL (clean concise)")
-        print(f"  S/R Rejection Log : Detailed reasons + email alerts")
-        print(f"  S/R Email Alerts  : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'} (sent asynchronously)")
+        print(f"  S/R Rejection Log : Detailed reasons (logs only - no email)")
+        print(f"  S/R Email Alerts  : REJECTION EMAILS DISABLED - all rejection details in logs only")
         print(f"  Price Precision   : auto dp via smart_fmt() - supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'} (non-blocking async send)")
         print(f"  Health Watchdog   : ENABLED (checks every {WATCHDOG_CHECK_INTERVAL // 60} min, "
@@ -5278,6 +5129,10 @@ class TradingBot:
               f"unhandled message types logged, throttled every {UNHANDLED_WS_MSG_LOG_INTERVAL}s per type)")
         print(f"  Startup Gating    : ENABLED (event-based readiness for WS connect / "
               f"subscribe-confirm / first-live-data, bounded timeouts as a safety net only)")
+        print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} complete closed candle(s) "
+              f"per symbol after any trade exit before strategy evaluation resumes")
+        print(f"  PnL Calculation   : LOCAL (entry/exit/quantity) - Delta realized PnL API NOT used")
+        print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -5570,6 +5425,9 @@ def main() -> None:
     print(f"  Daily loss cap    : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f}")
     print(f"  Max open trades   : {max_trades}")
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
+    print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} closed candles per symbol")
+    print(f"  PnL Calculation   : LOCAL (entry/exit/qty)")
+    print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
     if trading_capital <= 0:
@@ -5619,6 +5477,10 @@ def main() -> None:
                 for sym, t in bot.active_trades.items():
                     if isinstance(t, dict) and t.get("st_mode"):
                         st_info += f"[{sym}:ST-MODE] "
+                cooldown_info = ""
+                for sym, remaining in bot._post_exit_cooldown.items():
+                    if remaining and remaining > 0:
+                        cooldown_info += f"[{sym}:COOLDOWN {remaining}] "
                 print(
                     f"  [STATUS] Open={open_n}/{max_trades}  "
                     f"Signals={len(bot.signals)}  "
@@ -5626,6 +5488,7 @@ def main() -> None:
                     f"WS={ws_state}  {bot.daily_loss_tracker.status()}  "
                     + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
                     + (f"  {st_info}" if st_info else "")
+                    + (f"  {cooldown_info}" if cooldown_info else "")
                 )
             except Exception as e:
                 _log_exc("STATUS", f"Status print failed (bot itself keeps running): {e}")
