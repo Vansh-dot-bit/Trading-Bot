@@ -1080,6 +1080,7 @@ MIN_ENGULF_BODY_PCT = 0.30
 HARAMI_BODY_TOLERANCE = 0.001
 RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
+VOL_EXP_TOLERANCE = 0.003
 
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
@@ -1607,13 +1608,22 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     if confirm_candle["close"] >= break_candle["close"]:
         return False, None, ""
 
+    # Body-size condition: average body of 7 range candles <= 50% of breakout candle's body
+    range_bodies = [candle_body(c) for c in range_candles]
+    avg_range_body = sum(range_bodies) / len(range_bodies)
+    breakout_body = candle_body(break_candle)
+
+    if breakout_body <= 0 or avg_range_body > 0.5 * breakout_body:
+        return False, None, ""
+
     confirm_candle_copy = confirm_candle.copy()
     confirm_candle_copy["pattern_high"] = break_candle["high"]
 
     _log("info", "RANGE_BREAK_SHORT",
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {smart_fmt(break_candle['close'])} < range low | "
-         f"Confirm close {confirm_candle['close']} < break close")
+         f"Confirm close {confirm_candle['close']} < break close | "
+         f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
     return True, confirm_candle_copy, "RANGE_BREAK_SHORT"
 
 
@@ -1622,25 +1632,41 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     if len(candles) < lookback + 2:
         return False, None, ""
 
-    current = candles[-2]
+    breakout_candle = candles[-2]
     prev_candles = candles[-(lookback + 2):-2]
     if len(prev_candles) < lookback:
         return False, None, ""
 
-    lowest_low = min(c["low"] for c in prev_candles)
-
-    if current["close"] >= lowest_low:
-        return False, None, ""
-    if not is_bearish(current):
+    if not is_bearish(breakout_candle):
         return False, None, ""
 
-    current_copy = current.copy()
-    current_copy["pattern_high"] = current["high"]
-    current_copy["breakout_level"] = lowest_low
+    # Find repeated lows (at least 2 touches within VOL_EXP_TOLERANCE)
+    lows = [c["low"] for c in prev_candles]
+    repeated_low = None
+    for low in lows:
+        count = sum(1 for other in lows if abs(other - low) / max(low, 1) <= VOL_EXP_TOLERANCE)
+        if count >= 2:
+            if repeated_low is None or low < repeated_low:
+                repeated_low = low
+
+    if repeated_low is None:
+        return False, None, ""
+
+    if breakout_candle["close"] >= repeated_low:
+        return False, None, ""
+
+    max_vol_prev = max(c["volume"] for c in prev_candles)
+    if breakout_candle["volume"] <= max_vol_prev:
+        return False, None, ""
+
+    current_copy = breakout_candle.copy()
+    current_copy["pattern_high"] = breakout_candle["high"]
+    current_copy["breakout_level"] = repeated_low
 
     _log("info", "VOL_EXPANSION_SHORT",
-         f"Break below 21-candle low {smart_fmt(lowest_low)} | "
-         f"Close {smart_fmt(current['close'])} < low | NO WICK CONDITION")
+         f"Repeated low level at {smart_fmt(repeated_low)} (within {VOL_EXP_TOLERANCE*100:.2f}% tolerance) | "
+         f"Break close {smart_fmt(breakout_candle['close'])} < repeated low | "
+         f"Volume: {breakout_candle['volume']:.2f} > max prev vol {max_vol_prev:.2f}")
     return True, current_copy, "VOL_EXPANSION_SHORT"
 
 
@@ -1836,13 +1862,22 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     if confirm_candle["close"] <= break_candle["close"]:
         return False, None, ""
 
+    # Body-size condition: average body of 7 range candles <= 50% of breakout candle's body
+    range_bodies = [candle_body(c) for c in range_candles]
+    avg_range_body = sum(range_bodies) / len(range_bodies)
+    breakout_body = candle_body(break_candle)
+
+    if breakout_body <= 0 or avg_range_body > 0.5 * breakout_body:
+        return False, None, ""
+
     confirm_candle_copy = confirm_candle.copy()
     confirm_candle_copy["pattern_low"] = break_candle["low"]
 
     _log("info", "RANGE_BREAK_LONG",
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {break_candle['close']} > range high | "
-         f"Confirm close {confirm_candle['close']} > break close")
+         f"Confirm close {confirm_candle['close']} > break close | "
+         f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
     return True, confirm_candle_copy, "RANGE_BREAK_LONG"
 
 
@@ -1851,25 +1886,41 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
     if len(candles) < lookback + 2:
         return False, None, ""
 
-    current = candles[-2]
+    breakout_candle = candles[-2]
     prev_candles = candles[-(lookback + 2):-2]
     if len(prev_candles) < lookback:
         return False, None, ""
 
-    highest_high = max(c["high"] for c in prev_candles)
-
-    if current["close"] <= highest_high:
-        return False, None, ""
-    if not is_bullish(current):
+    if not is_bullish(breakout_candle):
         return False, None, ""
 
-    current_copy = current.copy()
-    current_copy["pattern_low"] = current["low"]
-    current_copy["breakout_level"] = highest_high
+    # Find repeated highs (at least 2 touches within VOL_EXP_TOLERANCE)
+    highs = [c["high"] for c in prev_candles]
+    repeated_high = None
+    for high in highs:
+        count = sum(1 for other in highs if abs(other - high) / max(high, 1) <= VOL_EXP_TOLERANCE)
+        if count >= 2:
+            if repeated_high is None or high > repeated_high:
+                repeated_high = high
+
+    if repeated_high is None:
+        return False, None, ""
+
+    if breakout_candle["close"] <= repeated_high:
+        return False, None, ""
+
+    max_vol_prev = max(c["volume"] for c in prev_candles)
+    if breakout_candle["volume"] <= max_vol_prev:
+        return False, None, ""
+
+    current_copy = breakout_candle.copy()
+    current_copy["pattern_low"] = breakout_candle["low"]
+    current_copy["breakout_level"] = repeated_high
 
     _log("info", "VOL_EXPANSION_LONG",
-         f"Break above 21-candle high {smart_fmt(highest_high)} | "
-         f"Close {smart_fmt(current['close'])} > high | NO WICK CONDITION")
+         f"Repeated high level at {smart_fmt(repeated_high)} (within {VOL_EXP_TOLERANCE*100:.2f}% tolerance) | "
+         f"Break close {smart_fmt(breakout_candle['close'])} > repeated high | "
+         f"Volume: {breakout_candle['volume']:.2f} > max prev vol {max_vol_prev:.2f}")
     return True, current_copy, "VOL_EXPANSION_LONG"
 
 
