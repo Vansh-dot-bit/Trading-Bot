@@ -272,8 +272,6 @@ SuperTrend : Monitored post-entry"""
 
         if no_rsi:
             body += "\nRSI Filter : DISABLED"
-        if strategy in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
-            body += f"\nHarami Tol : {signal.get('harami_tolerance', 0.001) * 100:.2f}%"
         if "breakout_level" in signal:
             body += f"\nBreakout Lvl: {smart_fmt(signal['breakout_level'])}"
         if "level_strength" in signal:
@@ -466,7 +464,6 @@ Action       : No new trades will be placed"""
         return True
 
     def send_startup_report(self, config: dict, symbols: List[str],
-                            harami_tolerance: float,
                             sr_levels: Optional[Dict[str, Dict[str, List[dict]]]] = None) -> bool:
         if not self.enabled:
             return False
@@ -669,6 +666,50 @@ as soon as possible.
 You will get a RESOLVED email automatically once this condition clears.
 This alert will not repeat for the same ongoing issue for at least
 {HEALTH_ALERT_COOLDOWN // 60} minutes."""
+
+        self._dispatch_async(subject, body)
+        return True
+
+    def send_capital_update(self, old_balance: float, new_balance: float,
+                             reason: str = "TRADE_EXECUTED") -> bool:
+        """Send an email showing the old balance, new balance, and the difference."""
+        if not self.enabled:
+            return False
+
+        difference = new_balance - old_balance
+        if difference > 0:
+            direction_text = "INCREASED"
+            direction_emoji = "\U0001F4C8"
+            diff_str = f"+${difference:,.2f}"
+        elif difference < 0:
+            direction_text = "DECREASED"
+            direction_emoji = "\U0001F4C9"
+            diff_str = f"-${abs(difference):,.2f}"
+        else:
+            direction_text = "UNCHANGED"
+            direction_emoji = "\u27A1"
+            diff_str = "$0.00"
+
+        subject = f"[CAPITAL] {direction_emoji} Balance {direction_text} - {diff_str}"
+
+        body = f"""CAPITAL UPDATE - DELTA EXCHANGE BALANCE REFRESH
+-----------------------------
+Time          : {datetime.now(timezone.utc).isoformat()}
+Reason        : {reason}
+
+BALANCE CHANGE
+-----------------------------
+OLD Balance   : ${old_balance:,.2f}
+NEW Balance   : ${new_balance:,.2f}
+DIFFERENCE    : {diff_str}
+
+STATUS
+-----------------------------
+Balance       : {direction_text}
+Source        : Delta Exchange (single source of truth)
+Note          : trading_capital has been updated to the new balance.
+                All risk, position sizing, and daily-loss calculations
+                now use the new balance."""
 
         self._dispatch_async(subject, body)
         return True
@@ -1077,7 +1118,6 @@ TP_MAX_PCT = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
 
 MIN_ENGULF_BODY_PCT = 0.30
-HARAMI_BODY_TOLERANCE = 0.001
 RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
 VOL_EXP_TOLERANCE = 0.003
@@ -2092,85 +2132,11 @@ def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Opti
 
 
 # ================================================================
-#  13d. HARAMI STRATEGIES
-# ================================================================
-
-def check_short_signal_bearish_harami(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
-        return False, None, ""
-
-    signal = candles[-2]
-    prev = candles[-3]
-
-    if not is_bullish(prev):
-        return False, None, ""
-    if not is_bearish(signal):
-        return False, None, ""
-
-    prev_body_top = max(prev["open"], prev["close"])
-    prev_body_bottom = min(prev["open"], prev["close"])
-    signal_body_top = max(signal["open"], signal["close"])
-    signal_body_bottom = min(signal["open"], signal["close"])
-
-    tolerance_amount = prev_body_top * harami_tolerance
-
-    if signal_body_top > prev_body_top + tolerance_amount:
-        return False, None, ""
-    if signal_body_bottom < prev_body_bottom - tolerance_amount:
-        return False, None, ""
-    if signal_body_top >= prev_body_top and signal_body_bottom <= prev_body_bottom:
-        return False, None, ""
-
-    signal_candle = signal.copy()
-    signal_candle["pattern_high"] = prev["high"]
-    signal_candle["harami_tolerance"] = harami_tolerance
-
-    _log("info", "BEARISH_HARAMI",
-         f"Bearish Harami: Signal body inside prev body (tolerance: {harami_tolerance * 100:.2f}%)")
-    return True, signal_candle, "BEARISH_HARAMI"
-
-
-def check_long_signal_bullish_harami(candles: List[dict], harami_tolerance: float = HARAMI_BODY_TOLERANCE) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
-        return False, None, ""
-
-    signal = candles[-2]
-    prev = candles[-3]
-
-    if not is_bearish(prev):
-        return False, None, ""
-    if not is_bullish(signal):
-        return False, None, ""
-
-    prev_body_top = max(prev["open"], prev["close"])
-    prev_body_bottom = min(prev["open"], prev["close"])
-    signal_body_top = max(signal["open"], signal["close"])
-    signal_body_bottom = min(signal["open"], signal["close"])
-
-    tolerance_amount = prev_body_top * harami_tolerance
-
-    if signal_body_top > prev_body_top + tolerance_amount:
-        return False, None, ""
-    if signal_body_bottom < prev_body_bottom - tolerance_amount:
-        return False, None, ""
-    if signal_body_top >= prev_body_top and signal_body_bottom <= prev_body_bottom:
-        return False, None, ""
-
-    signal_candle = signal.copy()
-    signal_candle["pattern_low"] = prev["low"]
-    signal_candle["harami_tolerance"] = harami_tolerance
-
-    _log("info", "BULLISH_HARAMI",
-         f"Bullish Harami: Signal body inside prev body (tolerance: {harami_tolerance * 100:.2f}%)")
-    return True, signal_candle, "BULLISH_HARAMI"
-
-
-# ================================================================
 #  13e. SIGNAL CHECKERS
 # ================================================================
 
 def check_short_signal(
-    candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
+    candles: List[dict], symbol: str = ""
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     closed_candles = candles[:-1]
     rsi_passes, rsi_value = check_rsi_filter(
@@ -2194,17 +2160,11 @@ def check_short_signal(
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
 
-    triggered, signal_candle, strategy = check_short_signal_bearish_harami(candles, harami_tolerance)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
-        return True, signal_candle, strategy, rsi_value
-
     return False, None, "", rsi_value
 
 
 def check_short_signal_no_rsi(
     candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
-    harami_tolerance: float = HARAMI_BODY_TOLERANCE,
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     triggered, signal_candle, strategy = check_short_signal_range_break(candles)
@@ -2315,7 +2275,7 @@ def check_short_signal_no_rsi(
 
 
 def check_long_signal(
-    candles: List[dict], symbol: str = "", harami_tolerance: float = HARAMI_BODY_TOLERANCE
+    candles: List[dict], symbol: str = ""
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     closed_candles = candles[:-1]
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
@@ -2343,17 +2303,11 @@ def check_long_signal(
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
 
-    triggered, signal_candle, strategy = check_long_signal_bullish_harami(candles, harami_tolerance)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
-        return True, signal_candle, strategy, rsi
-
     return False, None, "", rsi
 
 
 def check_long_signal_no_rsi(
     candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
-    harami_tolerance: float = HARAMI_BODY_TOLERANCE,
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
     triggered, signal_candle, strategy = check_long_signal_range_break(candles)
@@ -3585,6 +3539,14 @@ class DailyLossTracker:
             self.daily_loss_usd = 0.0
             self._day = today
 
+    def update_capital(self, new_capital: float) -> None:
+        """Update the trading capital reference for daily loss limit calculations."""
+        with self._lock:
+            old_capital = self.trading_capital
+            self.trading_capital = new_capital
+            _log("info", "DAILY-LOSS",
+                 f"Trading capital reference updated: ${old_capital:,.2f} -> ${new_capital:,.2f}")
+
     def update_with_realized_pnl(self, realized_pnl: float) -> None:
         with self._lock:
             self._check_day_rollover()
@@ -3593,12 +3555,12 @@ class DailyLossTracker:
                 loss_amount = abs(realized_pnl)
                 self.daily_loss_usd += loss_amount
                 _log("warning", "DAILY-LOSS",
-                     f"Realized loss: ${loss_amount:.2f} | Daily loss total: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
+                     f"Balance-derived loss: ${loss_amount:.2f} | Daily loss total: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
             else:
                 profit_amount = realized_pnl
                 self.daily_loss_usd = max(0.0, self.daily_loss_usd - profit_amount)
                 _log("info", "DAILY-LOSS",
-                     f"Realized profit: ${profit_amount:.2f} | Daily loss total reduced to: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
+                     f"Balance-derived profit: ${profit_amount:.2f} | Daily loss total reduced to: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
             if limit > 0 and self.notifier and self.daily_loss_usd >= limit * 0.8:
                 self.notifier.send_daily_loss_warning(self.daily_loss_usd, limit)
             if limit > 0 and self.notifier and self.daily_loss_usd >= limit:
@@ -3641,7 +3603,6 @@ class TradingBot:
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
         self.enable_short = config.get("enable_short", True)
         self.enable_long = config.get("enable_long", True)
-        self.harami_tolerance = config.get("harami_tolerance", HARAMI_BODY_TOLERANCE)
 
         if self.trading_capital <= 0:
             _log("error", "STARTUP",
@@ -3670,6 +3631,9 @@ class TradingBot:
 
         self._trade_lock = threading.Lock()
         self.active_trades: Dict[str, dict] = {}
+
+        # Capital management lock - protects trading_capital updates
+        self._capital_lock = threading.Lock()
 
         self.signals: List[dict] = []
         self.sl_events: List[dict] = []
@@ -3719,29 +3683,80 @@ class TradingBot:
             except Exception as e:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
 
-    def _compute_local_pnl(self, trade: dict, exit_price: float) -> float:
+    def _refresh_capital_from_exchange(self, reason: str = "TRADE_EXECUTED") -> Optional[float]:
         """
-        Compute PnL locally from entry price, exit price, and size.
-        LONG:  (exit_price - entry_price) * quantity
-        SHORT: (entry_price - exit_price) * quantity
-        Returns a signed float. Positive = profit, negative = loss, zero = break-even.
+        Fetch the actual USD balance from Delta Exchange and update trading_capital.
+        This is the single source of truth for capital management. Also updates the
+        daily loss tracker's capital reference and sends an email notification
+        showing the old balance, new balance, and the difference.
+        Thread-safe via _capital_lock.
+        Returns the new balance (or None if refresh failed).
         """
         try:
-            entry = float(trade.get("entry", 0) or 0)
-            qty = float(trade.get("size", 0) or 0)
-            direction = trade.get("direction", "SHORT")
-            exit_p = float(exit_price or 0)
-        except (TypeError, ValueError):
-            return 0.0
-        if qty <= 0 or entry <= 0 or exit_p <= 0:
-            return 0.0
-        if direction == "LONG":
-            return (exit_p - entry) * qty
-        else:
-            return (entry - exit_p) * qty
+            new_balance = self.rest.get_usd_balance()
+            if new_balance <= 0:
+                _log("warning", "CAPITAL",
+                     f"Balance refresh returned ${new_balance:,.2f} - "
+                     f"keeping current trading_capital ${self.trading_capital:,.2f}")
+                return None
+
+            with self._capital_lock:
+                old_capital = self.trading_capital
+                self.trading_capital = new_balance
+                self.daily_loss_tracker.update_capital(new_balance)
+
+            difference = new_balance - old_capital
+            if difference > 0:
+                direction_text = "INCREASED"
+                diff_display = f"+${difference:,.2f}"
+            elif difference < 0:
+                direction_text = "DECREASED"
+                diff_display = f"-${abs(difference):,.2f}"
+            else:
+                direction_text = "UNCHANGED"
+                diff_display = "$0.00"
+
+            _log("info", "CAPITAL",
+                 f"Balance refresh ({reason}) | "
+                 f"OLD: ${old_capital:,.2f} | "
+                 f"NEW: ${new_balance:,.2f} | "
+                 f"DIFF: {diff_display} | "
+                 f"trading_capital updated to ${new_balance:,.2f}")
+
+            if self.notifier:
+                try:
+                    self.notifier.send_capital_update(
+                        old_balance=old_capital,
+                        new_balance=new_balance,
+                        reason=reason,
+                    )
+                except Exception as e:
+                    _log_exc("CAPITAL", f"Failed to send capital update email: {e}")
+
+            return new_balance
+
+        except Exception as e:
+            _log_exc("CAPITAL", f"Balance refresh failed (keeping current trading_capital ${self.trading_capital:,.2f}): {e}")
+            return None
 
     def _close_trade(self, symbol: str, trade: dict, reason: str,
                       exit_price: Optional[float] = None) -> None:
+        """
+        Close a trade.
+
+        LIVE mode: realized P&L is derived EXCLUSIVELY from the Delta Exchange
+        account balance difference:
+            realized_pnl = new_balance - old_balance
+        where old_balance is the confirmed balance captured immediately before
+        the trade was opened (stored on the trade record as 'balance_at_open'),
+        and new_balance is fetched after the position is fully closed.
+
+        No local entry_price -> exit_price -> position_size P&L is calculated,
+        stored, logged, displayed, or used in LIVE mode for any purpose.
+
+        PAPER mode: has no exchange balance, so we record $0.00 realized P&L
+        for the Daily Loss Tracker.
+        """
         try:
             entry = trade["entry"]
             direction = trade.get("direction", "SHORT")
@@ -3749,12 +3764,8 @@ class TradingBot:
 
             _log("info", "TRADE-CLOSE", f"Closing trade: {symbol} {direction} | Reason: {reason}")
 
-            # Determine the exit price to use for local PnL calculation.
-            # Priority:
-            #  1. Explicit exit_price argument (e.g. TP hit, ST exit with price)
-            #  2. TP level for TAKE_PROFIT
-            #  3. SL level for STOP_LOSS
-            #  4. Last known closed candle close for this symbol (fallback)
+            # Determine the exit price for logging/reference purposes only.
+            # This is NOT used to compute P&L in LIVE mode.
             local_exit_price: Optional[float] = None
             if exit_price is not None and exit_price > 0:
                 local_exit_price = float(exit_price)
@@ -3763,30 +3774,96 @@ class TradingBot:
             elif reason == "STOP_LOSS" and trade.get("stop_loss"):
                 local_exit_price = float(trade["stop_loss"])
             else:
-                # Fall back to the most recent closed candle for this symbol.
                 store = self.candle_store.get(symbol)
                 if store:
                     local_exit_price = float(list(store)[-1]["close"])
 
-            # Compute local PnL BEFORE closing the exchange position (so we
-            # still have the correct exit reference even if the close order
-            # or network call has issues).
-            if local_exit_price is not None and local_exit_price > 0:
-                realized_pnl = self._compute_local_pnl(trade, local_exit_price)
-            else:
-                realized_pnl = 0.0
+            # Snapshot the balance we recorded immediately before the trade
+            # was opened. This is the "old_balance" for the LIVE P&L calculation.
+            old_balance_at_open = trade.get("balance_at_open")
+            if old_balance_at_open is None or old_balance_at_open <= 0:
+                with self._capital_lock:
+                    old_balance_at_open = self.trading_capital
+                _log("warning", "TRADE-CLOSE",
+                     f"[{symbol}] 'balance_at_open' was missing on the trade record - "
+                     f"falling back to current trading_capital ${old_balance_at_open:,.2f}")
 
+            # ---- CLOSE THE EXCHANGE POSITION ----
+            close_succeeded = True
             if not self.paper:
                 pid = trade.get("product_id")
                 if pid and size > 0:
                     close_side = "buy" if direction == "SHORT" else "sell"
-                    self.rest.close_position(pid, size, side=close_side)
-                    _log("info", "TRADE-CLOSE", f"Closed position on Delta: product_id={pid}, size={size}, side={close_side}")
-                    time.sleep(1)
+                    close_result = self.rest.close_position(pid, size, side=close_side)
+                    if not close_result or "error" in close_result:
+                        close_succeeded = False
+                        _log("error", "TRADE-CLOSE",
+                             f"[{symbol}] exchange close order FAILED: {close_result}")
+                    else:
+                        _log("info", "TRADE-CLOSE",
+                             f"Closed position on Delta: product_id={pid}, size={size}, side={close_side}")
+                        # Allow the exchange to settle the close before fetching balance.
+                        time.sleep(2)
 
+            # ---- DERIVE REALIZED P&L ----
+            realized_pnl = 0.0
+            new_balance: Optional[float] = None
+
+            if not self.paper:
+                # ============================================================
+                # LIVE MODE - BALANCE-DERIVED P&L ONLY
+                # No local entry/exit P&L is calculated anywhere in this path.
+                # ============================================================
+                if not close_succeeded:
+                    _log("error", "TRADE-CLOSE",
+                         f"[{symbol}] skipping balance-derived P&L because the close order "
+                         f"failed. Daily Loss Tracker will NOT be updated for this trade. "
+                         f"Manual intervention required.")
+                else:
+                    new_balance = self.rest.get_usd_balance()
+                    if new_balance is None or new_balance <= 0:
+                        _log("error", "TRADE-CLOSE",
+                             f"[{symbol}] could not fetch a valid post-close balance "
+                             f"(got {new_balance}). Realized PnL for the Daily Loss Tracker "
+                             f"will NOT be recorded for this trade. Manual verification required.")
+                    else:
+                        realized_pnl = new_balance - old_balance_at_open
+                        _log("info", "TRADE-CLOSE",
+                             f"Balance-derived realized PnL for {symbol}: "
+                             f"OLD=${old_balance_at_open:,.2f} | "
+                             f"NEW=${new_balance:,.2f} | "
+                             f"PnL=${realized_pnl:,.2f}")
+
+                        # Update capital to the freshly fetched balance.
+                        with self._capital_lock:
+                            self.trading_capital = new_balance
+                            self.daily_loss_tracker.update_capital(new_balance)
+
+                        # Notify about the capital change.
+                        if self.notifier:
+                            try:
+                                self.notifier.send_capital_update(
+                                    old_balance=old_balance_at_open,
+                                    new_balance=new_balance,
+                                    reason=f"TRADE_CLOSED_{reason}",
+                                )
+                            except Exception as e:
+                                _log_exc("TRADE-CLOSE", f"Failed to send capital update email after close: {e}")
+            else:
+                # PAPER mode has no real exchange balance. We record $0.00 realized
+                # PnL for the Daily Loss Tracker since we cannot derive a balance-
+                # based value. No local entry/exit math is used here.
+                _log("info", "TRADE-CLOSE",
+                     f"PAPER mode - no exchange balance available; realized PnL recorded "
+                     f"as $0.00 for the Daily Loss Tracker for {symbol}.")
+
+            # ---- RECORD TRADE CLOSE METADATA ----
             trade["close_reason"] = reason
             trade["close_time"] = datetime.now(timezone.utc).isoformat()
             trade["realized_pnl"] = realized_pnl
+            trade["balance_at_open"] = old_balance_at_open
+            if new_balance is not None:
+                trade["balance_at_close"] = new_balance
             if local_exit_price is not None:
                 trade["exit_price"] = local_exit_price
 
@@ -3798,6 +3875,8 @@ class TradingBot:
                     "symbol": symbol, "entry": entry,
                     "take_profit": tp, "direction": direction,
                     "realized_pnl": realized_pnl, "reason": reason,
+                    "balance_at_open": old_balance_at_open,
+                    "balance_at_close": new_balance,
                 })
             else:
                 sl = local_exit_price or trade["stop_loss"]
@@ -3807,16 +3886,22 @@ class TradingBot:
                     "symbol": symbol, "entry": entry,
                     "stop_loss": sl, "direction": direction,
                     "realized_pnl": realized_pnl,
+                    "balance_at_open": old_balance_at_open,
+                    "balance_at_close": new_balance,
                 })
 
+            # ---- FEED THE DAILY LOSS TRACKER ----
+            # The balance-derived PnL is the ONLY source fed into the tracker
+            # in LIVE mode. No local P&L is added.
             self.daily_loss_tracker.update_with_realized_pnl(realized_pnl)
 
-            limit = self.trading_capital * self.daily_loss_limit_pct
+            with self._capital_lock:
+                limit = self.trading_capital * self.daily_loss_limit_pct
             _log("info", "TRADE-CLOSE",
                  f"Trade Closed: {symbol} {direction} | Reason: {reason} | "
                  f"Exit Price: {smart_fmt(local_exit_price) if local_exit_price else 'N/A'} | "
                  f"Size: {size} | "
-                 f"Local Realized PnL: ${realized_pnl:.2f} | "
+                 f"Balance-derived Realized PnL: ${realized_pnl:.2f} | "
                  f"Daily Loss Total: ${self.daily_loss_tracker.daily_loss_usd:.2f} | "
                  f"Daily Loss Limit: ${limit:.2f}")
 
@@ -4028,7 +4113,7 @@ class TradingBot:
 
         if self.notifier:
             self.notifier.send_startup_report(
-                self.config, self.symbols, self.harami_tolerance, sr_levels_for_email
+                self.config, self.symbols, sr_levels_for_email
             )
 
         self._log("info", "STARTUP", "STEP  8/15: Validating indicator/strategy data readiness...")
@@ -4491,7 +4576,6 @@ class TradingBot:
                     if self.enable_short:
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal_no_rsi(
                             candle_list, self.sr_managers[symbol], symbol=symbol,
-                            harami_tolerance=self.harami_tolerance,
                             notifier=self.notifier
                         )
                         if triggered and signal_candle is not None:
@@ -4500,7 +4584,7 @@ class TradingBot:
                             signal_found = True
                         else:
                             triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
-                                candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
+                                candle_list, symbol=symbol
                             )
                             if triggered and signal_candle is not None:
                                 self._on_signal(symbol, signal_candle, strategy_name,
@@ -4510,7 +4594,6 @@ class TradingBot:
                     if self.enable_long and symbol not in self.active_trades:
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi(
                             candle_list, self.sr_managers[symbol], symbol=symbol,
-                            harami_tolerance=self.harami_tolerance,
                             notifier=self.notifier
                         )
                         if triggered and signal_candle is not None:
@@ -4519,7 +4602,7 @@ class TradingBot:
                             signal_found = True
                         else:
                             triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
-                                candle_list, symbol=symbol, harami_tolerance=self.harami_tolerance
+                                candle_list, symbol=symbol
                             )
                             if triggered and signal_candle is not None:
                                 self._on_signal(symbol, signal_candle, strategy_name,
@@ -4600,12 +4683,6 @@ class TradingBot:
                 elif strategy_name in ("STRATEGY_1_SHORT", "RANGE_BREAK_SHORT",
                                         "VOL_EXPANSION_SHORT", "BEARISH_ENGULFING") and "pattern_high" in signal_candle:
                     sl = signal_candle["pattern_high"]
-                elif strategy_name == "BEARISH_HARAMI":
-                    store = self.candle_store.get(symbol)
-                    if store and len(store) >= 2:
-                        sl = list(store)[-2]["high"]
-                    else:
-                        sl = signal_candle.get("pattern_high", signal_candle["high"])
                 else:
                     store = self.candle_store.get(symbol)
                     sl = list(store)[-2]["high"] if store and len(store) >= 2 else signal_candle["high"]
@@ -4617,12 +4694,6 @@ class TradingBot:
                 elif strategy_name in ("STRATEGY_1_LONG", "RANGE_BREAK_LONG",
                                         "VOL_EXPANSION_LONG", "BULLISH_ENGULFING") and "pattern_low" in signal_candle:
                     sl = signal_candle["pattern_low"]
-                elif strategy_name == "BULLISH_HARAMI":
-                    store = self.candle_store.get(symbol)
-                    if store and len(store) >= 2:
-                        sl = list(store)[-2]["low"]
-                    else:
-                        sl = signal_candle.get("pattern_low", signal_candle["low"])
                 else:
                     store = self.candle_store.get(symbol)
                     sl = list(store)[-2]["low"] if store and len(store) >= 2 else signal_candle["low"]
@@ -4641,7 +4712,11 @@ class TradingBot:
                     self._log("info", "SIGNAL", f"[{symbol}] {direction} {strategy_name} REJECTED: Active trade exists")
                     return
 
-                risk_usd = round(self.trading_capital * self.risk_pct, 2)
+                # Snapshot current capital for the signal record.
+                with self._capital_lock:
+                    current_capital = self.trading_capital
+
+                risk_usd = round(current_capital * self.risk_pct, 2)
                 signal = {
                     "time": datetime.now(timezone.utc).isoformat(),
                     "symbol": symbol, "direction": direction,
@@ -4651,11 +4726,10 @@ class TradingBot:
                     "executed": False,
                     "product_id": self.product_map.get(symbol),
                     "risk_usd": risk_usd,
-                    "trading_capital": self.trading_capital,
+                    "trading_capital": current_capital,
                     "strategy": strategy_name,
                     "rsi": rsi_value,
                     "no_rsi": no_rsi,
-                    "harami_tolerance": self.harami_tolerance if strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI") else None,
                     "breakout_level": signal_candle.get("breakout_level", None),
                     "level_strength": signal_candle.get("level_strength", None),
                     "level_touches": signal_candle.get("level_touches", None),
@@ -4674,6 +4748,7 @@ class TradingBot:
                         "open_time": datetime.now(timezone.utc).isoformat(),
                         "strategy": strategy_name, "rsi": rsi_value,
                         "st_mode": False, "no_rsi": no_rsi,
+                        "balance_at_open": current_capital,
                     }
 
             rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
@@ -4688,8 +4763,6 @@ class TradingBot:
                 strategy_category = " [S/R BREAKOUT]"
             elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
                 strategy_category = " [ENGULFING PATTERN]"
-            elif strategy_name in ("BEARISH_HARAMI", "BULLISH_HARAMI"):
-                strategy_category = f" [HARAMI PATTERN - tol: {self.harami_tolerance * 100:.2f}%]"
             elif strategy_name in ("BEARISH_DOJI", "BULLISH_DOJI"):
                 strategy_category = f" [DOJI - body <= {DOJI_BODY_RATIO_MAX * 100:.0f}%]"
 
@@ -4770,6 +4843,15 @@ class TradingBot:
                 self._cleanup_trade(symbol)
                 return
 
+            # Snapshot the confirmed account balance immediately before placing
+            # the trade. This becomes the "old_balance" reference for the
+            # balance-derived realized P&L calculation on close.
+            balance_at_open = self.rest.get_usd_balance() or 0.0
+            if balance_at_open <= 0:
+                balance_at_open = capital
+            _log("info", "TRADE",
+                 f"[{symbol}] Balance snapshot immediately before entry: ${balance_at_open:,.2f}")
+
             side = "sell" if direction == "SHORT" else "buy"
             entry_result = self.rest.place_order(
                 product_id=pid, side=side, size=position_size, order_type="market_order",
@@ -4800,6 +4882,15 @@ class TradingBot:
 
             print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | filled={actual_filled_size} contracts")
 
+            # ----------------------------------------------------------
+            # CAPITAL MANAGEMENT: Immediately refresh balance after fill.
+            # The refreshed balance becomes the new trading_capital. Note:
+            # we do NOT overwrite 'balance_at_open' here - the snapshot taken
+            # before the entry is the correct reference for this trade's
+            # realized P&L.
+            # ----------------------------------------------------------
+            self._refresh_capital_from_exchange(reason="TRADE_FILLED")
+
             bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
             bracket_ok = bracket_result and "error" not in bracket_result
 
@@ -4827,10 +4918,15 @@ class TradingBot:
                 "bracket_tp_ok": bracket_ok,
                 "st_mode": False,
                 "no_rsi": signal.get("no_rsi", False),
+                "balance_at_open": balance_at_open,
             }
 
             with self._trade_lock:
                 self.active_trades[symbol] = trade_record
+
+            _log("info", "TRADE",
+                 f"[{symbol}] Trade opened. balance_at_open=${balance_at_open:,.2f} "
+                 f"(will be used to derive realized PnL on close)")
 
             if self.notifier:
                 try:
@@ -4886,7 +4982,10 @@ class TradingBot:
         now = time.time()
         current_issues: Dict[str, str] = {}
 
-        if self.trading_capital <= 0:
+        with self._capital_lock:
+            capital_snapshot = self.trading_capital
+
+        if capital_snapshot <= 0:
             current_issues["CAPITAL_ZERO"] = (
                 "trading_capital is $0 or unset. The bot cannot size positions "
                 "or evaluate the daily loss limit correctly in this state."
@@ -5182,7 +5281,12 @@ class TradingBot:
               f"subscribe-confirm / first-live-data, bounded timeouts as a safety net only)")
         print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} complete closed candle(s) "
               f"per symbol after any trade exit before strategy evaluation resumes")
-        print(f"  PnL Calculation   : LOCAL (entry/exit/quantity) - Delta realized PnL API NOT used")
+        print(f"  PnL Source        : DELTA EXCHANGE BALANCE DIFFERENCE (single source of truth)")
+        print(f"  PnL Calculation   : realized_pnl = new_balance - old_balance (LIVE mode ONLY)")
+        print(f"  PnL Local         : DISABLED in LIVE mode (no entry/exit local P&L)")
+        print(f"  Capital Source    : DELTA EXCHANGE BALANCE (single source of truth)")
+        print(f"  Capital Refresh   : After every successfully filled/executed trade + on close")
+        print(f"  Capital Email     : ENABLED (shows OLD, NEW, and DIFFERENCE)")
         print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
@@ -5333,40 +5437,14 @@ def ask_risk_params() -> Tuple[float, int]:
 def ask_daily_loss_limit() -> float:
     _divider("DAILY LOSS LIMIT")
     print("  Daily loss limit stops trading if cumulative REALIZED losses exceed this % of capital.")
+    print("  (Realized PnL is derived from the actual Delta Exchange balance difference.)")
     try:
         daily_loss = float(input("  Daily loss limit % (default = 5) : ").strip() or 5)
         daily_loss = max(0.1, min(daily_loss, 50.0))
     except ValueError:
         daily_loss = 5.0
-    print(f"  Daily loss limit : {daily_loss}% of trading capital (based on REALIZED PnL)")
+    print(f"  Daily loss limit : {daily_loss}% of trading capital (based on BALANCE-DERIVED REALIZED PnL)")
     return daily_loss
-
-
-def ask_harami_tolerance() -> float:
-    _divider("HARAMI TOLERANCE")
-    print("  Harami tolerance allows the second candle's body to be")
-    print("  slightly outside the first candle's body boundaries.")
-    print()
-    print("  Examples:")
-    print("    0.001  = 0.1% tolerance  (very strict - default)")
-    print("    0.005  = 0.5% tolerance  (some flexibility)")
-    print("    0.01   = 1.0% tolerance  (moderate flexibility)")
-    print("    0.05   = 5.0% tolerance  (very flexible)")
-    print("    0.10   = 10.0% tolerance (highly flexible)")
-    print("    0.20   = 20.0% tolerance (almost any pattern)")
-    print()
-    try:
-        tolerance = float(input("  Harami body tolerance (default = 0.001) : ").strip() or 0.001)
-        if tolerance > 0.20:
-            print(f"  WARNING: {tolerance * 100:.1f}% is very permissive!")
-            proceed = input("  Continue with this value? (y/N) : ").strip().lower()
-            if proceed != 'y':
-                return ask_harami_tolerance()
-        tolerance = max(0.0001, tolerance)
-    except ValueError:
-        tolerance = 0.001
-    print(f"  Harami tolerance : {tolerance * 100:.2f}%")
-    return tolerance
 
 
 def test_gmail():
@@ -5429,7 +5507,6 @@ def main() -> None:
     paper, api_key, api_secret = ask_mode()
     enable_short, enable_long = ask_trade_directions()
     notifier = ask_gmail_config()
-    harami_tolerance = ask_harami_tolerance()
 
     _divider("CONNECTING TO DELTA EXCHANGE INDIA")
     rest_tmp = DeltaREST(api_key, api_secret)
@@ -5477,7 +5554,12 @@ def main() -> None:
     print(f"  Max open trades   : {max_trades}")
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} closed candles per symbol")
-    print(f"  PnL Calculation   : LOCAL (entry/exit/qty)")
+    print(f"  PnL Source        : DELTA EXCHANGE BALANCE DIFFERENCE (single source of truth)")
+    print(f"  PnL Calculation   : realized_pnl = new_balance - old_balance (LIVE mode ONLY)")
+    print(f"  PnL Local         : DISABLED in LIVE mode (no entry/exit local P&L)")
+    print(f"  Capital Source    : DELTA EXCHANGE BALANCE (single source of truth)")
+    print(f"  Capital Refresh   : After every successfully filled/executed trade + on close")
+    print(f"  Capital Email     : ENABLED (shows OLD, NEW, and DIFFERENCE)")
     print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
@@ -5503,7 +5585,6 @@ def main() -> None:
         "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
         "enable_short": enable_short,
         "enable_long": enable_long,
-        "harami_tolerance": harami_tolerance,
     }
 
     bot = TradingBot(cfg, notifier=notifier)
@@ -5532,11 +5613,14 @@ def main() -> None:
                 for sym, remaining in bot._post_exit_cooldown.items():
                     if remaining and remaining > 0:
                         cooldown_info += f"[{sym}:COOLDOWN {remaining}] "
+                with bot._capital_lock:
+                    cap_snapshot = bot.trading_capital
                 print(
                     f"  [STATUS] Open={open_n}/{max_trades}  "
                     f"Signals={len(bot.signals)}  "
                     f"TPs={len(bot.tp_events)}  SLs={len(bot.sl_events)}  "
-                    f"WS={ws_state}  {bot.daily_loss_tracker.status()}  "
+                    f"WS={ws_state}  Capital=${cap_snapshot:,.2f}  "
+                    f"{bot.daily_loss_tracker.status()}  "
                     + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
                     + (f"  {st_info}" if st_info else "")
                     + (f"  {cooldown_info}" if cooldown_info else "")
