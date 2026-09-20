@@ -670,8 +670,6 @@ This alert will not repeat for the same ongoing issue for at least
 
     def send_capital_update(self, old_balance: float, new_balance: float,
                              reason: str = "TRADE_CLOSED") -> bool:
-        """Send an email showing the old balance, new balance, and the difference
-        for a TRADE CLOSE event."""
         if not self.enabled:
             return False
 
@@ -716,71 +714,7 @@ Balance       : {direction_text}
 Source        : Delta Exchange (single source of truth)
 Note          : trading_capital has been updated to the new balance.
                 All risk, position sizing, and daily-loss calculations
-                now use the new balance.
-                This P&L is TRADE-ONLY and excludes any external
-                deposits/withdrawals (those are reported separately)."""
-
-        self._dispatch_async(subject, body)
-        return True
-
-    def send_external_flow_alert(self, old_balance: float, new_balance: float,
-                                  flow_type: str, reason: str = "EXTERNAL_FLOW",
-                                  during_open_trade: bool = False) -> bool:
-        """
-        Send an email specifically for an external deposit/withdrawal detected
-        outside of trade activity.
-
-        flow_type: "DEPOSIT" or "WITHDRAWAL"
-        during_open_trade: True if a trade was open when the flow was detected.
-        """
-        if not self.enabled:
-            return False
-
-        difference = new_balance - old_balance
-        if flow_type == "DEPOSIT":
-            direction_emoji = "\U0001F4B0"
-            diff_str = f"+${abs(difference):,.2f}"
-        else:
-            direction_emoji = "\U0001F4B8"
-            diff_str = f"-${abs(difference):,.2f}"
-
-        subject = f"[EXTERNAL {flow_type}] {direction_emoji} Balance {diff_str}"
-
-        trade_context = (
-            "A trade was OPEN when this flow was detected. The flow amount has\n"
-            "been recorded separately and will be excluded from the trade's P&L\n"
-            "calculation when the trade closes."
-            if during_open_trade else
-            "No trade was open when this flow was detected."
-        )
-
-        body = f"""EXTERNAL FUNDS {flow_type} DETECTED
------------------------------
-Time          : {datetime.now(timezone.utc).isoformat()}
-Reason        : {reason}
-Flow Type     : {flow_type}
-
-BALANCE CHANGE
------------------------------
-OLD Balance   : ${old_balance:,.2f}
-NEW Balance   : ${new_balance:,.2f}
-DIFFERENCE    : {diff_str}
-
-CLASSIFICATION
------------------------------
-This change was detected OUTSIDE of trade activity.
-It is NOT trade P&L and has been recorded separately.
-
-CONTEXT
------------------------------
-{trade_context}
-
-STATUS
------------------------------
-trading_capital has been updated to the new exchange balance.
-Daily-loss tracker and all capital-dependent variables have been updated.
-
-Source        : Delta Exchange (single source of truth)"""
+                now use the new balance."""
 
         self._dispatch_async(subject, body)
         return True
@@ -1206,9 +1140,6 @@ ST2_LENGTH = 21
 ST2_FACTOR = 1.0
 
 POST_EXIT_COOLDOWN_CANDLES = 2
-
-EXTERNAL_FLOW_MIN_USD = 1.0
-EXTERNAL_FLOW_MONITOR_INTERVAL = 60
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m": {"resolution": "1m", "api_resolution": "1m", "ws_channel": "candlestick_1m", "secs": 60},
@@ -2134,15 +2065,32 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
 
 # ================================================================
 #  13c. ENGULFING STRATEGIES
+#          UPDATED: require one additional closed confirmation candle.
+#
+#   Bullish Engulfing structure:
+#       Bearish -> Bullish Engulfing -> Bullish Confirmation (close ABOVE Engulfing close)
+#
+#   Bearish Engulfing structure:
+#       Bullish -> Bearish Engulfing -> Bearish Confirmation (close BELOW Engulfing close)
+#
+#   All existing engulfing body conditions, minimum body %, RSI filters,
+#   SL placement, and everything else are unchanged.
 # ================================================================
 
 def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
+    # Need at least 4 candles:
+    #   candles[-4] = prior bullish candle
+    #   candles[-3] = bearish engulfing candle
+    #   candles[-2] = bearish confirmation candle (must close below engulfing close)
+    #   candles[-1] = currently forming candle (NOT used for confirmation)
+    if len(candles) < 4:
         return False, None, ""
 
-    signal = candles[-2]
-    prev = candles[-3]
+    confirm_candle = candles[-2]
+    signal = candles[-3]     # the bearish engulfing candle
+    prev = candles[-4]       # the prior bullish candle it engulfs
 
+    # --- Existing engulfing body conditions (unchanged) ---
     if not is_bullish(prev):
         return False, None, ""
     if not is_bearish(signal):
@@ -2156,22 +2104,41 @@ def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Opt
     if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
         return False, None, ""
 
-    signal_candle = signal.copy()
+    # --- NEW: additional closed confirmation candle ---
+    # Confirmation candle must be bearish AND close below the engulfing candle's close.
+    if not is_bearish(confirm_candle):
+        return False, None, ""
+    if confirm_candle["close"] >= signal["close"]:
+        return False, None, ""
+
+    # SL stays at the engulfing candle's high (unchanged).
+    signal_candle = confirm_candle.copy()
     signal_candle["pattern_high"] = signal["high"]
+    signal_candle["engulfing_close"] = signal["close"]
+    signal_candle["confirmation_close"] = confirm_candle["close"]
 
     _log("info", "BEARISH_ENGULFING",
-         f"Bearish Engulfing: Signal body {smart_fmt(signal_body)} engulfed prev body "
-         f"(range ratio: {(signal_body / signal_range) * 100:.1f}%)")
+         f"Bearish Engulfing + Confirmation: "
+         f"Engulf body {smart_fmt(signal_body)} (range ratio: {(signal_body / signal_range) * 100:.1f}%) | "
+         f"Engulf close {smart_fmt(signal['close'])} | "
+         f"Confirmation close {smart_fmt(confirm_candle['close'])} < Engulf close -> CONFIRMED")
     return True, signal_candle, "BEARISH_ENGULFING"
 
 
 def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 3:
+    # Need at least 4 candles:
+    #   candles[-4] = prior bearish candle
+    #   candles[-3] = bullish engulfing candle
+    #   candles[-2] = bullish confirmation candle (must close above engulfing close)
+    #   candles[-1] = currently forming candle (NOT used for confirmation)
+    if len(candles) < 4:
         return False, None, ""
 
-    signal = candles[-2]
-    prev = candles[-3]
+    confirm_candle = candles[-2]
+    signal = candles[-3]     # the bullish engulfing candle
+    prev = candles[-4]       # the prior bearish candle it engulfs
 
+    # --- Existing engulfing body conditions (unchanged) ---
     if not is_bearish(prev):
         return False, None, ""
     if not is_bullish(signal):
@@ -2185,12 +2152,24 @@ def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Opti
     if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
         return False, None, ""
 
-    signal_candle = signal.copy()
+    # --- NEW: additional closed confirmation candle ---
+    # Confirmation candle must be bullish AND close above the engulfing candle's close.
+    if not is_bullish(confirm_candle):
+        return False, None, ""
+    if confirm_candle["close"] <= signal["close"]:
+        return False, None, ""
+
+    # SL stays at the engulfing candle's low (unchanged).
+    signal_candle = confirm_candle.copy()
     signal_candle["pattern_low"] = signal["low"]
+    signal_candle["engulfing_close"] = signal["close"]
+    signal_candle["confirmation_close"] = confirm_candle["close"]
 
     _log("info", "BULLISH_ENGULFING",
-         f"Bullish Engulfing: Signal body {smart_fmt(signal_body)} engulfed prev body "
-         f"(range ratio: {(signal_body / signal_range) * 100:.1f}%)")
+         f"Bullish Engulfing + Confirmation: "
+         f"Engulf body {smart_fmt(signal_body)} (range ratio: {(signal_body / signal_range) * 100:.1f}%) | "
+         f"Engulf close {smart_fmt(signal['close'])} | "
+         f"Confirmation close {smart_fmt(confirm_candle['close'])} > Engulf close -> CONFIRMED")
     return True, signal_candle, "BULLISH_ENGULFING"
 
 
@@ -3612,13 +3591,6 @@ class TradingBot:
 
         self._capital_lock = threading.Lock()
 
-        self._last_known_external_balance: Optional[float] = None
-        self._open_trade_balance_snapshots: Dict[str, float] = {}
-        self._last_external_flow_fingerprint: Optional[Tuple[float, float, float]] = None
-        self._external_flow_lock = threading.Lock()
-        self._external_flow_monitor_thread: Optional[threading.Thread] = None
-        self._external_flow_monitor_stop = threading.Event()
-
         self.signals: List[dict] = []
         self.sl_events: List[dict] = []
         self.tp_events: List[dict] = []
@@ -3668,166 +3640,7 @@ class TradingBot:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
 
     # ------------------------------------------------------------------
-    # EXTERNAL BALANCE FLOW DETECTION (works even while a trade is open)
-    # ------------------------------------------------------------------
-
-    def _compute_expected_balance_for_open_trades(self) -> Optional[float]:
-        with self._trade_lock:
-            open_syms = [s for s, t in self.active_trades.items()
-                         if isinstance(t, dict) and not t.get("_reserved")]
-
-        if not open_syms:
-            return self._last_known_external_balance
-
-        total = 0.0
-        have_any = False
-        for sym in open_syms:
-            snap = self._open_trade_balance_snapshots.get(sym)
-            if snap is not None:
-                total += snap
-                have_any = True
-        if not have_any:
-            return self._last_known_external_balance
-        return total
-
-    def _check_external_balance_flow(self) -> None:
-        if self.paper:
-            return
-
-        with self._external_flow_lock:
-            try:
-                current_balance = self.rest.get_usd_balance()
-            except Exception as e:
-                _log_exc("EXTERNAL-FLOW", f"Failed to fetch balance for external-flow check: {e}")
-                return
-
-            if current_balance is None or current_balance <= 0:
-                return
-
-            expected = self._compute_expected_balance_for_open_trades()
-
-            if expected is None:
-                self._last_known_external_balance = current_balance
-                return
-
-            difference = current_balance - expected
-
-            if abs(difference) < EXTERNAL_FLOW_MIN_USD:
-                self._update_open_trade_snapshots(current_balance)
-                if not self._has_open_trades():
-                    self._last_known_external_balance = current_balance
-                return
-
-            fingerprint = (round(expected, 2), round(current_balance, 2), round(difference, 2))
-            if fingerprint == self._last_external_flow_fingerprint:
-                _log("debug", "EXTERNAL-FLOW",
-                     f"Skipping duplicate external-flow alert for fingerprint {fingerprint}")
-                self._update_open_trade_snapshots(current_balance)
-                if not self._has_open_trades():
-                    self._last_known_external_balance = current_balance
-                return
-
-            flow_type = "DEPOSIT" if difference > 0 else "WITHDRAWAL"
-            during_trade = self._has_open_trades()
-
-            _log("warning", "EXTERNAL-FLOW",
-                 f"External {flow_type} detected "
-                 f"{'(trade open)' if during_trade else '(no trade open)'} | "
-                 f"EXPECTED=${expected:,.2f} | ACTUAL=${current_balance:,.2f} | "
-                 f"DIFF=${difference:+,.2f}")
-
-            with self._capital_lock:
-                self.trading_capital = current_balance
-                self.daily_loss_tracker.update_capital(current_balance)
-
-            # Attribute the flow to each open trade so the trade's P&L
-            # calculation on close can back it out.
-            if during_trade:
-                with self._trade_lock:
-                    open_syms = [s for s, t in self.active_trades.items()
-                                 if isinstance(t, dict) and not t.get("_reserved")]
-                # Split evenly if multiple trades open (rare, but safe).
-                n = max(1, len(open_syms))
-                per_trade = difference / n
-                for sym in open_syms:
-                    t = self.active_trades.get(sym)
-                    if isinstance(t, dict):
-                        t["external_flow_during_trade"] = (
-                            float(t.get("external_flow_during_trade", 0.0)) + per_trade
-                        )
-
-            if self.notifier:
-                try:
-                    self.notifier.send_external_flow_alert(
-                        old_balance=expected,
-                        new_balance=current_balance,
-                        flow_type=flow_type,
-                        reason="EXTERNAL_BALANCE_CHANGE",
-                        during_open_trade=during_trade,
-                    )
-                except Exception as e:
-                    _log_exc("EXTERNAL-FLOW", f"Failed to send external-flow email: {e}")
-
-            self._last_external_flow_fingerprint = fingerprint
-            self._update_open_trade_snapshots(current_balance)
-            if not self._has_open_trades():
-                self._last_known_external_balance = current_balance
-
-    def _has_open_trades(self) -> bool:
-        with self._trade_lock:
-            return any(isinstance(t, dict) and not t.get("_reserved")
-                       for t in self.active_trades.values())
-
-    def _update_open_trade_snapshots(self, current_balance: float) -> None:
-        with self._trade_lock:
-            open_syms = [s for s, t in self.active_trades.items()
-                         if isinstance(t, dict) and not t.get("_reserved")]
-        for sym in open_syms:
-            self._open_trade_balance_snapshots[sym] = current_balance
-
-    def _register_open_trade_snapshot(self, symbol: str, balance: float) -> None:
-        self._open_trade_balance_snapshots[symbol] = balance
-
-    def _clear_open_trade_snapshot(self, symbol: str) -> None:
-        self._open_trade_balance_snapshots.pop(symbol, None)
-
-    # ------------------------------------------------------------------
-    # BACKGROUND EXTERNAL-FLOW MONITOR
-    # ------------------------------------------------------------------
-
-    def _start_external_flow_monitor(self) -> None:
-        if self.paper:
-            return
-        if self._external_flow_monitor_thread and self._external_flow_monitor_thread.is_alive():
-            return
-        self._external_flow_monitor_stop.clear()
-        self._external_flow_monitor_thread = threading.Thread(
-            target=self._external_flow_monitor_loop,
-            daemon=True, name="ExternalFlowMonitor"
-        )
-        self._external_flow_monitor_thread.start()
-        _log("info", "EXTERNAL-FLOW",
-             f"External-flow monitor started (every {EXTERNAL_FLOW_MONITOR_INTERVAL}s, "
-             f"threshold ${EXTERNAL_FLOW_MIN_USD:.2f})")
-
-    def _external_flow_monitor_loop(self) -> None:
-        while not self._external_flow_monitor_stop.is_set():
-            for _ in range(EXTERNAL_FLOW_MONITOR_INTERVAL):
-                if self._external_flow_monitor_stop.is_set():
-                    return
-                time.sleep(1)
-            try:
-                self._check_external_balance_flow()
-            except Exception as e:
-                _log_exc("EXTERNAL-FLOW", f"Background external-flow monitor error: {e}")
-
-    def _stop_external_flow_monitor(self) -> None:
-        self._external_flow_monitor_stop.set()
-        if self._external_flow_monitor_thread and self._external_flow_monitor_thread.is_alive():
-            self._external_flow_monitor_thread.join(timeout=5.0)
-
-    # ------------------------------------------------------------------
-    # TRADE CLOSE (trade P&L only - separated from external flows)
+    # TRADE CLOSE (trade P&L only)
     # ------------------------------------------------------------------
 
     def _close_trade(self, symbol: str, trade: dict, reason: str,
@@ -3858,8 +3671,6 @@ class TradingBot:
                 _log("warning", "TRADE-CLOSE",
                      f"[{symbol}] 'balance_before_entry' was missing on the trade record - "
                      f"falling back to current trading_capital ${balance_before_entry:,.2f}")
-
-            external_flow_during_trade = float(trade.get("external_flow_during_trade", 0.0))
 
             close_succeeded = True
             if not self.paper:
@@ -3893,22 +3704,17 @@ class TradingBot:
                              f"(got {final_balance}). Trade P&L will NOT be recorded "
                              f"for this trade. Manual verification required.")
                     else:
-                        raw_difference = final_balance - balance_before_entry
-                        trade_pnl = raw_difference - external_flow_during_trade
+                        trade_pnl = final_balance - balance_before_entry
 
                         _log("info", "TRADE-CLOSE",
                              f"Trade P&L for {symbol}: "
                              f"OLD=${balance_before_entry:,.2f} | "
                              f"NEW=${final_balance:,.2f} | "
-                             f"RawDiff=${raw_difference:,.2f} | "
-                             f"ExternalDuringTrade=${external_flow_during_trade:+,.2f} | "
                              f"TradePnL=${trade_pnl:,.2f}")
 
                         with self._capital_lock:
                             self.trading_capital = final_balance
                             self.daily_loss_tracker.update_capital(final_balance)
-                        if not self._has_open_trades():
-                            self._last_known_external_balance = final_balance
 
                         if self.notifier:
                             try:
@@ -3928,7 +3734,6 @@ class TradingBot:
             trade["close_time"] = datetime.now(timezone.utc).isoformat()
             trade["realized_pnl"] = trade_pnl
             trade["balance_before_entry"] = balance_before_entry
-            trade["external_flow_during_trade"] = external_flow_during_trade
             if final_balance is not None:
                 trade["balance_at_close"] = final_balance
             if local_exit_price is not None:
@@ -3944,7 +3749,6 @@ class TradingBot:
                     "realized_pnl": trade_pnl, "reason": reason,
                     "balance_before_entry": balance_before_entry,
                     "balance_at_close": final_balance,
-                    "external_flow_during_trade": external_flow_during_trade,
                 })
             else:
                 sl = local_exit_price or trade["stop_loss"]
@@ -3956,7 +3760,6 @@ class TradingBot:
                     "realized_pnl": trade_pnl,
                     "balance_before_entry": balance_before_entry,
                     "balance_at_close": final_balance,
-                    "external_flow_during_trade": external_flow_during_trade,
                 })
 
             self.daily_loss_tracker.update_with_realized_pnl(trade_pnl)
@@ -3991,13 +3794,8 @@ class TradingBot:
         except Exception as e:
             _log_exc("TRADE-CLOSE", f"Unexpected error while closing {symbol} - attempting cleanup anyway: {e}")
         finally:
-            self._clear_open_trade_snapshot(symbol)
             self._cleanup_trade(symbol)
             self._start_post_exit_cooldown(symbol)
-            try:
-                self._check_external_balance_flow()
-            except Exception as e:
-                _log_exc("EXTERNAL-FLOW", f"Post-close external-flow check failed: {e}")
 
     def _cleanup_trade(self, symbol: str) -> None:
         with self._trade_lock:
@@ -4182,17 +3980,6 @@ class TradingBot:
                 self.config, self.symbols, sr_levels_for_email
             )
 
-        if not self.paper:
-            try:
-                initial_balance = self.rest.get_usd_balance()
-                if initial_balance and initial_balance > 0:
-                    self._last_known_external_balance = initial_balance
-                    _log("info", "EXTERNAL-FLOW",
-                         f"External-flow baseline seeded with current balance "
-                         f"${initial_balance:,.2f}")
-            except Exception as e:
-                _log_exc("EXTERNAL-FLOW", f"Failed to seed external-flow baseline: {e}")
-
         self._log("info", "STARTUP", "STEP  8/15: Validating indicator/strategy data readiness...")
         self._validate_indicator_readiness()
 
@@ -4246,9 +4033,8 @@ class TradingBot:
         self._pipeline_ready.set()
         self._log("info", "STARTUP", "STEP 14/15: Data pipeline healthy - STRATEGY EVALUATION ENABLED.")
 
-        self._log("info", "STARTUP", "STEP 15/15: Starting watchdog and external-flow monitor...")
+        self._log("info", "STARTUP", "STEP 15/15: Starting watchdog and background health monitoring...")
         self._start_watchdog()
-        self._start_external_flow_monitor()
 
         self._log("info", "STARTUP", "Startup sequence complete - bot is fully operational.")
 
@@ -4257,7 +4043,6 @@ class TradingBot:
         self._watchdog_stop.set()
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             self._watchdog_thread.join(timeout=5.0)
-        self._stop_external_flow_monitor()
         if self.ws_manager:
             self.ws_manager.stop()
         self._log("info", "BOT", "Bot stopped.")
@@ -4824,7 +4609,6 @@ class TradingBot:
                         "strategy": strategy_name, "rsi": rsi_value,
                         "st_mode": False, "no_rsi": no_rsi,
                         "balance_before_entry": current_capital,
-                        "external_flow_during_trade": 0.0,
                     }
 
             rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
@@ -4838,7 +4622,7 @@ class TradingBot:
             elif strategy_name in ("RESISTANCE_BREAKOUT_LONG", "SUPPORT_BREAKDOWN_SHORT"):
                 strategy_category = " [S/R BREAKOUT]"
             elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
-                strategy_category = " [ENGULFING PATTERN]"
+                strategy_category = " [ENGULFING + CONFIRMATION]"
             elif strategy_name in ("BEARISH_DOJI", "BULLISH_DOJI"):
                 strategy_category = f" [DOJI - body <= {DOJI_BODY_RATIO_MAX * 100:.0f}%]"
 
@@ -4983,13 +4767,10 @@ class TradingBot:
                 "st_mode": False,
                 "no_rsi": signal.get("no_rsi", False),
                 "balance_before_entry": balance_before_entry,
-                "external_flow_during_trade": 0.0,
             }
 
             with self._trade_lock:
                 self.active_trades[symbol] = trade_record
-
-            self._register_open_trade_snapshot(symbol, balance_before_entry)
 
             _log("info", "TRADE",
                  f"[{symbol}] Trade opened. balance_before_entry=${balance_before_entry:,.2f} "
@@ -5184,11 +4965,6 @@ class TradingBot:
                             f"'[EVAL-SKIP]' entries for {sym}."
                         )
 
-        try:
-            self._check_external_balance_flow()
-        except Exception as e:
-            _log_exc("EXTERNAL-FLOW", f"Watchdog external-flow check failed: {e}")
-
         self._reconcile_watchdog_issues(current_issues)
 
     def _reconcile_watchdog_issues(self, current_issues: Dict[str, str]) -> None:
@@ -5301,9 +5077,8 @@ class TradingBot:
         print()
         print("+========================================================+")
         print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
-        print("|   CAPITAL LOGIC: trade P&L and external flows are      |")
-        print("|   fully separated. External deposits/withdrawals are   |")
-        print("|   detected CONTINUOUSLY, even while a trade is open.   |")
+        print("|   Engulfing strategies now require a closed             |")
+        print("|   confirmation candle before entry.                     |")
         print("+========================================================+")
         print()
 
@@ -5353,17 +5128,16 @@ class TradingBot:
               f"subscribe-confirm / first-live-data, bounded timeouts as a safety net only)")
         print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} complete closed candle(s) "
               f"per symbol after any trade exit before strategy evaluation resumes")
-        print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry - external_flows)")
-        print(f"  PnL Calculation   : realized_pnl = raw_diff - external_flows_during_trade")
+        print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry)")
+        print(f"  PnL Calculation   : realized_pnl = final_balance - balance_before_entry")
         print(f"  PnL Local         : DISABLED in LIVE mode (no entry/exit local P&L)")
         print(f"  Capital Source    : DELTA EXCHANGE BALANCE (single source of truth)")
-        print(f"  Capital Refresh   : After every trade close + on external deposit/withdrawal")
-        print(f"  External Flows    : MONITORED CONTINUOUSLY every {EXTERNAL_FLOW_MONITOR_INTERVAL}s "
-              f"(threshold ${EXTERNAL_FLOW_MIN_USD:.2f}, even while trades are open)")
-        print(f"  Trade vs External : FULLY SEPARATED - trade P&L never includes "
-              f"deposits/withdrawals, and vice versa")
-        print(f"  Capital Email     : ONE email after trade close (trade P&L) + "
-              f"ONE email per external deposit/withdrawal")
+        print(f"  Capital Refresh   : ONLY after a trade is completely closed")
+        print(f"  Capital Email     : ONE email after trade close (OLD, NEW, DIFFERENCE, PROFIT/LOSS/NO CHANGE)")
+        print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
+        print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
+        print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
+        print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
         print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
@@ -5514,8 +5288,7 @@ def ask_risk_params() -> Tuple[float, int]:
 def ask_daily_loss_limit() -> float:
     _divider("DAILY LOSS LIMIT")
     print("  Daily loss limit stops trading if cumulative REALIZED trade losses exceed this % of capital.")
-    print("  (Realized PnL is derived from the actual Delta Exchange balance difference of each trade,")
-    print("   excluding any external deposits/withdrawals detected during the trade.)")
+    print("  (Realized PnL is derived from the actual Delta Exchange balance difference of each trade.)")
     try:
         daily_loss = float(input("  Daily loss limit % (default = 5) : ").strip() or 5)
         daily_loss = max(0.1, min(daily_loss, 50.0))
@@ -5632,17 +5405,16 @@ def main() -> None:
     print(f"  Max open trades   : {max_trades}")
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} closed candles per symbol")
-    print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry - external_flows)")
-    print(f"  PnL Calculation   : realized_pnl = raw_diff - external_flows_during_trade")
+    print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry)")
+    print(f"  PnL Calculation   : realized_pnl = final_balance - balance_before_entry")
     print(f"  PnL Local         : DISABLED in LIVE mode (no entry/exit local P&L)")
     print(f"  Capital Source    : DELTA EXCHANGE BALANCE (single source of truth)")
-    print(f"  Capital Refresh   : After every trade close + on external deposit/withdrawal")
-    print(f"  External Flows    : MONITORED CONTINUOUSLY every {EXTERNAL_FLOW_MONITOR_INTERVAL}s "
-          f"(threshold ${EXTERNAL_FLOW_MIN_USD:.2f}, even while trades are open)")
-    print(f"  Trade vs External : FULLY SEPARATED - trade P&L never includes "
-          f"deposits/withdrawals, and vice versa")
-    print(f"  Capital Email     : ONE email after trade close (trade P&L) + "
-          f"ONE email per external deposit/withdrawal")
+    print(f"  Capital Refresh   : ONLY after a trade is completely closed")
+    print(f"  Capital Email     : ONE email after trade close (OLD, NEW, DIFFERENCE, PROFIT/LOSS/NO CHANGE)")
+    print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
+    print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
+    print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
+    print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
     print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
