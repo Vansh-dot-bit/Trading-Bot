@@ -634,8 +634,6 @@ Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
     def send_sr_rejection(self, symbol: str, direction: str, level_price: float,
                            breakout_close: float, confirm_close: float,
                            rejection_reason: str, strategy: str = "S/R_BREAKOUT") -> bool:
-        # Rejected trade notifications are intentionally suppressed.
-        # All rejection details remain in the logs only.
         return False
 
     def send_health_alert(self, issue_key: str, message: str, resolved: bool = False) -> bool:
@@ -671,8 +669,9 @@ This alert will not repeat for the same ongoing issue for at least
         return True
 
     def send_capital_update(self, old_balance: float, new_balance: float,
-                             reason: str = "TRADE_EXECUTED") -> bool:
-        """Send an email showing the old balance, new balance, and the difference."""
+                             reason: str = "TRADE_CLOSED") -> bool:
+        """Send an email showing the old balance, new balance, and the difference
+        for a TRADE CLOSE event."""
         if not self.enabled:
             return False
 
@@ -681,18 +680,21 @@ This alert will not repeat for the same ongoing issue for at least
             direction_text = "INCREASED"
             direction_emoji = "\U0001F4C8"
             diff_str = f"+${difference:,.2f}"
+            result_label = "PROFIT"
         elif difference < 0:
             direction_text = "DECREASED"
             direction_emoji = "\U0001F4C9"
             diff_str = f"-${abs(difference):,.2f}"
+            result_label = "LOSS"
         else:
             direction_text = "UNCHANGED"
             direction_emoji = "\u27A1"
             diff_str = "$0.00"
+            result_label = "NO CHANGE"
 
-        subject = f"[CAPITAL] {direction_emoji} Balance {direction_text} - {diff_str}"
+        subject = f"[TRADE P&L] {direction_emoji} Balance {direction_text} - {diff_str}"
 
-        body = f"""CAPITAL UPDATE - DELTA EXCHANGE BALANCE REFRESH
+        body = f"""TRADE P&L - DELTA EXCHANGE BALANCE REFRESH
 -----------------------------
 Time          : {datetime.now(timezone.utc).isoformat()}
 Reason        : {reason}
@@ -703,13 +705,82 @@ OLD Balance   : ${old_balance:,.2f}
 NEW Balance   : ${new_balance:,.2f}
 DIFFERENCE    : {diff_str}
 
+RESULT
+-----------------------------
+Trade P&L     : {diff_str}
+Classification: {result_label}
+
 STATUS
 -----------------------------
 Balance       : {direction_text}
 Source        : Delta Exchange (single source of truth)
 Note          : trading_capital has been updated to the new balance.
                 All risk, position sizing, and daily-loss calculations
-                now use the new balance."""
+                now use the new balance.
+                This P&L is TRADE-ONLY and excludes any external
+                deposits/withdrawals (those are reported separately)."""
+
+        self._dispatch_async(subject, body)
+        return True
+
+    def send_external_flow_alert(self, old_balance: float, new_balance: float,
+                                  flow_type: str, reason: str = "EXTERNAL_FLOW",
+                                  during_open_trade: bool = False) -> bool:
+        """
+        Send an email specifically for an external deposit/withdrawal detected
+        outside of trade activity.
+
+        flow_type: "DEPOSIT" or "WITHDRAWAL"
+        during_open_trade: True if a trade was open when the flow was detected.
+        """
+        if not self.enabled:
+            return False
+
+        difference = new_balance - old_balance
+        if flow_type == "DEPOSIT":
+            direction_emoji = "\U0001F4B0"
+            diff_str = f"+${abs(difference):,.2f}"
+        else:
+            direction_emoji = "\U0001F4B8"
+            diff_str = f"-${abs(difference):,.2f}"
+
+        subject = f"[EXTERNAL {flow_type}] {direction_emoji} Balance {diff_str}"
+
+        trade_context = (
+            "A trade was OPEN when this flow was detected. The flow amount has\n"
+            "been recorded separately and will be excluded from the trade's P&L\n"
+            "calculation when the trade closes."
+            if during_open_trade else
+            "No trade was open when this flow was detected."
+        )
+
+        body = f"""EXTERNAL FUNDS {flow_type} DETECTED
+-----------------------------
+Time          : {datetime.now(timezone.utc).isoformat()}
+Reason        : {reason}
+Flow Type     : {flow_type}
+
+BALANCE CHANGE
+-----------------------------
+OLD Balance   : ${old_balance:,.2f}
+NEW Balance   : ${new_balance:,.2f}
+DIFFERENCE    : {diff_str}
+
+CLASSIFICATION
+-----------------------------
+This change was detected OUTSIDE of trade activity.
+It is NOT trade P&L and has been recorded separately.
+
+CONTEXT
+-----------------------------
+{trade_context}
+
+STATUS
+-----------------------------
+trading_capital has been updated to the new exchange balance.
+Daily-loss tracker and all capital-dependent variables have been updated.
+
+Source        : Delta Exchange (single source of truth)"""
 
         self._dispatch_async(subject, body)
         return True
@@ -1108,9 +1179,6 @@ RSI_MIN_CANDLES = RSI_PERIOD + 1
 FILL_POLL_INTERVAL = 0.5
 FILL_POLL_TIMEOUT = 15
 
-# Doji body threshold: a candle is a Doji when
-# (|Close - Open| / (High - Low)) * 100 <= DOJI_BODY_RATIO_MAX * 100
-# i.e. body/range <= 0.20 (20%). Exactly 20% is still counted as a Doji.
 DOJI_BODY_RATIO_MAX = 0.20
 
 TP_RR_RATIO = 2.0
@@ -1130,7 +1198,6 @@ SR_MAX_LEVEL_AGE = 100
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
 
-# FINAL MINIMUM DISTANCE FILTER - 1.5% minimum separation between final levels
 MIN_SR_DISTANCE_PERCENT = 1.5
 
 ST1_LENGTH = 14
@@ -1138,9 +1205,10 @@ ST1_FACTOR = 2.0
 ST2_LENGTH = 21
 ST2_FACTOR = 1.0
 
-# Post-exit cooldown: wait this many complete closed candles before resuming
-# strategy evaluation for a symbol that just exited a trade.
 POST_EXIT_COOLDOWN_CANDLES = 2
+
+EXTERNAL_FLOW_MIN_USD = 1.0
+EXTERNAL_FLOW_MONITOR_INTERVAL = 60
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m": {"resolution": "1m", "api_resolution": "1m", "ws_channel": "candlestick_1m", "secs": 60},
@@ -1557,7 +1625,6 @@ def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
     r = candle_range(c)
     if r <= 0:
         return False
-    # A candle is a Doji when body/range <= body_ratio_max (<=20% included).
     return (candle_body(c) / r) <= body_ratio_max
 
 
@@ -1648,7 +1715,6 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     if confirm_candle["close"] >= break_candle["close"]:
         return False, None, ""
 
-    # Body-size condition: average body of 7 range candles <= 50% of breakout candle's body
     range_bodies = [candle_body(c) for c in range_candles]
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
@@ -1662,7 +1728,7 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     _log("info", "RANGE_BREAK_SHORT",
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {smart_fmt(break_candle['close'])} < range low | "
-         f"Confirm close {confirm_candle['close']} < break close | "
+         f"Confirm close {smart_fmt(confirm_candle['close'])} < break close | "
          f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
     return True, confirm_candle_copy, "RANGE_BREAK_SHORT"
 
@@ -1680,7 +1746,6 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     if not is_bearish(breakout_candle):
         return False, None, ""
 
-    # Find repeated lows (at least 2 touches within VOL_EXP_TOLERANCE)
     lows = [c["low"] for c in prev_candles]
     repeated_low = None
     for low in lows:
@@ -1902,7 +1967,6 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     if confirm_candle["close"] <= break_candle["close"]:
         return False, None, ""
 
-    # Body-size condition: average body of 7 range candles <= 50% of breakout candle's body
     range_bodies = [candle_body(c) for c in range_candles]
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
@@ -1934,7 +1998,6 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
     if not is_bullish(breakout_candle):
         return False, None, ""
 
-    # Find repeated highs (at least 2 touches within VOL_EXP_TOLERANCE)
     highs = [c["high"] for c in prev_candles]
     repeated_high = None
     for high in highs:
@@ -2443,7 +2506,6 @@ class SRLevelManager:
         self.pending_swing_highs: List[float] = []
         self.pending_swing_lows: List[float] = []
 
-        # Track which candle indices have been fully processed
         self._processed_indices: set = set()
         self._last_processed_index = -1
 
@@ -2453,25 +2515,20 @@ class SRLevelManager:
         logger.debug(f"[S/R-DEBUG][{self.symbol}] {msg}")
 
     def _log_new_level(self, level_type: str, price: float) -> None:
-        """Log a new level detection."""
         _log("info", "S/R", f"[{self.symbol}] NEW {level_type} | {smart_fmt(price)}")
 
     def _log_merged_levels(self, level_type: str, prices: List[float], merged_price: float) -> None:
-        """Log when levels are merged."""
         price_strs = [smart_fmt(p) for p in prices]
         _log("info", "S/R", f"[{self.symbol}] MERGED | {' + '.join(price_strs)} → {smart_fmt(merged_price)}")
 
     def _log_filtered_levels(self, level_type: str, prices: List[float], merged_price: float) -> None:
-        """Log when levels are filtered by proximity."""
         price_strs = [smart_fmt(p) for p in prices]
         _log("info", "S/R", f"[{self.symbol}] FILTERED | {' + '.join(price_strs)} → {smart_fmt(merged_price)} | <{self.min_distance_percent}%")
 
     def _log_reclassified_level(self, old_type: str, new_type: str, price: float, current_price: float) -> None:
-        """Log when a level is reclassified."""
         _log("info", "S/R", f"[{self.symbol}] RECLASSIFIED | {old_type} → {new_type} | {smart_fmt(price)} | price={smart_fmt(current_price)}")
 
     def _log_final_levels(self) -> None:
-        """Log final support and resistance levels."""
         support_strs = [smart_fmt(l["price"]) for l in sorted(self.support_levels, key=lambda x: x["price"])]
         resistance_strs = [smart_fmt(l["price"]) for l in sorted(self.resistance_levels, key=lambda x: x["price"])]
 
@@ -2481,21 +2538,13 @@ class SRLevelManager:
         _log("info", "S/R", f"[{self.symbol}] FINAL | S: {s_str} | R: {r_str}")
 
     def _reclassify_levels_by_price(self, current_price: float) -> None:
-        """
-        Reclassify all levels based on current price:
-        - Level below current price → SUPPORT
-        - Level above current price → RESISTANCE
-        This ensures correct classification after price moves significantly.
-        """
         with self._lock:
             reclassified = []
 
-            # Process resistance levels
             new_resistances = []
             for level in self.resistance_levels:
                 price = level["price"]
                 if price < current_price:
-                    # Should be support
                     level_copy = dict(level)
                     level_copy["type"] = "SUPPORT"
                     self.support_levels.append(level_copy)
@@ -2505,12 +2554,10 @@ class SRLevelManager:
                     new_resistances.append(level)
             self.resistance_levels = new_resistances
 
-            # Process support levels
             new_supports = []
             for level in self.support_levels:
                 price = level["price"]
                 if price > current_price:
-                    # Should be resistance
                     level_copy = dict(level)
                     level_copy["type"] = "RESISTANCE"
                     self.resistance_levels.append(level_copy)
@@ -2520,23 +2567,18 @@ class SRLevelManager:
                     new_supports.append(level)
             self.support_levels = new_supports
 
-            # Remove duplicates (if a level was in both lists)
             self._deduplicate_levels()
 
             if reclassified:
                 self._progress_log(f"Reclassified {len(reclassified)} levels based on price {smart_fmt(current_price)}")
 
     def _deduplicate_levels(self) -> None:
-        """Remove duplicate levels within tolerance from both lists."""
-        # Deduplicate supports
         unique_supports = {}
         for level in self.support_levels:
             price = level["price"]
-            # Find if there's already a level within tolerance
             found = False
             for existing in list(unique_supports.values()):
                 if abs(existing["price"] - price) / max(price, 1) < self.merge_threshold:
-                    # Keep the one with higher strength
                     if level.get("strength", 1) > existing.get("strength", 1):
                         unique_supports[id(level)] = level
                     found = True
@@ -2545,7 +2587,6 @@ class SRLevelManager:
                 unique_supports[id(level)] = level
         self.support_levels = list(unique_supports.values())
 
-        # Deduplicate resistances
         unique_resistances = {}
         for level in self.resistance_levels:
             price = level["price"]
@@ -2561,11 +2602,9 @@ class SRLevelManager:
         self.resistance_levels = list(unique_resistances.values())
 
     def _merge_levels(self, levels: List[Dict], level_type: str) -> List[Dict]:
-        """Merge nearby levels using weighted average based on touches."""
         if not levels:
             return []
 
-        # Sort by price
         sorted_levels = sorted(levels, key=lambda x: x["price"])
         merged = []
         i = 0
@@ -2575,9 +2614,7 @@ class SRLevelManager:
             group = [current]
             j = i + 1
 
-            # Find all levels within merge threshold
             while j < len(sorted_levels):
-                # Check if next level is within threshold of current group
                 group_avg = sum(l["price"] for l in group) / len(group)
                 if abs(sorted_levels[j]["price"] - group_avg) / max(group_avg, 1) <= self.merge_threshold:
                     group.append(sorted_levels[j])
@@ -2588,7 +2625,6 @@ class SRLevelManager:
             if len(group) == 1:
                 merged.append(group[0])
             else:
-                # Merge the group into one level using weighted average
                 total_touches = sum(l.get("touches", 1) for l in group)
                 total_strength = sum(l.get("strength", 1) for l in group)
                 merged_price = 0.0
@@ -2604,7 +2640,6 @@ class SRLevelManager:
                 else:
                     merged_price = sum(l["price"] for l in group) / len(group)
 
-                # Create merged level
                 merged_level = {
                     "price": round(merged_price, 8),
                     "age": min(l.get("age", 0) for l in group),
@@ -2615,7 +2650,6 @@ class SRLevelManager:
                     "_original_prices": [l["price"] for l in group],
                 }
 
-                # Log the merge
                 self._log_merged_levels(level_type, [l["price"] for l in group], merged_price)
                 self._progress_log(f"Merged {level_type} levels: {[smart_fmt(l['price']) for l in group]} → {smart_fmt(merged_price)} (touches={total_touches}, strength={min(5, total_strength)})")
 
@@ -2626,14 +2660,9 @@ class SRLevelManager:
         return merged
 
     def _apply_final_proximity_filter(self, levels: List[Dict], level_type: str) -> List[Dict]:
-        """
-        Apply iterative minimum-distance filter to ensure no two levels of the same type
-        are closer than min_distance_percent. Runs iteratively until no pairs remain.
-        """
         if not levels:
             return []
 
-        # Make a mutable copy
         working = levels.copy()
         merged_count = 0
         iterations = 0
@@ -2643,7 +2672,6 @@ class SRLevelManager:
             if len(working) <= 1:
                 break
 
-            # Sort by price
             working.sort(key=lambda x: x["price"])
             merged_this_round = []
             new_working = []
@@ -2654,9 +2682,7 @@ class SRLevelManager:
                 group = [current]
                 j = i + 1
 
-                # Find all levels within the minimum distance threshold
                 while j < len(working):
-                    # Calculate percentage distance between current group avg and next level
                     group_avg = sum(l["price"] for l in group) / len(group)
                     dist_pct = abs(working[j]["price"] - group_avg) / max(group_avg, 1) * 100
 
@@ -2669,10 +2695,8 @@ class SRLevelManager:
                 if len(group) == 1:
                     new_working.append(group[0])
                 else:
-                    # Merge the group into one stronger level
                     merged_this_round.extend(group)
 
-                    # Weighted average for the final price
                     total_weight = 0.0
                     merged_price = 0.0
                     total_touches = 0
@@ -2693,7 +2717,6 @@ class SRLevelManager:
                     else:
                         merged_price = sum(l["price"] for l in group) / len(group)
 
-                    # Create merged level
                     merged_level = {
                         "price": round(merged_price, 8),
                         "age": min_age if min_age != float('inf') else 0,
@@ -2704,7 +2727,6 @@ class SRLevelManager:
                         "_proximity_prices": [l["price"] for l in group],
                     }
 
-                    # Log the proximity filter
                     self._log_filtered_levels(level_type, [l["price"] for l in group], merged_price)
                     self._progress_log(f"Proximity filtered {level_type}: {[smart_fmt(l['price']) for l in group]} → {smart_fmt(merged_price)} (touches={total_touches}, strength={min(5, total_strength)})")
 
@@ -2715,11 +2737,9 @@ class SRLevelManager:
 
             working = new_working
 
-            # If no merges happened this round, we're done
             if not merged_this_round:
                 break
 
-            # If we've done too many iterations, break to avoid infinite loops
             if iterations > 100:
                 self._progress_log(f"Proximity filter exceeded max iterations, stopping")
                 break
@@ -2727,14 +2747,12 @@ class SRLevelManager:
         return working
 
     def update_levels(self, candles: List[dict], initializing: bool = False) -> None:
-        """Main entry point for S/R level updates."""
         if len(candles) < self.lookback:
             self._progress_log(f"Not enough candles: {len(candles)} < {self.lookback}")
             return
 
         with self._lock:
             if initializing:
-                # INITIAL MODE: Process the complete history from scratch
                 self._progress_log(f"INITIAL SCAN STARTED | Candles={len(candles)}")
                 self._reset_all_levels()
                 self._processed_indices.clear()
@@ -2742,21 +2760,17 @@ class SRLevelManager:
 
                 self._run_initial_scan(candles)
 
-                # Mark all historical candles as processed
                 for i in range(len(candles)):
                     self._processed_indices.add(i)
                 self._last_processed_index = len(candles) - 1
 
-                # Merge levels after initial scan (local proximity)
                 self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
 
-                # RECLASSIFY: Fix classification based on current price
                 current_price = candles[-1]["close"] if candles else 0
                 if current_price > 0:
                     self._reclassify_levels_by_price(current_price)
 
-                # Apply final minimum-distance filter iteratively
                 self._progress_log(f"Final proximity filter | Threshold={self.min_distance_percent}%")
                 before_r = len(self.resistance_levels)
                 before_s = len(self.support_levels)
@@ -2772,13 +2786,10 @@ class SRLevelManager:
                 if before_s != after_s:
                     self._progress_log(f"SUPPORT filtered: {before_s} → {after_s}")
 
-                # Log final levels
                 self._log_final_levels()
             else:
-                # LIVE MODE: Process only newly closed candles
                 current_idx = len(candles) - 1
 
-                # Find unprocessed indices
                 unprocessed = []
                 for i in range(self._last_processed_index + 1, current_idx + 1):
                     if i not in self._processed_indices:
@@ -2790,36 +2801,28 @@ class SRLevelManager:
 
                 self._progress_log(f"LIVE INCREMENTAL UPDATE | New Candles={len(unprocessed)} | Range={unprocessed[0]}→{unprocessed[-1]}")
 
-                # Process each unprocessed candle
                 for idx in unprocessed:
-                    # Need enough context for swing detection
                     context_start = max(0, idx - SR_SWING_SENSITIVITY - 1)
                     context_end = min(len(candles), idx + SR_SWING_SENSITIVITY + 2)
                     context = candles[context_start:context_end]
 
                     self._process_candle_at_index(idx, context, candles)
 
-                    # Mark as processed
                     self._processed_indices.add(idx)
                     self._last_processed_index = max(self._last_processed_index, idx)
 
-                # Age all levels by 1 for each new candle
                 self._age_levels()
 
-                # Update strength for levels near current price
                 if candles:
                     self._update_level_strength(candles)
 
-                # Merge levels after live update (local proximity)
                 self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
 
-                # RECLASSIFY: Fix classification based on current price
                 current_price = candles[-1]["close"] if candles else 0
                 if current_price > 0:
                     self._reclassify_levels_by_price(current_price)
 
-                # Apply final minimum-distance filter iteratively on live updates
                 before_r = len(self.resistance_levels)
                 before_s = len(self.support_levels)
 
@@ -2832,26 +2835,21 @@ class SRLevelManager:
                 if before_r != after_r or before_s != after_s:
                     self._progress_log(f"Live update filtered | RESISTANCE: {before_r}→{after_r} | SUPPORT: {before_s}→{after_s}")
 
-                # Log final levels
                 self._log_final_levels()
 
     def _reset_all_levels(self) -> None:
-        """Reset all level data for a fresh initial scan."""
         self.resistance_levels.clear()
         self.support_levels.clear()
         self.pending_swing_highs.clear()
         self.pending_swing_lows.clear()
 
     def _run_initial_scan(self, candles: List[dict]) -> None:
-        """Perform a complete historical scan for S/R levels."""
         n = len(candles)
         sensitivity = SR_SWING_SENSITIVITY
 
         self._progress_log(f"Initial scan over {n} candles with sensitivity={sensitivity}")
 
-        # Detect all swing points in the entire historical dataset
         for i in range(sensitivity, n - sensitivity):
-            # Check for swing high
             is_high = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["high"] <= candles[i - j]["high"] or candles[i]["high"] <= candles[i + j]["high"]:
@@ -2859,7 +2857,6 @@ class SRLevelManager:
                     break
             if is_high:
                 price = candles[i]["high"]
-                # Check if this level already exists (prevent duplicates)
                 if not self._level_exists(self.resistance_levels, price):
                     new_level = {
                         "price": price,
@@ -2874,7 +2871,6 @@ class SRLevelManager:
                     self._log_new_level("RESISTANCE", price)
                     self._progress_log(f"New RESISTANCE at {smart_fmt(price)} (index {i})")
 
-            # Check for swing low
             is_low = True
             for j in range(1, sensitivity + 1):
                 if candles[i]["low"] >= candles[i - j]["low"] or candles[i]["low"] >= candles[i + j]["low"]:
@@ -2896,21 +2892,17 @@ class SRLevelManager:
                     self._log_new_level("SUPPORT", price)
                     self._progress_log(f"New SUPPORT at {smart_fmt(price)} (index {i})")
 
-        # Update strength and touches based on price proximity
         self._update_level_strength(candles)
 
         self._progress_log(f"Initial scan complete: {len(self.support_levels)} supports, {len(self.resistance_levels)} resistances")
 
     def _process_candle_at_index(self, idx: int, context: List[dict], full_candles: List[dict]) -> None:
-        """Process a single candle for S/R detection in live mode."""
         if len(context) < SR_SWING_SENSITIVITY * 2 + 1:
             return
 
         sensitivity = SR_SWING_SENSITIVITY
-        # The candle we're checking is at position sensitivity in the context
         check_pos = sensitivity
 
-        # Check for swing high
         is_high = True
         for j in range(1, sensitivity + 1):
             if (check_pos - j < 0 or check_pos + j >= len(context)):
@@ -2934,7 +2926,6 @@ class SRLevelManager:
                 self._log_new_level("RESISTANCE", price)
                 self._progress_log(f"New RESISTANCE at {smart_fmt(price)}")
 
-        # Check for swing low
         is_low = True
         for j in range(1, sensitivity + 1):
             if (check_pos - j < 0 or check_pos + j >= len(context)):
@@ -2959,20 +2950,17 @@ class SRLevelManager:
                 self._progress_log(f"New SUPPORT at {smart_fmt(price)}")
 
     def _level_exists(self, levels: List[Dict], price: float, tolerance: float = 0.002) -> bool:
-        """Check if a level with this price already exists."""
         for level in levels:
             if abs(level["price"] - price) / max(price, 1) < tolerance:
                 return True
         return False
 
     def _update_level_strength(self, candles: List[dict]) -> None:
-        """Update strength and touches for all levels based on price proximity."""
         if not candles:
             return
         current_price = candles[-1]["close"]
         threshold = current_price * SR_PRICE_TOUCH_THRESHOLD
 
-        # Update resistance levels
         for level in self.resistance_levels:
             if abs(level["price"] - current_price) <= threshold:
                 level["strength"] = min(5, level["strength"] + 1)
@@ -2980,7 +2968,6 @@ class SRLevelManager:
                 level["age"] = 0
                 self._progress_log(f"RESISTANCE touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
 
-        # Update support levels
         for level in self.support_levels:
             if abs(level["price"] - current_price) <= threshold:
                 level["strength"] = min(5, level["strength"] + 1)
@@ -2989,10 +2976,8 @@ class SRLevelManager:
                 self._progress_log(f"SUPPORT touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
 
     def _age_levels(self) -> List[Dict]:
-        """Age all levels by 1 and remove expired ones."""
         expired_levels = []
 
-        # Age resistance levels
         new_resistances = []
         for level in self.resistance_levels:
             effective_max_age = self.max_age + (level["strength"] * 15)
@@ -3004,7 +2989,6 @@ class SRLevelManager:
                 self._progress_log(f"RESISTANCE expired: {smart_fmt(level['price'])} (age {level['age']}/{effective_max_age})")
         self.resistance_levels = new_resistances
 
-        # Age support levels
         new_supports = []
         for level in self.support_levels:
             effective_max_age = self.max_age + (level["strength"] * 15)
@@ -3019,7 +3003,6 @@ class SRLevelManager:
         return expired_levels
 
     def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
-        """Check for broken levels and handle replacements."""
         if len(candles) < 3:
             return
 
@@ -3029,7 +3012,6 @@ class SRLevelManager:
         if not break_candle or not confirm_candle:
             return
 
-        # Check resistance levels
         for i, level in enumerate(self.resistance_levels):
             resistance_price = level["price"]
             if break_candle["close"] > resistance_price:
@@ -3064,7 +3046,6 @@ class SRLevelManager:
                         )
                     break
 
-        # Check support levels
         for i, level in enumerate(self.support_levels):
             support_price = level["price"]
             if break_candle["close"] < support_price:
@@ -3540,7 +3521,6 @@ class DailyLossTracker:
             self._day = today
 
     def update_capital(self, new_capital: float) -> None:
-        """Update the trading capital reference for daily loss limit calculations."""
         with self._lock:
             old_capital = self.trading_capital
             self.trading_capital = new_capital
@@ -3555,12 +3535,12 @@ class DailyLossTracker:
                 loss_amount = abs(realized_pnl)
                 self.daily_loss_usd += loss_amount
                 _log("warning", "DAILY-LOSS",
-                     f"Balance-derived loss: ${loss_amount:.2f} | Daily loss total: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
+                     f"Trade-derived loss: ${loss_amount:.2f} | Daily loss total: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
             else:
                 profit_amount = realized_pnl
                 self.daily_loss_usd = max(0.0, self.daily_loss_usd - profit_amount)
                 _log("info", "DAILY-LOSS",
-                     f"Balance-derived profit: ${profit_amount:.2f} | Daily loss total reduced to: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
+                     f"Trade-derived profit: ${profit_amount:.2f} | Daily loss total reduced to: ${self.daily_loss_usd:.2f} / ${limit:.2f}")
             if limit > 0 and self.notifier and self.daily_loss_usd >= limit * 0.8:
                 self.notifier.send_daily_loss_warning(self.daily_loss_usd, limit)
             if limit > 0 and self.notifier and self.daily_loss_usd >= limit:
@@ -3625,15 +3605,19 @@ class TradingBot:
         self._last_closed_time: Dict[str, int] = {}
         self._candle_locks: Dict[str, threading.Lock] = {}
 
-        # Post-exit cooldown tracking (per symbol)
-        # Maps symbol -> number of closed candles still to wait
         self._post_exit_cooldown: Dict[str, int] = {}
 
         self._trade_lock = threading.Lock()
         self.active_trades: Dict[str, dict] = {}
 
-        # Capital management lock - protects trading_capital updates
         self._capital_lock = threading.Lock()
+
+        self._last_known_external_balance: Optional[float] = None
+        self._open_trade_balance_snapshots: Dict[str, float] = {}
+        self._last_external_flow_fingerprint: Optional[Tuple[float, float, float]] = None
+        self._external_flow_lock = threading.Lock()
+        self._external_flow_monitor_thread: Optional[threading.Thread] = None
+        self._external_flow_monitor_stop = threading.Event()
 
         self.signals: List[dict] = []
         self.sl_events: List[dict] = []
@@ -3683,80 +3667,171 @@ class TradingBot:
             except Exception as e:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
 
-    def _refresh_capital_from_exchange(self, reason: str = "TRADE_EXECUTED") -> Optional[float]:
-        """
-        Fetch the actual USD balance from Delta Exchange and update trading_capital.
-        This is the single source of truth for capital management. Also updates the
-        daily loss tracker's capital reference and sends an email notification
-        showing the old balance, new balance, and the difference.
-        Thread-safe via _capital_lock.
-        Returns the new balance (or None if refresh failed).
-        """
-        try:
-            new_balance = self.rest.get_usd_balance()
-            if new_balance <= 0:
-                _log("warning", "CAPITAL",
-                     f"Balance refresh returned ${new_balance:,.2f} - "
-                     f"keeping current trading_capital ${self.trading_capital:,.2f}")
-                return None
+    # ------------------------------------------------------------------
+    # EXTERNAL BALANCE FLOW DETECTION (works even while a trade is open)
+    # ------------------------------------------------------------------
+
+    def _compute_expected_balance_for_open_trades(self) -> Optional[float]:
+        with self._trade_lock:
+            open_syms = [s for s, t in self.active_trades.items()
+                         if isinstance(t, dict) and not t.get("_reserved")]
+
+        if not open_syms:
+            return self._last_known_external_balance
+
+        total = 0.0
+        have_any = False
+        for sym in open_syms:
+            snap = self._open_trade_balance_snapshots.get(sym)
+            if snap is not None:
+                total += snap
+                have_any = True
+        if not have_any:
+            return self._last_known_external_balance
+        return total
+
+    def _check_external_balance_flow(self) -> None:
+        if self.paper:
+            return
+
+        with self._external_flow_lock:
+            try:
+                current_balance = self.rest.get_usd_balance()
+            except Exception as e:
+                _log_exc("EXTERNAL-FLOW", f"Failed to fetch balance for external-flow check: {e}")
+                return
+
+            if current_balance is None or current_balance <= 0:
+                return
+
+            expected = self._compute_expected_balance_for_open_trades()
+
+            if expected is None:
+                self._last_known_external_balance = current_balance
+                return
+
+            difference = current_balance - expected
+
+            if abs(difference) < EXTERNAL_FLOW_MIN_USD:
+                self._update_open_trade_snapshots(current_balance)
+                if not self._has_open_trades():
+                    self._last_known_external_balance = current_balance
+                return
+
+            fingerprint = (round(expected, 2), round(current_balance, 2), round(difference, 2))
+            if fingerprint == self._last_external_flow_fingerprint:
+                _log("debug", "EXTERNAL-FLOW",
+                     f"Skipping duplicate external-flow alert for fingerprint {fingerprint}")
+                self._update_open_trade_snapshots(current_balance)
+                if not self._has_open_trades():
+                    self._last_known_external_balance = current_balance
+                return
+
+            flow_type = "DEPOSIT" if difference > 0 else "WITHDRAWAL"
+            during_trade = self._has_open_trades()
+
+            _log("warning", "EXTERNAL-FLOW",
+                 f"External {flow_type} detected "
+                 f"{'(trade open)' if during_trade else '(no trade open)'} | "
+                 f"EXPECTED=${expected:,.2f} | ACTUAL=${current_balance:,.2f} | "
+                 f"DIFF=${difference:+,.2f}")
 
             with self._capital_lock:
-                old_capital = self.trading_capital
-                self.trading_capital = new_balance
-                self.daily_loss_tracker.update_capital(new_balance)
+                self.trading_capital = current_balance
+                self.daily_loss_tracker.update_capital(current_balance)
 
-            difference = new_balance - old_capital
-            if difference > 0:
-                direction_text = "INCREASED"
-                diff_display = f"+${difference:,.2f}"
-            elif difference < 0:
-                direction_text = "DECREASED"
-                diff_display = f"-${abs(difference):,.2f}"
-            else:
-                direction_text = "UNCHANGED"
-                diff_display = "$0.00"
-
-            _log("info", "CAPITAL",
-                 f"Balance refresh ({reason}) | "
-                 f"OLD: ${old_capital:,.2f} | "
-                 f"NEW: ${new_balance:,.2f} | "
-                 f"DIFF: {diff_display} | "
-                 f"trading_capital updated to ${new_balance:,.2f}")
+            # Attribute the flow to each open trade so the trade's P&L
+            # calculation on close can back it out.
+            if during_trade:
+                with self._trade_lock:
+                    open_syms = [s for s, t in self.active_trades.items()
+                                 if isinstance(t, dict) and not t.get("_reserved")]
+                # Split evenly if multiple trades open (rare, but safe).
+                n = max(1, len(open_syms))
+                per_trade = difference / n
+                for sym in open_syms:
+                    t = self.active_trades.get(sym)
+                    if isinstance(t, dict):
+                        t["external_flow_during_trade"] = (
+                            float(t.get("external_flow_during_trade", 0.0)) + per_trade
+                        )
 
             if self.notifier:
                 try:
-                    self.notifier.send_capital_update(
-                        old_balance=old_capital,
-                        new_balance=new_balance,
-                        reason=reason,
+                    self.notifier.send_external_flow_alert(
+                        old_balance=expected,
+                        new_balance=current_balance,
+                        flow_type=flow_type,
+                        reason="EXTERNAL_BALANCE_CHANGE",
+                        during_open_trade=during_trade,
                     )
                 except Exception as e:
-                    _log_exc("CAPITAL", f"Failed to send capital update email: {e}")
+                    _log_exc("EXTERNAL-FLOW", f"Failed to send external-flow email: {e}")
 
-            return new_balance
+            self._last_external_flow_fingerprint = fingerprint
+            self._update_open_trade_snapshots(current_balance)
+            if not self._has_open_trades():
+                self._last_known_external_balance = current_balance
 
-        except Exception as e:
-            _log_exc("CAPITAL", f"Balance refresh failed (keeping current trading_capital ${self.trading_capital:,.2f}): {e}")
-            return None
+    def _has_open_trades(self) -> bool:
+        with self._trade_lock:
+            return any(isinstance(t, dict) and not t.get("_reserved")
+                       for t in self.active_trades.values())
+
+    def _update_open_trade_snapshots(self, current_balance: float) -> None:
+        with self._trade_lock:
+            open_syms = [s for s, t in self.active_trades.items()
+                         if isinstance(t, dict) and not t.get("_reserved")]
+        for sym in open_syms:
+            self._open_trade_balance_snapshots[sym] = current_balance
+
+    def _register_open_trade_snapshot(self, symbol: str, balance: float) -> None:
+        self._open_trade_balance_snapshots[symbol] = balance
+
+    def _clear_open_trade_snapshot(self, symbol: str) -> None:
+        self._open_trade_balance_snapshots.pop(symbol, None)
+
+    # ------------------------------------------------------------------
+    # BACKGROUND EXTERNAL-FLOW MONITOR
+    # ------------------------------------------------------------------
+
+    def _start_external_flow_monitor(self) -> None:
+        if self.paper:
+            return
+        if self._external_flow_monitor_thread and self._external_flow_monitor_thread.is_alive():
+            return
+        self._external_flow_monitor_stop.clear()
+        self._external_flow_monitor_thread = threading.Thread(
+            target=self._external_flow_monitor_loop,
+            daemon=True, name="ExternalFlowMonitor"
+        )
+        self._external_flow_monitor_thread.start()
+        _log("info", "EXTERNAL-FLOW",
+             f"External-flow monitor started (every {EXTERNAL_FLOW_MONITOR_INTERVAL}s, "
+             f"threshold ${EXTERNAL_FLOW_MIN_USD:.2f})")
+
+    def _external_flow_monitor_loop(self) -> None:
+        while not self._external_flow_monitor_stop.is_set():
+            for _ in range(EXTERNAL_FLOW_MONITOR_INTERVAL):
+                if self._external_flow_monitor_stop.is_set():
+                    return
+                time.sleep(1)
+            try:
+                self._check_external_balance_flow()
+            except Exception as e:
+                _log_exc("EXTERNAL-FLOW", f"Background external-flow monitor error: {e}")
+
+    def _stop_external_flow_monitor(self) -> None:
+        self._external_flow_monitor_stop.set()
+        if self._external_flow_monitor_thread and self._external_flow_monitor_thread.is_alive():
+            self._external_flow_monitor_thread.join(timeout=5.0)
+
+    # ------------------------------------------------------------------
+    # TRADE CLOSE (trade P&L only - separated from external flows)
+    # ------------------------------------------------------------------
 
     def _close_trade(self, symbol: str, trade: dict, reason: str,
                       exit_price: Optional[float] = None) -> None:
-        """
-        Close a trade.
-
-        LIVE mode: realized P&L is derived EXCLUSIVELY from the Delta Exchange
-        account balance difference:
-            realized_pnl = new_balance - old_balance
-        where old_balance is the confirmed balance captured immediately before
-        the trade was opened (stored on the trade record as 'balance_at_open'),
-        and new_balance is fetched after the position is fully closed.
-
-        No local entry_price -> exit_price -> position_size P&L is calculated,
-        stored, logged, displayed, or used in LIVE mode for any purpose.
-
-        PAPER mode: has no exchange balance, so we record $0.00 realized P&L
-        for the Daily Loss Tracker.
-        """
         try:
             entry = trade["entry"]
             direction = trade.get("direction", "SHORT")
@@ -3764,8 +3839,6 @@ class TradingBot:
 
             _log("info", "TRADE-CLOSE", f"Closing trade: {symbol} {direction} | Reason: {reason}")
 
-            # Determine the exit price for logging/reference purposes only.
-            # This is NOT used to compute P&L in LIVE mode.
             local_exit_price: Optional[float] = None
             if exit_price is not None and exit_price > 0:
                 local_exit_price = float(exit_price)
@@ -3778,17 +3851,16 @@ class TradingBot:
                 if store:
                     local_exit_price = float(list(store)[-1]["close"])
 
-            # Snapshot the balance we recorded immediately before the trade
-            # was opened. This is the "old_balance" for the LIVE P&L calculation.
-            old_balance_at_open = trade.get("balance_at_open")
-            if old_balance_at_open is None or old_balance_at_open <= 0:
+            balance_before_entry = trade.get("balance_before_entry")
+            if balance_before_entry is None or balance_before_entry <= 0:
                 with self._capital_lock:
-                    old_balance_at_open = self.trading_capital
+                    balance_before_entry = self.trading_capital
                 _log("warning", "TRADE-CLOSE",
-                     f"[{symbol}] 'balance_at_open' was missing on the trade record - "
-                     f"falling back to current trading_capital ${old_balance_at_open:,.2f}")
+                     f"[{symbol}] 'balance_before_entry' was missing on the trade record - "
+                     f"falling back to current trading_capital ${balance_before_entry:,.2f}")
 
-            # ---- CLOSE THE EXCHANGE POSITION ----
+            external_flow_during_trade = float(trade.get("external_flow_during_trade", 0.0))
+
             close_succeeded = True
             if not self.paper:
                 pid = trade.get("product_id")
@@ -3802,68 +3874,63 @@ class TradingBot:
                     else:
                         _log("info", "TRADE-CLOSE",
                              f"Closed position on Delta: product_id={pid}, size={size}, side={close_side}")
-                        # Allow the exchange to settle the close before fetching balance.
                         time.sleep(2)
 
-            # ---- DERIVE REALIZED P&L ----
-            realized_pnl = 0.0
-            new_balance: Optional[float] = None
+            trade_pnl = 0.0
+            final_balance: Optional[float] = None
 
             if not self.paper:
-                # ============================================================
-                # LIVE MODE - BALANCE-DERIVED P&L ONLY
-                # No local entry/exit P&L is calculated anywhere in this path.
-                # ============================================================
                 if not close_succeeded:
                     _log("error", "TRADE-CLOSE",
-                         f"[{symbol}] skipping balance-derived P&L because the close order "
-                         f"failed. Daily Loss Tracker will NOT be updated for this trade. "
+                         f"[{symbol}] skipping trade P&L because the close order failed. "
+                         f"Daily Loss Tracker will NOT be updated for this trade. "
                          f"Manual intervention required.")
                 else:
-                    new_balance = self.rest.get_usd_balance()
-                    if new_balance is None or new_balance <= 0:
+                    final_balance = self.rest.get_usd_balance()
+                    if final_balance is None or final_balance <= 0:
                         _log("error", "TRADE-CLOSE",
                              f"[{symbol}] could not fetch a valid post-close balance "
-                             f"(got {new_balance}). Realized PnL for the Daily Loss Tracker "
-                             f"will NOT be recorded for this trade. Manual verification required.")
+                             f"(got {final_balance}). Trade P&L will NOT be recorded "
+                             f"for this trade. Manual verification required.")
                     else:
-                        realized_pnl = new_balance - old_balance_at_open
+                        raw_difference = final_balance - balance_before_entry
+                        trade_pnl = raw_difference - external_flow_during_trade
+
                         _log("info", "TRADE-CLOSE",
-                             f"Balance-derived realized PnL for {symbol}: "
-                             f"OLD=${old_balance_at_open:,.2f} | "
-                             f"NEW=${new_balance:,.2f} | "
-                             f"PnL=${realized_pnl:,.2f}")
+                             f"Trade P&L for {symbol}: "
+                             f"OLD=${balance_before_entry:,.2f} | "
+                             f"NEW=${final_balance:,.2f} | "
+                             f"RawDiff=${raw_difference:,.2f} | "
+                             f"ExternalDuringTrade=${external_flow_during_trade:+,.2f} | "
+                             f"TradePnL=${trade_pnl:,.2f}")
 
-                        # Update capital to the freshly fetched balance.
                         with self._capital_lock:
-                            self.trading_capital = new_balance
-                            self.daily_loss_tracker.update_capital(new_balance)
+                            self.trading_capital = final_balance
+                            self.daily_loss_tracker.update_capital(final_balance)
+                        if not self._has_open_trades():
+                            self._last_known_external_balance = final_balance
 
-                        # Notify about the capital change.
                         if self.notifier:
                             try:
                                 self.notifier.send_capital_update(
-                                    old_balance=old_balance_at_open,
-                                    new_balance=new_balance,
+                                    old_balance=balance_before_entry,
+                                    new_balance=final_balance,
                                     reason=f"TRADE_CLOSED_{reason}",
                                 )
                             except Exception as e:
                                 _log_exc("TRADE-CLOSE", f"Failed to send capital update email after close: {e}")
             else:
-                # PAPER mode has no real exchange balance. We record $0.00 realized
-                # PnL for the Daily Loss Tracker since we cannot derive a balance-
-                # based value. No local entry/exit math is used here.
                 _log("info", "TRADE-CLOSE",
-                     f"PAPER mode - no exchange balance available; realized PnL recorded "
+                     f"PAPER mode - no exchange balance available; trade PnL recorded "
                      f"as $0.00 for the Daily Loss Tracker for {symbol}.")
 
-            # ---- RECORD TRADE CLOSE METADATA ----
             trade["close_reason"] = reason
             trade["close_time"] = datetime.now(timezone.utc).isoformat()
-            trade["realized_pnl"] = realized_pnl
-            trade["balance_at_open"] = old_balance_at_open
-            if new_balance is not None:
-                trade["balance_at_close"] = new_balance
+            trade["realized_pnl"] = trade_pnl
+            trade["balance_before_entry"] = balance_before_entry
+            trade["external_flow_during_trade"] = external_flow_during_trade
+            if final_balance is not None:
+                trade["balance_at_close"] = final_balance
             if local_exit_price is not None:
                 trade["exit_price"] = local_exit_price
 
@@ -3874,9 +3941,10 @@ class TradingBot:
                     "time": datetime.now(timezone.utc).isoformat(),
                     "symbol": symbol, "entry": entry,
                     "take_profit": tp, "direction": direction,
-                    "realized_pnl": realized_pnl, "reason": reason,
-                    "balance_at_open": old_balance_at_open,
-                    "balance_at_close": new_balance,
+                    "realized_pnl": trade_pnl, "reason": reason,
+                    "balance_before_entry": balance_before_entry,
+                    "balance_at_close": final_balance,
+                    "external_flow_during_trade": external_flow_during_trade,
                 })
             else:
                 sl = local_exit_price or trade["stop_loss"]
@@ -3885,15 +3953,13 @@ class TradingBot:
                     "time": datetime.now(timezone.utc).isoformat(),
                     "symbol": symbol, "entry": entry,
                     "stop_loss": sl, "direction": direction,
-                    "realized_pnl": realized_pnl,
-                    "balance_at_open": old_balance_at_open,
-                    "balance_at_close": new_balance,
+                    "realized_pnl": trade_pnl,
+                    "balance_before_entry": balance_before_entry,
+                    "balance_at_close": final_balance,
+                    "external_flow_during_trade": external_flow_during_trade,
                 })
 
-            # ---- FEED THE DAILY LOSS TRACKER ----
-            # The balance-derived PnL is the ONLY source fed into the tracker
-            # in LIVE mode. No local P&L is added.
-            self.daily_loss_tracker.update_with_realized_pnl(realized_pnl)
+            self.daily_loss_tracker.update_with_realized_pnl(trade_pnl)
 
             with self._capital_lock:
                 limit = self.trading_capital * self.daily_loss_limit_pct
@@ -3901,7 +3967,7 @@ class TradingBot:
                  f"Trade Closed: {symbol} {direction} | Reason: {reason} | "
                  f"Exit Price: {smart_fmt(local_exit_price) if local_exit_price else 'N/A'} | "
                  f"Size: {size} | "
-                 f"Balance-derived Realized PnL: ${realized_pnl:.2f} | "
+                 f"Trade PnL: ${trade_pnl:.2f} | "
                  f"Daily Loss Total: ${self.daily_loss_tracker.daily_loss_usd:.2f} | "
                  f"Daily Loss Limit: ${limit:.2f}")
 
@@ -3912,22 +3978,26 @@ class TradingBot:
                         self.notifier.send_supertrend_exit(
                             symbol=symbol, direction=direction, entry=entry,
                             exit_price=ep if ep else entry,
-                            realized_pnl=realized_pnl,
+                            realized_pnl=trade_pnl,
                             timeframe=self.timeframe,
                             mode="PAPER" if self.paper else "LIVE",
                         )
                     else:
                         trade_copy = trade.copy()
                         trade_copy["symbol"] = symbol
-                        self.notifier.send_trade_closed(trade_copy, reason, abs(realized_pnl))
+                        self.notifier.send_trade_closed(trade_copy, reason, abs(trade_pnl))
                 except Exception as e:
                     _log_exc("TRADE-CLOSE", f"Notifier error while closing {symbol} (trade still closed correctly): {e}")
         except Exception as e:
             _log_exc("TRADE-CLOSE", f"Unexpected error while closing {symbol} - attempting cleanup anyway: {e}")
         finally:
+            self._clear_open_trade_snapshot(symbol)
             self._cleanup_trade(symbol)
-            # Start post-exit cooldown for this symbol (2 complete candles).
             self._start_post_exit_cooldown(symbol)
+            try:
+                self._check_external_balance_flow()
+            except Exception as e:
+                _log_exc("EXTERNAL-FLOW", f"Post-close external-flow check failed: {e}")
 
     def _cleanup_trade(self, symbol: str) -> None:
         with self._trade_lock:
@@ -3935,7 +4005,6 @@ class TradingBot:
         self._log("info", "CLEANUP", f"Trade record removed for {symbol}")
 
     def _start_post_exit_cooldown(self, symbol: str) -> None:
-        """Begin a 2-closed-candle cooldown for the given symbol."""
         self._post_exit_cooldown[symbol] = POST_EXIT_COOLDOWN_CANDLES
         self._log(
             "info", "COOLDOWN",
@@ -3944,7 +4013,6 @@ class TradingBot:
         )
 
     def _tick_post_exit_cooldown(self, symbol: str) -> None:
-        """Called for each new closed candle to advance the cooldown counter."""
         remaining = self._post_exit_cooldown.get(symbol)
         if remaining is None:
             return
@@ -4020,7 +4088,6 @@ class TradingBot:
             )
             if reversed_trend:
                 _log("info", "ST-EXIT", f"[{symbol}] {direction} - Both SuperTrends REVERSED.")
-                # Use the last closed candle's close as the ST exit reference price.
                 st_exit_price = closed_candles[-1]["close"] if closed_candles else None
                 print()
                 print(f"  [ST REVERSAL EXIT] {symbol} {direction}")
@@ -4100,7 +4167,6 @@ class TradingBot:
         self._log("info", "STARTUP", "STEP  7/15: Running initial Support/Resistance detection on historical data...")
         self._run_initial_sr_detection()
 
-        # Collect final filtered S/R levels for the startup email
         sr_levels_for_email: Dict[str, Dict[str, List[dict]]] = {}
         for sym in self.symbols:
             sr_manager = self.sr_managers.get(sym)
@@ -4115,6 +4181,17 @@ class TradingBot:
             self.notifier.send_startup_report(
                 self.config, self.symbols, sr_levels_for_email
             )
+
+        if not self.paper:
+            try:
+                initial_balance = self.rest.get_usd_balance()
+                if initial_balance and initial_balance > 0:
+                    self._last_known_external_balance = initial_balance
+                    _log("info", "EXTERNAL-FLOW",
+                         f"External-flow baseline seeded with current balance "
+                         f"${initial_balance:,.2f}")
+            except Exception as e:
+                _log_exc("EXTERNAL-FLOW", f"Failed to seed external-flow baseline: {e}")
 
         self._log("info", "STARTUP", "STEP  8/15: Validating indicator/strategy data readiness...")
         self._validate_indicator_readiness()
@@ -4169,8 +4246,9 @@ class TradingBot:
         self._pipeline_ready.set()
         self._log("info", "STARTUP", "STEP 14/15: Data pipeline healthy - STRATEGY EVALUATION ENABLED.")
 
-        self._log("info", "STARTUP", "STEP 15/15: Starting watchdog and background health monitoring...")
+        self._log("info", "STARTUP", "STEP 15/15: Starting watchdog and external-flow monitor...")
         self._start_watchdog()
+        self._start_external_flow_monitor()
 
         self._log("info", "STARTUP", "Startup sequence complete - bot is fully operational.")
 
@@ -4179,6 +4257,7 @@ class TradingBot:
         self._watchdog_stop.set()
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             self._watchdog_thread.join(timeout=5.0)
+        self._stop_external_flow_monitor()
         if self.ws_manager:
             self.ws_manager.stop()
         self._log("info", "BOT", "Bot stopped.")
@@ -4547,9 +4626,6 @@ class TradingBot:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
             if symbol not in self.active_trades:
-                # Advance post-exit cooldown for this symbol (if any) since a
-                # new closed candle has arrived. This happens even if we
-                # subsequently skip evaluation.
                 if self._post_exit_cooldown.get(symbol, 0) > 0:
                     self._tick_post_exit_cooldown(symbol)
 
@@ -4712,7 +4788,6 @@ class TradingBot:
                     self._log("info", "SIGNAL", f"[{symbol}] {direction} {strategy_name} REJECTED: Active trade exists")
                     return
 
-                # Snapshot current capital for the signal record.
                 with self._capital_lock:
                     current_capital = self.trading_capital
 
@@ -4748,7 +4823,8 @@ class TradingBot:
                         "open_time": datetime.now(timezone.utc).isoformat(),
                         "strategy": strategy_name, "rsi": rsi_value,
                         "st_mode": False, "no_rsi": no_rsi,
-                        "balance_at_open": current_capital,
+                        "balance_before_entry": current_capital,
+                        "external_flow_during_trade": 0.0,
                     }
 
             rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
@@ -4843,14 +4919,11 @@ class TradingBot:
                 self._cleanup_trade(symbol)
                 return
 
-            # Snapshot the confirmed account balance immediately before placing
-            # the trade. This becomes the "old_balance" reference for the
-            # balance-derived realized P&L calculation on close.
-            balance_at_open = self.rest.get_usd_balance() or 0.0
-            if balance_at_open <= 0:
-                balance_at_open = capital
+            balance_before_entry = self.rest.get_usd_balance() or 0.0
+            if balance_before_entry <= 0:
+                balance_before_entry = capital
             _log("info", "TRADE",
-                 f"[{symbol}] Balance snapshot immediately before entry: ${balance_at_open:,.2f}")
+                 f"[{symbol}] Balance snapshot immediately before entry: ${balance_before_entry:,.2f}")
 
             side = "sell" if direction == "SHORT" else "buy"
             entry_result = self.rest.place_order(
@@ -4882,15 +4955,6 @@ class TradingBot:
 
             print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | filled={actual_filled_size} contracts")
 
-            # ----------------------------------------------------------
-            # CAPITAL MANAGEMENT: Immediately refresh balance after fill.
-            # The refreshed balance becomes the new trading_capital. Note:
-            # we do NOT overwrite 'balance_at_open' here - the snapshot taken
-            # before the entry is the correct reference for this trade's
-            # realized P&L.
-            # ----------------------------------------------------------
-            self._refresh_capital_from_exchange(reason="TRADE_FILLED")
-
             bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
             bracket_ok = bracket_result and "error" not in bracket_result
 
@@ -4918,15 +4982,18 @@ class TradingBot:
                 "bracket_tp_ok": bracket_ok,
                 "st_mode": False,
                 "no_rsi": signal.get("no_rsi", False),
-                "balance_at_open": balance_at_open,
+                "balance_before_entry": balance_before_entry,
+                "external_flow_during_trade": 0.0,
             }
 
             with self._trade_lock:
                 self.active_trades[symbol] = trade_record
 
+            self._register_open_trade_snapshot(symbol, balance_before_entry)
+
             _log("info", "TRADE",
-                 f"[{symbol}] Trade opened. balance_at_open=${balance_at_open:,.2f} "
-                 f"(will be used to derive realized PnL on close)")
+                 f"[{symbol}] Trade opened. balance_before_entry=${balance_before_entry:,.2f} "
+                 f"(will be used to derive trade PnL on close)")
 
             if self.notifier:
                 try:
@@ -5117,6 +5184,11 @@ class TradingBot:
                             f"'[EVAL-SKIP]' entries for {sym}."
                         )
 
+        try:
+            self._check_external_balance_flow()
+        except Exception as e:
+            _log_exc("EXTERNAL-FLOW", f"Watchdog external-flow check failed: {e}")
+
         self._reconcile_watchdog_issues(current_issues)
 
     def _reconcile_watchdog_issues(self, current_issues: Dict[str, str]) -> None:
@@ -5229,9 +5301,9 @@ class TradingBot:
         print()
         print("+========================================================+")
         print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
-        print("|   FIX: Clean concise S/R logs showing:                  |")
-        print("|   NEW → MERGED → RECLASSIFIED → FILTERED → FINAL       |")
-        print("|   All S/R levels clearly tracked through the pipeline.  |")
+        print("|   CAPITAL LOGIC: trade P&L and external flows are      |")
+        print("|   fully separated. External deposits/withdrawals are   |")
+        print("|   detected CONTINUOUSLY, even while a trade is open.   |")
         print("+========================================================+")
         print()
 
@@ -5281,12 +5353,17 @@ class TradingBot:
               f"subscribe-confirm / first-live-data, bounded timeouts as a safety net only)")
         print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} complete closed candle(s) "
               f"per symbol after any trade exit before strategy evaluation resumes")
-        print(f"  PnL Source        : DELTA EXCHANGE BALANCE DIFFERENCE (single source of truth)")
-        print(f"  PnL Calculation   : realized_pnl = new_balance - old_balance (LIVE mode ONLY)")
+        print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry - external_flows)")
+        print(f"  PnL Calculation   : realized_pnl = raw_diff - external_flows_during_trade")
         print(f"  PnL Local         : DISABLED in LIVE mode (no entry/exit local P&L)")
         print(f"  Capital Source    : DELTA EXCHANGE BALANCE (single source of truth)")
-        print(f"  Capital Refresh   : After every successfully filled/executed trade + on close")
-        print(f"  Capital Email     : ENABLED (shows OLD, NEW, and DIFFERENCE)")
+        print(f"  Capital Refresh   : After every trade close + on external deposit/withdrawal")
+        print(f"  External Flows    : MONITORED CONTINUOUSLY every {EXTERNAL_FLOW_MONITOR_INTERVAL}s "
+              f"(threshold ${EXTERNAL_FLOW_MIN_USD:.2f}, even while trades are open)")
+        print(f"  Trade vs External : FULLY SEPARATED - trade P&L never includes "
+              f"deposits/withdrawals, and vice versa")
+        print(f"  Capital Email     : ONE email after trade close (trade P&L) + "
+              f"ONE email per external deposit/withdrawal")
         print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
@@ -5436,14 +5513,15 @@ def ask_risk_params() -> Tuple[float, int]:
 
 def ask_daily_loss_limit() -> float:
     _divider("DAILY LOSS LIMIT")
-    print("  Daily loss limit stops trading if cumulative REALIZED losses exceed this % of capital.")
-    print("  (Realized PnL is derived from the actual Delta Exchange balance difference.)")
+    print("  Daily loss limit stops trading if cumulative REALIZED trade losses exceed this % of capital.")
+    print("  (Realized PnL is derived from the actual Delta Exchange balance difference of each trade,")
+    print("   excluding any external deposits/withdrawals detected during the trade.)")
     try:
         daily_loss = float(input("  Daily loss limit % (default = 5) : ").strip() or 5)
         daily_loss = max(0.1, min(daily_loss, 50.0))
     except ValueError:
         daily_loss = 5.0
-    print(f"  Daily loss limit : {daily_loss}% of trading capital (based on BALANCE-DERIVED REALIZED PnL)")
+    print(f"  Daily loss limit : {daily_loss}% of trading capital (based on TRADE-ONLY REALIZED PnL)")
     return daily_loss
 
 
@@ -5554,12 +5632,17 @@ def main() -> None:
     print(f"  Max open trades   : {max_trades}")
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} closed candles per symbol")
-    print(f"  PnL Source        : DELTA EXCHANGE BALANCE DIFFERENCE (single source of truth)")
-    print(f"  PnL Calculation   : realized_pnl = new_balance - old_balance (LIVE mode ONLY)")
+    print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry - external_flows)")
+    print(f"  PnL Calculation   : realized_pnl = raw_diff - external_flows_during_trade")
     print(f"  PnL Local         : DISABLED in LIVE mode (no entry/exit local P&L)")
     print(f"  Capital Source    : DELTA EXCHANGE BALANCE (single source of truth)")
-    print(f"  Capital Refresh   : After every successfully filled/executed trade + on close")
-    print(f"  Capital Email     : ENABLED (shows OLD, NEW, and DIFFERENCE)")
+    print(f"  Capital Refresh   : After every trade close + on external deposit/withdrawal")
+    print(f"  External Flows    : MONITORED CONTINUOUSLY every {EXTERNAL_FLOW_MONITOR_INTERVAL}s "
+          f"(threshold ${EXTERNAL_FLOW_MIN_USD:.2f}, even while trades are open)")
+    print(f"  Trade vs External : FULLY SEPARATED - trade P&L never includes "
+          f"deposits/withdrawals, and vice versa")
+    print(f"  Capital Email     : ONE email after trade close (trade P&L) + "
+          f"ONE email per external deposit/withdrawal")
     print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
