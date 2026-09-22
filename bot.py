@@ -2065,32 +2065,16 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
 
 # ================================================================
 #  13c. ENGULFING STRATEGIES
-#          UPDATED: require one additional closed confirmation candle.
-#
-#   Bullish Engulfing structure:
-#       Bearish -> Bullish Engulfing -> Bullish Confirmation (close ABOVE Engulfing close)
-#
-#   Bearish Engulfing structure:
-#       Bullish -> Bearish Engulfing -> Bearish Confirmation (close BELOW Engulfing close)
-#
-#   All existing engulfing body conditions, minimum body %, RSI filters,
-#   SL placement, and everything else are unchanged.
 # ================================================================
 
 def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    # Need at least 4 candles:
-    #   candles[-4] = prior bullish candle
-    #   candles[-3] = bearish engulfing candle
-    #   candles[-2] = bearish confirmation candle (must close below engulfing close)
-    #   candles[-1] = currently forming candle (NOT used for confirmation)
     if len(candles) < 4:
         return False, None, ""
 
     confirm_candle = candles[-2]
-    signal = candles[-3]     # the bearish engulfing candle
-    prev = candles[-4]       # the prior bullish candle it engulfs
+    signal = candles[-3]
+    prev = candles[-4]
 
-    # --- Existing engulfing body conditions (unchanged) ---
     if not is_bullish(prev):
         return False, None, ""
     if not is_bearish(signal):
@@ -2104,14 +2088,11 @@ def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Opt
     if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
         return False, None, ""
 
-    # --- NEW: additional closed confirmation candle ---
-    # Confirmation candle must be bearish AND close below the engulfing candle's close.
     if not is_bearish(confirm_candle):
         return False, None, ""
     if confirm_candle["close"] >= signal["close"]:
         return False, None, ""
 
-    # SL stays at the engulfing candle's high (unchanged).
     signal_candle = confirm_candle.copy()
     signal_candle["pattern_high"] = signal["high"]
     signal_candle["engulfing_close"] = signal["close"]
@@ -2126,19 +2107,13 @@ def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Opt
 
 
 def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    # Need at least 4 candles:
-    #   candles[-4] = prior bearish candle
-    #   candles[-3] = bullish engulfing candle
-    #   candles[-2] = bullish confirmation candle (must close above engulfing close)
-    #   candles[-1] = currently forming candle (NOT used for confirmation)
     if len(candles) < 4:
         return False, None, ""
 
     confirm_candle = candles[-2]
-    signal = candles[-3]     # the bullish engulfing candle
-    prev = candles[-4]       # the prior bearish candle it engulfs
+    signal = candles[-3]
+    prev = candles[-4]
 
-    # --- Existing engulfing body conditions (unchanged) ---
     if not is_bearish(prev):
         return False, None, ""
     if not is_bullish(signal):
@@ -2152,14 +2127,11 @@ def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Opti
     if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
         return False, None, ""
 
-    # --- NEW: additional closed confirmation candle ---
-    # Confirmation candle must be bullish AND close above the engulfing candle's close.
     if not is_bullish(confirm_candle):
         return False, None, ""
     if confirm_candle["close"] <= signal["close"]:
         return False, None, ""
 
-    # SL stays at the engulfing candle's low (unchanged).
     signal_candle = confirm_candle.copy()
     signal_candle["pattern_low"] = signal["low"]
     signal_candle["engulfing_close"] = signal["close"]
@@ -3432,22 +3404,69 @@ class DeltaREST:
 
 
 # ================================================================
-#  20. POSITION SIZER
+#  20. POSITION SIZER  (UPDATED - uses user-provided lot size)
 # ================================================================
 
 def compute_position_size(entry_price: float, stop_loss_price: float,
                            account_balance: float, risk_pct: float,
-                           leverage: int) -> Tuple[int, dict]:
+                           leverage: int, user_lot_size: float) -> Tuple[int, dict]:
+    """
+    Compute the number of CONTRACTS to trade using the user-provided lot size.
+
+    Steps (unchanged risk logic):
+      1. risk_amount   = account_balance * risk_pct
+      2. stop_distance = |entry_price - stop_loss_price|
+      3. risk_qty      = risk_amount / stop_distance        (coin quantity for the risk)
+      4. max_by_margin = (account_balance * leverage) / entry_price  (coin quantity by margin)
+      5. calc_qty      = min(risk_qty, max_by_margin)       (coin quantity actually tradable)
+
+    Then convert coin quantity to integer contracts using the user lot size:
+      contracts = int(calc_qty / user_lot_size)
+
+    No `max(1, ...)` fallback: if contracts < 1, return 0 and the caller
+    rejects the trade with a clear log message.
+    """
+    if user_lot_size <= 0:
+        # Invalid lot size - caller should have validated this at startup.
+        return 0, {"error": "invalid_lot_size", "user_lot_size": user_lot_size}
+
     risk_amount = account_balance * risk_pct
     stop_distance = abs(entry_price - stop_loss_price)
     if stop_distance <= 0:
-        return 0, {}
+        return 0, {"error": "zero_stop_distance"}
+
     risk_size = risk_amount / stop_distance
     max_by_margin = (account_balance * leverage) / entry_price
-    final_size_raw = min(risk_size, max_by_margin)
-    final_size = max(1, int(final_size_raw))
-    margin_used = (final_size * entry_price) / leverage
-    max_loss_est = final_size * stop_distance
+    calc_coin_qty = min(risk_size, max_by_margin)
+
+    contracts = int(calc_coin_qty / user_lot_size)
+
+    if contracts < 1:
+        diag = {
+            "account_balance": round(account_balance, 2),
+            "risk_pct": round(risk_pct * 100, 2),
+            "risk_amount": round(risk_amount, 2),
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "stop_distance": stop_distance,
+            "risk_size_raw": round(risk_size, 8),
+            "max_by_margin": round(max_by_margin, 8),
+            "calc_coin_qty": round(calc_coin_qty, 8),
+            "user_lot_size": user_lot_size,
+            "contracts": 0,
+            "margin_used": 0.0,
+            "max_loss_est": 0.0,
+            "leverage": leverage,
+            "rejected": True,
+            "reject_reason": "contracts_less_than_1",
+        }
+        return 0, diag
+
+    # Use the user lot size consistently for margin and estimated loss.
+    effective_coin_qty = contracts * user_lot_size
+    margin_used = (effective_coin_qty * entry_price) / leverage
+    max_loss_est = effective_coin_qty * stop_distance
+
     diag = {
         "account_balance": round(account_balance, 2),
         "risk_pct": round(risk_pct * 100, 2),
@@ -3455,14 +3474,18 @@ def compute_position_size(entry_price: float, stop_loss_price: float,
         "entry_price": entry_price,
         "stop_loss_price": stop_loss_price,
         "stop_distance": stop_distance,
-        "risk_size_raw": round(risk_size, 6),
-        "max_by_margin": round(max_by_margin, 6),
-        "final_size": final_size,
+        "risk_size_raw": round(risk_size, 8),
+        "max_by_margin": round(max_by_margin, 8),
+        "calc_coin_qty": round(calc_coin_qty, 8),
+        "user_lot_size": user_lot_size,
+        "contracts": contracts,
+        "effective_coin_qty": round(effective_coin_qty, 8),
         "margin_used": round(margin_used, 2),
         "max_loss_est": round(max_loss_est, 2),
         "leverage": leverage,
+        "rejected": False,
     }
-    return final_size, diag
+    return contracts, diag
 
 
 def compute_take_profit(entry_price: float, stop_loss_price: float,
@@ -3562,6 +3585,13 @@ class TradingBot:
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
         self.enable_short = config.get("enable_short", True)
         self.enable_long = config.get("enable_long", True)
+
+        # NEW: user-provided lot/contract size (e.g. 0.01 ETH, 0.001 BTC, etc.)
+        self.user_lot_size = float(config.get("user_lot_size", 0.0))
+        if self.user_lot_size <= 0:
+            _log("error", "STARTUP",
+                 "user_lot_size is 0 or missing in config - the bot will not be "
+                 "able to size any trade and will be halted at start(). Fix your config.")
 
         if self.trading_capital <= 0:
             _log("error", "STARTUP",
@@ -3908,6 +3938,12 @@ class TradingBot:
             self._log("error", "STARTUP",
                        "Aborting: trading_capital must be > 0. The bot cannot size "
                        "trades or evaluate the daily loss limit with $0 capital.")
+            self.running = False
+            return
+        if self.user_lot_size <= 0:
+            self._log("error", "STARTUP",
+                       "Aborting: user_lot_size must be > 0. The bot cannot convert "
+                       "coin quantity to contracts without a valid lot size.")
             self.running = False
             return
 
@@ -4632,6 +4668,7 @@ class TradingBot:
             print(f"           Stop Loss   : {smart_fmt(sl)} (distance={smart_fmt(stop_dist)}) [CANDLE CLOSE]")
             print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
             print(f"           Risk        : ${risk_usd:,.2f} ({self.config['risk_pct']}%)")
+            print(f"           Lot Size    : {self.user_lot_size}")
             print(f"           RSI(14)     : {rsi_str}")
             if signal.get("breakout_level"):
                 stars = "*" * (signal.get("level_strength", 0) or 0)
@@ -4695,11 +4732,18 @@ class TradingBot:
                 self._cleanup_trade(symbol)
                 return
 
-            position_size, _ = compute_position_size(
+            position_size, size_diag = compute_position_size(
                 entry_price=entry, stop_loss_price=sl,
-                account_balance=capital, risk_pct=self.risk_pct, leverage=self.leverage,
+                account_balance=capital, risk_pct=self.risk_pct,
+                leverage=self.leverage, user_lot_size=self.user_lot_size,
             )
+
             if position_size < 1:
+                _log("warning", "TRADE",
+                     f"[{symbol}] Position sizing REJECTED - calculated contracts < 1 "
+                     f"(calc_coin_qty={size_diag.get('calc_coin_qty', 0)}, "
+                     f"user_lot_size={self.user_lot_size}). "
+                     f"Try a smaller lot size or larger capital/risk.")
                 self._cleanup_trade(symbol)
                 return
 
@@ -4707,7 +4751,9 @@ class TradingBot:
             if balance_before_entry <= 0:
                 balance_before_entry = capital
             _log("info", "TRADE",
-                 f"[{symbol}] Balance snapshot immediately before entry: ${balance_before_entry:,.2f}")
+                 f"[{symbol}] Position sizing: contracts={position_size} "
+                 f"(coin_qty={size_diag.get('calc_coin_qty')}, lot_size={self.user_lot_size}) | "
+                 f"Balance snapshot immediately before entry: ${balance_before_entry:,.2f}")
 
             side = "sell" if direction == "SHORT" else "buy"
             entry_result = self.rest.place_order(
@@ -4767,6 +4813,7 @@ class TradingBot:
                 "st_mode": False,
                 "no_rsi": signal.get("no_rsi", False),
                 "balance_before_entry": balance_before_entry,
+                "user_lot_size": self.user_lot_size,
             }
 
             with self._trade_lock:
@@ -5077,8 +5124,7 @@ class TradingBot:
         print()
         print("+========================================================+")
         print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
-        print("|   Engulfing strategies now require a closed             |")
-        print("|   confirmation candle before entry.                     |")
+        print("|   Position sizing uses user-provided lot/contract size. |")
         print("+========================================================+")
         print()
 
@@ -5091,6 +5137,7 @@ class TradingBot:
         print(f"  Timeframe         : {self.timeframe}")
         print(f"  Trading capital   : ${self.trading_capital:,.2f} USD")
         print(f"  Risk / trade      : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
+        print(f"  Lot / contract    : {self.user_lot_size} (user-provided)")
         print(f"  Take-Profit (def) : {TP_RR_RATIO:.1f}:1 (triggers on PRICE TOUCH)")
         print(f"  Take-Profit (ST)  : Both SuperTrends reverse direction")
         print(f"  Stop Loss         : Triggers on CANDLE CLOSE only (disabled in ST mode)")
@@ -5135,6 +5182,8 @@ class TradingBot:
         print(f"  Capital Refresh   : ONLY after a trade is completely closed")
         print(f"  Capital Email     : ONE email after trade close (OLD, NEW, DIFFERENCE, PROFIT/LOSS/NO CHANGE)")
         print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
+        print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
+              f"rejects if contracts < 1 (no max(1,...) fallback)")
         print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
         print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
         print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
@@ -5298,6 +5347,39 @@ def ask_daily_loss_limit() -> float:
     return daily_loss
 
 
+def ask_user_lot_size(symbols: List[str]) -> float:
+    """
+    Ask the user to enter the lot/contract size for the selected coin(s).
+
+    The user is free to enter any value (e.g. 0.01 ETH, 0.001 BTC, 1 SOL, ...).
+    This value is used generically - the bot does NOT hard-code any coin's
+    lot size. Whatever the user enters is used to convert coin quantity
+    to integer contracts/lots when placing orders.
+    """
+    _divider("LOT / CONTRACT SIZE")
+    print("  Enter the lot/contract size for your selected coin(s).")
+    print("  Examples:  0.01 ETH   |   0.001 BTC   |   1 SOL   |   0.1 DOGE")
+    print("  This value is used generically - no coin is hard-coded.")
+    print()
+    if symbols:
+        print(f"  Selected symbol(s): {', '.join(symbols)}")
+    while True:
+        raw = input("  Enter lot size (e.g. 0.01) : ").strip()
+        if not raw:
+            print("  [ERROR] Lot size cannot be empty. Try again.")
+            continue
+        try:
+            lot = float(raw)
+        except ValueError:
+            print("  [ERROR] Invalid number. Try again.")
+            continue
+        if lot <= 0:
+            print("  [ERROR] Lot size must be > 0. Try again.")
+            continue
+        print(f"  Lot size : {lot}")
+        return lot
+
+
 def test_gmail():
     print("\n  TESTING GMAIL NOTIFICATIONS")
     print("  " + "=" * 50)
@@ -5370,6 +5452,10 @@ def main() -> None:
     print(f"  {len(product_map)} products loaded.")
 
     raw_symbols = ask_symbols(product_map)
+
+    # NEW: ask for user-provided lot/contract size (generic, no hard-coded coin).
+    user_lot_size = ask_user_lot_size(raw_symbols)
+
     leverage = ask_leverage()
 
     account_balance = 0.0
@@ -5395,6 +5481,7 @@ def main() -> None:
     print(f"  Short Trades      : {'ENABLED' if enable_short else 'DISABLED'}")
     print(f"  Long Trades       : {'ENABLED' if enable_long else 'DISABLED'}")
     print(f"  Symbols           : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
+    print(f"  Lot / contract    : {user_lot_size}")
     print(f"  Leverage          : {leverage}x")
     print(f"  Trading capital   : ${trading_capital:,.2f}")
     print(f"  Risk / trade      : {risk_pct}%  =  ~${risk_usd:,.2f}")
@@ -5412,6 +5499,8 @@ def main() -> None:
     print(f"  Capital Refresh   : ONLY after a trade is completely closed")
     print(f"  Capital Email     : ONE email after trade close (OLD, NEW, DIFFERENCE, PROFIT/LOSS/NO CHANGE)")
     print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
+    print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
+          f"rejects if contracts < 1 (no max(1,...) fallback)")
     print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
     print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
     print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
@@ -5420,6 +5509,10 @@ def main() -> None:
 
     if trading_capital <= 0:
         print("  [ERROR] Trading capital is $0 - the bot cannot start. Enter a positive amount.")
+        return
+
+    if user_lot_size <= 0:
+        print("  [ERROR] Lot size must be > 0 - the bot cannot start.")
         return
 
     confirm = input("  Type YES to start the bot : ").strip().upper()
@@ -5440,6 +5533,7 @@ def main() -> None:
         "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
         "enable_short": enable_short,
         "enable_long": enable_long,
+        "user_lot_size": user_lot_size,
     }
 
     bot = TradingBot(cfg, notifier=notifier)
@@ -5475,6 +5569,7 @@ def main() -> None:
                     f"Signals={len(bot.signals)}  "
                     f"TPs={len(bot.tp_events)}  SLs={len(bot.sl_events)}  "
                     f"WS={ws_state}  Capital=${cap_snapshot:,.2f}  "
+                    f"Lot={bot.user_lot_size}  "
                     f"{bot.daily_loss_tracker.status()}  "
                     + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
                     + (f"  {st_info}" if st_info else "")
