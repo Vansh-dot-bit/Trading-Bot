@@ -1122,7 +1122,7 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 MIN_ENGULF_BODY_PCT = 0.30
 RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
-VOL_EXP_TOLERANCE = 0.003
+VOL_EXP_TOLERANCE = 0.002   # CHANGED: 0.30% -> 0.20%
 
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
@@ -1665,12 +1665,25 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
 
 
 def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Volume Expansion SHORT — UPDATED:
+      - Requires one extra closed confirmation candle after the breakout candle.
+      - SHORT structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
+        candles[-3] = breakout candle
+        candles[-2] = confirmation candle (must close BELOW breakout candle low)
+        candles[-1] = currently forming candle (never used)
+      - 21-candle lookback, repeated low detection (tolerance = VOL_EXP_TOLERANCE),
+        and volume expansion condition all unchanged.
+      - SL anchored to the breakout candle's HIGH (unchanged behavior).
+    """
     lookback = VOL_EXP_LOOKBACK
-    if len(candles) < lookback + 2:
+    # Need: 21 prior + breakout + confirmation + forming = 24 candles
+    if len(candles) < lookback + 3:
         return False, None, ""
 
-    breakout_candle = candles[-2]
-    prev_candles = candles[-(lookback + 2):-2]
+    confirm_candle = candles[-2]
+    breakout_candle = candles[-3]
+    prev_candles = candles[-(lookback + 3):-3]
     if len(prev_candles) < lookback:
         return False, None, ""
 
@@ -1695,15 +1708,22 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     if breakout_candle["volume"] <= max_vol_prev:
         return False, None, ""
 
-    current_copy = breakout_candle.copy()
-    current_copy["pattern_high"] = breakout_candle["high"]
-    current_copy["breakout_level"] = repeated_low
+    # NEW: confirmation candle must close BELOW the breakout candle's LOW
+    if confirm_candle["close"] >= breakout_candle["low"]:
+        return False, None, ""
+
+    signal_candle = confirm_candle.copy()
+    signal_candle["pattern_high"] = breakout_candle["high"]
+    signal_candle["breakout_level"] = repeated_low
+    signal_candle["breakout_candle_low"] = breakout_candle["low"]
+    signal_candle["confirmation_close"] = confirm_candle["close"]
 
     _log("info", "VOL_EXPANSION_SHORT",
          f"Repeated low level at {smart_fmt(repeated_low)} (within {VOL_EXP_TOLERANCE*100:.2f}% tolerance) | "
          f"Break close {smart_fmt(breakout_candle['close'])} < repeated low | "
-         f"Volume: {breakout_candle['volume']:.2f} > max prev vol {max_vol_prev:.2f}")
-    return True, current_copy, "VOL_EXPANSION_SHORT"
+         f"Volume: {breakout_candle['volume']:.2f} > max prev vol {max_vol_prev:.2f} | "
+         f"Confirm close {smart_fmt(confirm_candle['close'])} < breakout low {smart_fmt(breakout_candle['low'])} -> CONFIRMED")
+    return True, signal_candle, "VOL_EXPANSION_SHORT"
 
 
 def check_short_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
@@ -1917,12 +1937,25 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
 
 
 def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Volume Expansion LONG — UPDATED:
+      - Requires one extra closed confirmation candle after the breakout candle.
+      - LONG structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
+        candles[-3] = breakout candle
+        candles[-2] = confirmation candle (must close ABOVE breakout candle high)
+        candles[-1] = currently forming candle (never used)
+      - 21-candle lookback, repeated high detection (tolerance = VOL_EXP_TOLERANCE),
+        and volume expansion condition all unchanged.
+      - SL anchored to the breakout candle's LOW (unchanged behavior).
+    """
     lookback = VOL_EXP_LOOKBACK
-    if len(candles) < lookback + 2:
+    # Need: 21 prior + breakout + confirmation + forming = 24 candles
+    if len(candles) < lookback + 3:
         return False, None, ""
 
-    breakout_candle = candles[-2]
-    prev_candles = candles[-(lookback + 2):-2]
+    confirm_candle = candles[-2]
+    breakout_candle = candles[-3]
+    prev_candles = candles[-(lookback + 3):-3]
     if len(prev_candles) < lookback:
         return False, None, ""
 
@@ -1947,15 +1980,22 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
     if breakout_candle["volume"] <= max_vol_prev:
         return False, None, ""
 
-    current_copy = breakout_candle.copy()
-    current_copy["pattern_low"] = breakout_candle["low"]
-    current_copy["breakout_level"] = repeated_high
+    # NEW: confirmation candle must close ABOVE the breakout candle's HIGH
+    if confirm_candle["close"] <= breakout_candle["high"]:
+        return False, None, ""
+
+    signal_candle = confirm_candle.copy()
+    signal_candle["pattern_low"] = breakout_candle["low"]
+    signal_candle["breakout_level"] = repeated_high
+    signal_candle["breakout_candle_high"] = breakout_candle["high"]
+    signal_candle["confirmation_close"] = confirm_candle["close"]
 
     _log("info", "VOL_EXPANSION_LONG",
          f"Repeated high level at {smart_fmt(repeated_high)} (within {VOL_EXP_TOLERANCE*100:.2f}% tolerance) | "
          f"Break close {smart_fmt(breakout_candle['close'])} > repeated high | "
-         f"Volume: {breakout_candle['volume']:.2f} > max prev vol {max_vol_prev:.2f}")
-    return True, current_copy, "VOL_EXPANSION_LONG"
+         f"Volume: {breakout_candle['volume']:.2f} > max prev vol {max_vol_prev:.2f} | "
+         f"Confirm close {smart_fmt(confirm_candle['close'])} > breakout high {smart_fmt(breakout_candle['high'])} -> CONFIRMED")
+    return True, signal_candle, "VOL_EXPANSION_LONG"
 
 
 def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
@@ -3404,30 +3444,13 @@ class DeltaREST:
 
 
 # ================================================================
-#  20. POSITION SIZER  (UPDATED - uses user-provided lot size)
+#  20. POSITION SIZER  (uses user-provided lot size)
 # ================================================================
 
 def compute_position_size(entry_price: float, stop_loss_price: float,
                            account_balance: float, risk_pct: float,
                            leverage: int, user_lot_size: float) -> Tuple[int, dict]:
-    """
-    Compute the number of CONTRACTS to trade using the user-provided lot size.
-
-    Steps (unchanged risk logic):
-      1. risk_amount   = account_balance * risk_pct
-      2. stop_distance = |entry_price - stop_loss_price|
-      3. risk_qty      = risk_amount / stop_distance        (coin quantity for the risk)
-      4. max_by_margin = (account_balance * leverage) / entry_price  (coin quantity by margin)
-      5. calc_qty      = min(risk_qty, max_by_margin)       (coin quantity actually tradable)
-
-    Then convert coin quantity to integer contracts using the user lot size:
-      contracts = int(calc_qty / user_lot_size)
-
-    No `max(1, ...)` fallback: if contracts < 1, return 0 and the caller
-    rejects the trade with a clear log message.
-    """
     if user_lot_size <= 0:
-        # Invalid lot size - caller should have validated this at startup.
         return 0, {"error": "invalid_lot_size", "user_lot_size": user_lot_size}
 
     risk_amount = account_balance * risk_pct
@@ -3462,7 +3485,6 @@ def compute_position_size(entry_price: float, stop_loss_price: float,
         }
         return 0, diag
 
-    # Use the user lot size consistently for margin and estimated loss.
     effective_coin_qty = contracts * user_lot_size
     margin_used = (effective_coin_qty * entry_price) / leverage
     max_loss_est = effective_coin_qty * stop_distance
@@ -3586,7 +3608,6 @@ class TradingBot:
         self.enable_short = config.get("enable_short", True)
         self.enable_long = config.get("enable_long", True)
 
-        # NEW: user-provided lot/contract size (e.g. 0.01 ETH, 0.001 BTC, etc.)
         self.user_lot_size = float(config.get("user_lot_size", 0.0))
         if self.user_lot_size <= 0:
             _log("error", "STARTUP",
@@ -3668,10 +3689,6 @@ class TradingBot:
                 self.on_log_callback(f"[{tag}] {msg}", level)
             except Exception as e:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
-
-    # ------------------------------------------------------------------
-    # TRADE CLOSE (trade P&L only)
-    # ------------------------------------------------------------------
 
     def _close_trade(self, symbol: str, trade: dict, reason: str,
                       exit_price: Optional[float] = None) -> None:
@@ -4659,6 +4676,8 @@ class TradingBot:
                 strategy_category = " [S/R BREAKOUT]"
             elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
                 strategy_category = " [ENGULFING + CONFIRMATION]"
+            elif strategy_name in ("VOL_EXPANSION_SHORT", "VOL_EXPANSION_LONG"):
+                strategy_category = " [VOL EXPANSION + CONFIRMATION]"
             elif strategy_name in ("BEARISH_DOJI", "BULLISH_DOJI"):
                 strategy_category = f" [DOJI - body <= {DOJI_BODY_RATIO_MAX * 100:.0f}%]"
 
@@ -5125,6 +5144,7 @@ class TradingBot:
         print("+========================================================+")
         print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
         print("|   Position sizing uses user-provided lot/contract size. |")
+        print("|   Volume Expansion now requires a confirmation candle.  |")
         print("+========================================================+")
         print()
 
@@ -5150,6 +5170,8 @@ class TradingBot:
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
+        print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
+              f"requires 1 confirmation candle after breakout")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
         print(f"  S/R Init          : Complete historical scan (all swing points) - once at startup")
         print(f"  S/R Live          : Incremental updates per new candle - maintains processed-state")
@@ -5348,14 +5370,6 @@ def ask_daily_loss_limit() -> float:
 
 
 def ask_user_lot_size(symbols: List[str]) -> float:
-    """
-    Ask the user to enter the lot/contract size for the selected coin(s).
-
-    The user is free to enter any value (e.g. 0.01 ETH, 0.001 BTC, 1 SOL, ...).
-    This value is used generically - the bot does NOT hard-code any coin's
-    lot size. Whatever the user enters is used to convert coin quantity
-    to integer contracts/lots when placing orders.
-    """
     _divider("LOT / CONTRACT SIZE")
     print("  Enter the lot/contract size for your selected coin(s).")
     print("  Examples:  0.01 ETH   |   0.001 BTC   |   1 SOL   |   0.1 DOGE")
@@ -5453,7 +5467,6 @@ def main() -> None:
 
     raw_symbols = ask_symbols(product_map)
 
-    # NEW: ask for user-provided lot/contract size (generic, no hard-coded coin).
     user_lot_size = ask_user_lot_size(raw_symbols)
 
     leverage = ask_leverage()
@@ -5501,6 +5514,8 @@ def main() -> None:
     print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
     print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
           f"rejects if contracts < 1 (no max(1,...) fallback)")
+    print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
+          f"requires 1 confirmation candle after breakout")
     print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
     print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
     print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
