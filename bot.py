@@ -1106,8 +1106,8 @@ TIMEOUT = 30
 CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 55.0
-RSI_OVERSOLD = 40.0
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
 RSI_MIN_CANDLES = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL = 0.5
@@ -1122,7 +1122,10 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 MIN_ENGULF_BODY_PCT = 0.30
 RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
-VOL_EXP_TOLERANCE = 0.002   # CHANGED: 0.30% -> 0.20%
+VOL_EXP_TOLERANCE = 0.002   # 0.20%
+
+# NEW: Range Break breakout body must be >= 1.70x the average lookback body
+RANGE_BREAK_BODY_MULTIPLIER = 1.70
 
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
@@ -1588,39 +1591,6 @@ def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[d
     return True, sc, "STRATEGY_1_SHORT"
 
 
-def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 5:
-        return False, None, ""
-
-    signal_c = candles[-2]
-    doji_c = candles[-3]
-    bullish_2 = candles[-4]
-    bullish_1 = candles[-5]
-
-    if not is_bullish(bullish_1):
-        return False, None, ""
-    if not is_bullish(bullish_2):
-        return False, None, ""
-    if bullish_2["close"] <= bullish_1["close"]:
-        return False, None, ""
-    if not is_doji(doji_c):
-        return False, None, ""
-    if not is_bearish(signal_c):
-        return False, None, ""
-    if signal_c["close"] >= doji_c["low"]:
-        return False, None, ""
-
-    result = signal_c.copy()
-    result["doji_low"] = doji_c["low"]
-    result["pattern_high"] = doji_c["high"]
-
-    _log("info", "BEARISH_DOJI",
-         f"Bullish breakout: C2 close {smart_fmt(bullish_2['close'])} > C1 close {smart_fmt(bullish_1['close'])} | "
-         f"Doji (body ratio: {candle_body(doji_c) / candle_range(doji_c) * 100:.1f}%) -> Bearish confirmation: "
-         f"Signal close {smart_fmt(signal_c['close'])} < doji low {smart_fmt(doji_c['low'])}")
-    return True, result, "BEARISH_DOJI"
-
-
 def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 3:
@@ -1650,7 +1620,8 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
 
-    if breakout_body <= 0 or avg_range_body > 0.5 * breakout_body:
+    # NEW: breakout body must be >= 1.70x the average lookback body
+    if breakout_body <= 0 or breakout_body < RANGE_BREAK_BODY_MULTIPLIER * avg_range_body:
         return False, None, ""
 
     confirm_candle_copy = confirm_candle.copy()
@@ -1660,13 +1631,14 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {smart_fmt(break_candle['close'])} < range low | "
          f"Confirm close {smart_fmt(confirm_candle['close'])} < break close | "
-         f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
+         f"BreakBody={smart_fmt(breakout_body)} >= "
+         f"{RANGE_BREAK_BODY_MULTIPLIER:.2f}x AvgRangeBody={smart_fmt(avg_range_body)}")
     return True, confirm_candle_copy, "RANGE_BREAK_SHORT"
 
 
 def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Volume Expansion SHORT — UPDATED:
+    Volume Expansion SHORT:
       - Requires one extra closed confirmation candle after the breakout candle.
       - SHORT structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
         candles[-3] = breakout candle
@@ -1674,10 +1646,9 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
         candles[-1] = currently forming candle (never used)
       - 21-candle lookback, repeated low detection (tolerance = VOL_EXP_TOLERANCE),
         and volume expansion condition all unchanged.
-      - SL anchored to the breakout candle's HIGH (unchanged behavior).
+      - SL anchored to the breakout candle's HIGH.
     """
     lookback = VOL_EXP_LOOKBACK
-    # Need: 21 prior + breakout + confirmation + forming = 24 candles
     if len(candles) < lookback + 3:
         return False, None, ""
 
@@ -1708,7 +1679,6 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     if breakout_candle["volume"] <= max_vol_prev:
         return False, None, ""
 
-    # NEW: confirmation candle must close BELOW the breakout candle's LOW
     if confirm_candle["close"] >= breakout_candle["low"]:
         return False, None, ""
 
@@ -1806,7 +1776,8 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         if not is_bearish(confirm_candle):
             continue
 
-        if confirm_candle["close"] >= false_breakout_candle["close"]:
+        # NEW: confirmation must close BELOW the false-breakout candle's LOW
+        if confirm_candle["close"] >= false_breakout_candle["low"]:
             continue
 
         signal_candle = confirm_candle.copy()
@@ -1817,13 +1788,14 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
         signal_candle["false_breakout_high"] = false_breakout_candle["high"]
+        signal_candle["false_breakout_low"] = false_breakout_candle["low"]
 
         stars = "*" * level_dict["strength"]
 
         _log("info", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT",
              f"SHORT: Resistance false breakout reversal at {smart_fmt(resistance)} "
              f"(High {smart_fmt(false_breakout_candle['high'])} > Resistance > Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout close "
+             f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout low {smart_fmt(false_breakout_candle['low'])} "
              f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
 
         return True, signal_candle, "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
@@ -1860,39 +1832,6 @@ def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[di
     return True, sc, "STRATEGY_1_LONG"
 
 
-def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 5:
-        return False, None, ""
-
-    signal_c = candles[-2]
-    doji_c = candles[-3]
-    bearish_2 = candles[-4]
-    bearish_1 = candles[-5]
-
-    if not is_bearish(bearish_1):
-        return False, None, ""
-    if not is_bearish(bearish_2):
-        return False, None, ""
-    if bearish_2["close"] >= bearish_1["close"]:
-        return False, None, ""
-    if not is_doji(doji_c):
-        return False, None, ""
-    if not is_bullish(signal_c):
-        return False, None, ""
-    if signal_c["close"] <= doji_c["high"]:
-        return False, None, ""
-
-    result = signal_c.copy()
-    result["doji_high"] = doji_c["high"]
-    result["pattern_low"] = doji_c["low"]
-
-    _log("info", "BULLISH_DOJI",
-         f"Bearish breakout: C2 close {smart_fmt(bearish_2['close'])} < C1 close {smart_fmt(bearish_1['close'])} | "
-         f"Doji (body ratio: {candle_body(doji_c) / candle_range(doji_c) * 100:.1f}%) -> Bullish confirmation: "
-         f"Signal close {smart_fmt(signal_c['close'])} > doji high {smart_fmt(doji_c['high'])}")
-    return True, result, "BULLISH_DOJI"
-
-
 def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     lookback = RANGE_BREAK_LOOKBACK
     if len(candles) < lookback + 3:
@@ -1922,7 +1861,8 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
 
-    if breakout_body <= 0 or avg_range_body > 0.5 * breakout_body:
+    # NEW: breakout body must be >= 1.70x the average lookback body
+    if breakout_body <= 0 or breakout_body < RANGE_BREAK_BODY_MULTIPLIER * avg_range_body:
         return False, None, ""
 
     confirm_candle_copy = confirm_candle.copy()
@@ -1932,13 +1872,14 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
          f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
          f"Break close {break_candle['close']} > range high | "
          f"Confirm close {confirm_candle['close']} > break close | "
-         f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
+         f"BreakBody={smart_fmt(breakout_body)} >= "
+         f"{RANGE_BREAK_BODY_MULTIPLIER:.2f}x AvgRangeBody={smart_fmt(avg_range_body)}")
     return True, confirm_candle_copy, "RANGE_BREAK_LONG"
 
 
 def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
     """
-    Volume Expansion LONG — UPDATED:
+    Volume Expansion LONG:
       - Requires one extra closed confirmation candle after the breakout candle.
       - LONG structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
         candles[-3] = breakout candle
@@ -1946,10 +1887,9 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
         candles[-1] = currently forming candle (never used)
       - 21-candle lookback, repeated high detection (tolerance = VOL_EXP_TOLERANCE),
         and volume expansion condition all unchanged.
-      - SL anchored to the breakout candle's LOW (unchanged behavior).
+      - SL anchored to the breakout candle's LOW.
     """
     lookback = VOL_EXP_LOOKBACK
-    # Need: 21 prior + breakout + confirmation + forming = 24 candles
     if len(candles) < lookback + 3:
         return False, None, ""
 
@@ -1980,7 +1920,6 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
     if breakout_candle["volume"] <= max_vol_prev:
         return False, None, ""
 
-    # NEW: confirmation candle must close ABOVE the breakout candle's HIGH
     if confirm_candle["close"] <= breakout_candle["high"]:
         return False, None, ""
 
@@ -2078,7 +2017,8 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
         if not is_bullish(confirm_candle):
             continue
 
-        if confirm_candle["close"] <= false_breakout_candle["close"]:
+        # NEW: confirmation must close ABOVE the false-breakout candle's HIGH
+        if confirm_candle["close"] <= false_breakout_candle["high"]:
             continue
 
         signal_candle = confirm_candle.copy()
@@ -2089,100 +2029,19 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
         signal_candle["false_breakout_low"] = false_breakout_candle["low"]
+        signal_candle["false_breakout_high"] = false_breakout_candle["high"]
 
         stars = "*" * level_dict["strength"]
 
         _log("info", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG",
              f"LONG: Support false breakout reversal at {smart_fmt(support)} "
              f"(Low {smart_fmt(false_breakout_candle['low'])} < Support < Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout close "
+             f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout high {smart_fmt(false_breakout_candle['high'])} "
              f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
 
         return True, signal_candle, "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
 
     return False, None, ""
-
-
-# ================================================================
-#  13c. ENGULFING STRATEGIES
-# ================================================================
-
-def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    confirm_candle = candles[-2]
-    signal = candles[-3]
-    prev = candles[-4]
-
-    if not is_bullish(prev):
-        return False, None, ""
-    if not is_bearish(signal):
-        return False, None, ""
-    if signal["open"] <= prev["close"] or signal["close"] >= prev["open"]:
-        return False, None, ""
-
-    signal_body = candle_body(signal)
-    signal_range = candle_range(signal)
-
-    if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
-        return False, None, ""
-
-    if not is_bearish(confirm_candle):
-        return False, None, ""
-    if confirm_candle["close"] >= signal["close"]:
-        return False, None, ""
-
-    signal_candle = confirm_candle.copy()
-    signal_candle["pattern_high"] = signal["high"]
-    signal_candle["engulfing_close"] = signal["close"]
-    signal_candle["confirmation_close"] = confirm_candle["close"]
-
-    _log("info", "BEARISH_ENGULFING",
-         f"Bearish Engulfing + Confirmation: "
-         f"Engulf body {smart_fmt(signal_body)} (range ratio: {(signal_body / signal_range) * 100:.1f}%) | "
-         f"Engulf close {smart_fmt(signal['close'])} | "
-         f"Confirmation close {smart_fmt(confirm_candle['close'])} < Engulf close -> CONFIRMED")
-    return True, signal_candle, "BEARISH_ENGULFING"
-
-
-def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
-        return False, None, ""
-
-    confirm_candle = candles[-2]
-    signal = candles[-3]
-    prev = candles[-4]
-
-    if not is_bearish(prev):
-        return False, None, ""
-    if not is_bullish(signal):
-        return False, None, ""
-    if signal["open"] >= prev["close"] or signal["close"] <= prev["open"]:
-        return False, None, ""
-
-    signal_body = candle_body(signal)
-    signal_range = candle_range(signal)
-
-    if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
-        return False, None, ""
-
-    if not is_bullish(confirm_candle):
-        return False, None, ""
-    if confirm_candle["close"] <= signal["close"]:
-        return False, None, ""
-
-    signal_candle = confirm_candle.copy()
-    signal_candle["pattern_low"] = signal["low"]
-    signal_candle["engulfing_close"] = signal["close"]
-    signal_candle["confirmation_close"] = confirm_candle["close"]
-
-    _log("info", "BULLISH_ENGULFING",
-         f"Bullish Engulfing + Confirmation: "
-         f"Engulf body {smart_fmt(signal_body)} (range ratio: {(signal_body / signal_range) * 100:.1f}%) | "
-         f"Engulf close {smart_fmt(signal['close'])} | "
-         f"Confirmation close {smart_fmt(confirm_candle['close'])} > Engulf close -> CONFIRMED")
-    return True, signal_candle, "BULLISH_ENGULFING"
 
 
 # ================================================================
@@ -2200,16 +2059,6 @@ def check_short_signal(
         return False, None, "", rsi_value
 
     triggered, signal_candle, strategy = check_short_signal_strategy_1(candles)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
-        return True, signal_candle, strategy, rsi_value
-
-    triggered, signal_candle, strategy = check_short_signal_strategy_5(candles)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
-        return True, signal_candle, strategy, rsi_value
-
-    triggered, signal_candle, strategy = check_short_signal_bearish_engulfing(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
@@ -2306,8 +2155,8 @@ def check_short_signal_no_rsi(
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
                     continue
 
-                if confirm_candle["close"] >= false_breakout_candle["close"]:
-                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout close {smart_fmt(false_breakout_candle['close'])}"
+                if confirm_candle["close"] >= false_breakout_candle["low"]:
+                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout low {smart_fmt(false_breakout_candle['low'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
                     continue
 
@@ -2343,16 +2192,6 @@ def check_long_signal(
     _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} - LONG filter passes")
 
     triggered, signal_candle, strategy = check_long_signal_strategy_1(candles)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
-        return True, signal_candle, strategy, rsi
-
-    triggered, signal_candle, strategy = check_long_signal_strategy_5(candles)
-    if triggered:
-        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
-        return True, signal_candle, strategy, rsi
-
-    triggered, signal_candle, strategy = check_long_signal_bullish_engulfing(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
@@ -2449,8 +2288,8 @@ def check_long_signal_no_rsi(
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
                     continue
 
-                if confirm_candle["close"] <= false_breakout_candle["close"]:
-                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout close {smart_fmt(false_breakout_candle['close'])}"
+                if confirm_candle["close"] <= false_breakout_candle["high"]:
+                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout high {smart_fmt(false_breakout_candle['high'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
                     continue
 
@@ -2802,6 +2641,9 @@ class SRLevelManager:
                     self._processed_indices.add(idx)
                     self._last_processed_index = max(self._last_processed_index, idx)
 
+                # NEW: Check for broken levels and replace if confirmation failed
+                self._check_broken_levels(candles, initializing=False)
+
                 self._age_levels()
 
                 if candles:
@@ -2994,6 +2836,19 @@ class SRLevelManager:
         return expired_levels
 
     def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
+        """
+        S/R Replacement System — NOT a trading strategy.
+
+        When a genuine breakout occurs (close beyond the level) but the normal
+        breakout confirmation FAILS, the old level is removed and a new level
+        is created at the breakout candle's extreme (high for resistance,
+        low for support). This only updates S/R levels — it does NOT generate
+        any trade signals.
+
+        This is completely separate from the false-breakout reversal strategy,
+        which is handled elsewhere and requires the close to return INSIDE the
+        level (opposite condition).
+        """
         if len(candles) < 3:
             return
 
@@ -3003,6 +2858,10 @@ class SRLevelManager:
         if not break_candle or not confirm_candle:
             return
 
+        # --- RESISTANCE REPLACEMENT ---
+        # Genuine breakout: breakout_close > resistance
+        # Confirmation fails: confirm not bullish OR confirm close <= break close
+        replaced_resistances = []
         for i, level in enumerate(self.resistance_levels):
             resistance_price = level["price"]
             if break_candle["close"] > resistance_price:
@@ -3011,7 +2870,7 @@ class SRLevelManager:
                     confirm_candle["close"] <= break_candle["close"]
                 )
                 if confirm_failed:
-                    old_resistance = self.resistance_levels.pop(i)
+                    old_resistance = self.resistance_levels[i]
                     new_price = break_candle["high"]
                     new_level = {
                         "price": new_price,
@@ -3024,6 +2883,8 @@ class SRLevelManager:
                         "break_price": break_candle["close"],
                         "candle_type": "BREAKOUT"
                     }
+                    # Remove old level, add new level
+                    self.resistance_levels.pop(i)
                     self.resistance_levels.append(new_level)
                     _log("info", f"S/R [{self.symbol}]",
                          f"RESISTANCE REPLACED: {smart_fmt(old_resistance['price'])} -> {smart_fmt(new_price)}")
@@ -3037,6 +2898,9 @@ class SRLevelManager:
                         )
                     break
 
+        # --- SUPPORT REPLACEMENT ---
+        # Genuine breakdown: breakout_close < support
+        # Confirmation fails: confirm not bearish OR confirm close >= break close
         for i, level in enumerate(self.support_levels):
             support_price = level["price"]
             if break_candle["close"] < support_price:
@@ -3045,7 +2909,7 @@ class SRLevelManager:
                     confirm_candle["close"] >= break_candle["close"]
                 )
                 if confirm_failed:
-                    old_support = self.support_levels.pop(i)
+                    old_support = self.support_levels[i]
                     new_price = break_candle["low"]
                     new_level = {
                         "price": new_price,
@@ -3058,6 +2922,8 @@ class SRLevelManager:
                         "break_price": break_candle["close"],
                         "candle_type": "BREAKDOWN"
                     }
+                    # Remove old level, add new level
+                    self.support_levels.pop(i)
                     self.support_levels.append(new_level)
                     _log("info", f"S/R [{self.symbol}]",
                          f"SUPPORT REPLACED: {smart_fmt(old_support['price'])} -> {smart_fmt(new_price)}")
@@ -4592,10 +4458,8 @@ class TradingBot:
             if direction == "SHORT":
                 if strategy_name in ("SUPPORT_BREAKDOWN_SHORT", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"):
                     sl = signal_candle.get("pattern_high", signal_candle["high"])
-                elif strategy_name == "BEARISH_DOJI":
-                    sl = signal_candle.get("pattern_high", signal_candle["high"])
                 elif strategy_name in ("STRATEGY_1_SHORT", "RANGE_BREAK_SHORT",
-                                        "VOL_EXPANSION_SHORT", "BEARISH_ENGULFING") and "pattern_high" in signal_candle:
+                                        "VOL_EXPANSION_SHORT") and "pattern_high" in signal_candle:
                     sl = signal_candle["pattern_high"]
                 else:
                     store = self.candle_store.get(symbol)
@@ -4603,10 +4467,8 @@ class TradingBot:
             else:
                 if strategy_name in ("RESISTANCE_BREAKOUT_LONG", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"):
                     sl = signal_candle.get("pattern_low", signal_candle["low"])
-                elif strategy_name == "BULLISH_DOJI":
-                    sl = signal_candle.get("pattern_low", signal_candle["low"])
                 elif strategy_name in ("STRATEGY_1_LONG", "RANGE_BREAK_LONG",
-                                        "VOL_EXPANSION_LONG", "BULLISH_ENGULFING") and "pattern_low" in signal_candle:
+                                        "VOL_EXPANSION_LONG") and "pattern_low" in signal_candle:
                     sl = signal_candle["pattern_low"]
                 else:
                     store = self.candle_store.get(symbol)
@@ -4674,12 +4536,8 @@ class TradingBot:
                 strategy_category = " [S/R FALSE BREAKOUT REVERSAL]"
             elif strategy_name in ("RESISTANCE_BREAKOUT_LONG", "SUPPORT_BREAKDOWN_SHORT"):
                 strategy_category = " [S/R BREAKOUT]"
-            elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
-                strategy_category = " [ENGULFING + CONFIRMATION]"
             elif strategy_name in ("VOL_EXPANSION_SHORT", "VOL_EXPANSION_LONG"):
                 strategy_category = " [VOL EXPANSION + CONFIRMATION]"
-            elif strategy_name in ("BEARISH_DOJI", "BULLISH_DOJI"):
-                strategy_category = f" [DOJI - body <= {DOJI_BODY_RATIO_MAX * 100:.0f}%]"
 
             print()
             print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] - {strategy_name}{strategy_category}")
@@ -5170,6 +5028,7 @@ class TradingBot:
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
         print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
+        print(f"  Range Break Body  : breakout body >= {RANGE_BREAK_BODY_MULTIPLIER:.2f}x avg lookback body (previous {RANGE_BREAK_LOOKBACK} candles)")
         print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
               f"requires 1 confirmation candle after breakout")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
@@ -5178,6 +5037,7 @@ class TradingBot:
         print(f"  S/R Merging       : ENABLED (weighted avg by touches/strength, threshold={SR_MERGE_THRESHOLD*100:.2f}%)")
         print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price)")
         print(f"  S/R Min Distance  : ENABLED ({MIN_SR_DISTANCE_PERCENT}% minimum separation - runs ITERATIVELY)")
+        print(f"  S/R Replacement   : ENABLED (genuine breakout + failed confirmation -> replace level)")
         print(f"  S/R Logging       : NEW → MERGED → RECLASSIFIED → FILTERED → FINAL (clean concise)")
         print(f"  S/R Rejection Log : Detailed reasons (logs only - no email)")
         print(f"  S/R Email Alerts  : REJECTION EMAILS DISABLED - all rejection details in logs only")
@@ -5206,10 +5066,6 @@ class TradingBot:
         print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
         print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
               f"rejects if contracts < 1 (no max(1,...) fallback)")
-        print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
-        print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
-        print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
-        print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -5514,12 +5370,9 @@ def main() -> None:
     print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
     print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
           f"rejects if contracts < 1 (no max(1,...) fallback)")
+    print(f"  Range Break Body  : breakout body >= {RANGE_BREAK_BODY_MULTIPLIER:.2f}x avg lookback body (previous {RANGE_BREAK_LOOKBACK} candles)")
     print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
           f"requires 1 confirmation candle after breakout")
-    print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
-    print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
-    print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
-    print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
     if trading_capital <= 0:
