@@ -1119,9 +1119,8 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 
 RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
-VOL_EXP_TOLERANCE = 0.002   # 0.20%
+VOL_EXP_TOLERANCE = 0.002
 
-# Range Break breakout body must be >= 1.70x the average lookback body
 RANGE_BREAK_BODY_MULTIPLIER = 1.70
 
 SR_LOOKBACK = 100
@@ -1610,7 +1609,6 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
 
-    # breakout body must be >= 1.70x the average lookback body
     if breakout_body <= 0 or breakout_body < RANGE_BREAK_BODY_MULTIPLIER * avg_range_body:
         return False, None, ""
 
@@ -1627,17 +1625,6 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
 
 
 def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    """
-    Volume Expansion SHORT:
-      - Requires one extra closed confirmation candle after the breakout candle.
-      - SHORT structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
-        candles[-3] = breakout candle
-        candles[-2] = confirmation candle (must close BELOW breakout candle low)
-        candles[-1] = currently forming candle (never used)
-      - 21-candle lookback, repeated low detection (tolerance = VOL_EXP_TOLERANCE),
-        and volume expansion condition all unchanged.
-      - SL anchored to the breakout candle's HIGH.
-    """
     lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 3:
         return False, None, ""
@@ -1766,7 +1753,6 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         if not is_bearish(confirm_candle):
             continue
 
-        # confirmation must close BELOW the false-breakout candle's LOW
         if confirm_candle["close"] >= false_breakout_candle["low"]:
             continue
 
@@ -1851,7 +1837,6 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
 
-    # breakout body must be >= 1.70x the average lookback body
     if breakout_body <= 0 or breakout_body < RANGE_BREAK_BODY_MULTIPLIER * avg_range_body:
         return False, None, ""
 
@@ -1868,17 +1853,6 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
 
 
 def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
-    """
-    Volume Expansion LONG:
-      - Requires one extra closed confirmation candle after the breakout candle.
-      - LONG structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
-        candles[-3] = breakout candle
-        candles[-2] = confirmation candle (must close ABOVE breakout candle high)
-        candles[-1] = currently forming candle (never used)
-      - 21-candle lookback, repeated high detection (tolerance = VOL_EXP_TOLERANCE),
-        and volume expansion condition all unchanged.
-      - SL anchored to the breakout candle's LOW.
-    """
     lookback = VOL_EXP_LOOKBACK
     if len(candles) < lookback + 3:
         return False, None, ""
@@ -2007,7 +1981,6 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
         if not is_bullish(confirm_candle):
             continue
 
-        # confirmation must close ABOVE the false-breakout candle's HIGH
         if confirm_candle["close"] <= false_breakout_candle["high"]:
             continue
 
@@ -2631,7 +2604,6 @@ class SRLevelManager:
                     self._processed_indices.add(idx)
                     self._last_processed_index = max(self._last_processed_index, idx)
 
-                # Check for broken levels and replace if confirmation failed
                 self._check_broken_levels(candles, initializing=False)
 
                 self._age_levels()
@@ -2827,12 +2799,12 @@ class SRLevelManager:
 
     def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
         """
-        S/R Replacement System — NOT a trading strategy.
+        S/R Replacement System - NOT a trading strategy.
 
         When a genuine breakout occurs (close beyond the level) but the normal
         breakout confirmation FAILS, the old level is removed and a new level
         is created at the breakout candle's extreme (high for resistance,
-        low for support). This only updates S/R levels — it does NOT generate
+        low for support). This only updates S/R levels - it does NOT generate
         any trade signals.
 
         This is completely separate from the false-breakout reversal strategy,
@@ -2848,7 +2820,6 @@ class SRLevelManager:
         if not break_candle or not confirm_candle:
             return
 
-        # --- RESISTANCE REPLACEMENT ---
         for i, level in enumerate(self.resistance_levels):
             resistance_price = level["price"]
             if break_candle["close"] > resistance_price:
@@ -2884,7 +2855,6 @@ class SRLevelManager:
                         )
                     break
 
-        # --- SUPPORT REPLACEMENT ---
         for i, level in enumerate(self.support_levels):
             support_price = level["price"]
             if break_candle["close"] < support_price:
@@ -4983,9 +4953,10 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
-        print("|   Position sizing uses user-provided lot/contract size. |")
-        print("|   Volume Expansion now requires a confirmation candle.  |")
+        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9            |")
+        print("|   Position sizing uses user-provided lot/contract size.|")
+        print("|   Strategy set: Strategy 1, Range Break, Vol Expansion,|")
+        print("|   S/R Breakout, S/R False Breakout Reversal.           |")
         print("+========================================================+")
         print()
 
@@ -5051,8 +5022,6 @@ class TradingBot:
               f"rejects if contracts < 1 (no max(1,...) fallback)")
         print(f"  Active Strategies : Strategy 1 (RSI), Range Break, Vol Expansion, "
               f"S/R Breakout, S/R False Breakout Reversal")
-        print(f"  Removed Strategies: Bullish Engulfing, Bearish Engulfing, "
-              f"Bullish Doji, Bearish Doji (fully removed - cannot generate signals)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -5284,7 +5253,7 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +========================================================+")
-    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.9 (FIXED)   |")
+    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.9          |")
     print("  +========================================================+")
 
     _divider("SETUP")
@@ -5362,8 +5331,6 @@ def main() -> None:
           f"requires 1 confirmation candle after breakout")
     print(f"  Active Strategies : Strategy 1 (RSI), Range Break, Vol Expansion, "
           f"S/R Breakout, S/R False Breakout Reversal")
-    print(f"  Removed Strategies: Bullish Engulfing, Bearish Engulfing, "
-          f"Bullish Doji, Bearish Doji (fully removed)")
     print()
 
     if trading_capital <= 0:
