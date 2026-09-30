@@ -1113,18 +1113,15 @@ RSI_MIN_CANDLES = RSI_PERIOD + 1
 FILL_POLL_INTERVAL = 0.5
 FILL_POLL_TIMEOUT = 15
 
-DOJI_BODY_RATIO_MAX = 0.20
-
 TP_RR_RATIO = 2.0
 TP_MAX_PCT = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
 
-MIN_ENGULF_BODY_PCT = 0.30
 RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
 VOL_EXP_TOLERANCE = 0.002   # 0.20%
 
-# NEW: Range Break breakout body must be >= 1.70x the average lookback body
+# Range Break breakout body must be >= 1.70x the average lookback body
 RANGE_BREAK_BODY_MULTIPLIER = 1.70
 
 SR_LOOKBACK = 100
@@ -1555,13 +1552,6 @@ def is_bearish(c: dict) -> bool:
     return c["close"] < c["open"]
 
 
-def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
-    r = candle_range(c)
-    if r <= 0:
-        return False
-    return (candle_body(c) / r) <= body_ratio_max
-
-
 # ================================================================
 #  13a. SHORT STRATEGIES
 # ================================================================
@@ -1620,7 +1610,7 @@ def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
 
-    # NEW: breakout body must be >= 1.70x the average lookback body
+    # breakout body must be >= 1.70x the average lookback body
     if breakout_body <= 0 or breakout_body < RANGE_BREAK_BODY_MULTIPLIER * avg_range_body:
         return False, None, ""
 
@@ -1776,7 +1766,7 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         if not is_bearish(confirm_candle):
             continue
 
-        # NEW: confirmation must close BELOW the false-breakout candle's LOW
+        # confirmation must close BELOW the false-breakout candle's LOW
         if confirm_candle["close"] >= false_breakout_candle["low"]:
             continue
 
@@ -1861,7 +1851,7 @@ def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[d
     avg_range_body = sum(range_bodies) / len(range_bodies)
     breakout_body = candle_body(break_candle)
 
-    # NEW: breakout body must be >= 1.70x the average lookback body
+    # breakout body must be >= 1.70x the average lookback body
     if breakout_body <= 0 or breakout_body < RANGE_BREAK_BODY_MULTIPLIER * avg_range_body:
         return False, None, ""
 
@@ -2017,7 +2007,7 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
         if not is_bullish(confirm_candle):
             continue
 
-        # NEW: confirmation must close ABOVE the false-breakout candle's HIGH
+        # confirmation must close ABOVE the false-breakout candle's HIGH
         if confirm_candle["close"] <= false_breakout_candle["high"]:
             continue
 
@@ -2641,7 +2631,7 @@ class SRLevelManager:
                     self._processed_indices.add(idx)
                     self._last_processed_index = max(self._last_processed_index, idx)
 
-                # NEW: Check for broken levels and replace if confirmation failed
+                # Check for broken levels and replace if confirmation failed
                 self._check_broken_levels(candles, initializing=False)
 
                 self._age_levels()
@@ -2859,9 +2849,6 @@ class SRLevelManager:
             return
 
         # --- RESISTANCE REPLACEMENT ---
-        # Genuine breakout: breakout_close > resistance
-        # Confirmation fails: confirm not bullish OR confirm close <= break close
-        replaced_resistances = []
         for i, level in enumerate(self.resistance_levels):
             resistance_price = level["price"]
             if break_candle["close"] > resistance_price:
@@ -2883,7 +2870,6 @@ class SRLevelManager:
                         "break_price": break_candle["close"],
                         "candle_type": "BREAKOUT"
                     }
-                    # Remove old level, add new level
                     self.resistance_levels.pop(i)
                     self.resistance_levels.append(new_level)
                     _log("info", f"S/R [{self.symbol}]",
@@ -2899,8 +2885,6 @@ class SRLevelManager:
                     break
 
         # --- SUPPORT REPLACEMENT ---
-        # Genuine breakdown: breakout_close < support
-        # Confirmation fails: confirm not bearish OR confirm close >= break close
         for i, level in enumerate(self.support_levels):
             support_price = level["price"]
             if break_candle["close"] < support_price:
@@ -2922,7 +2906,6 @@ class SRLevelManager:
                         "break_price": break_candle["close"],
                         "candle_type": "BREAKDOWN"
                     }
-                    # Remove old level, add new level
                     self.support_levels.pop(i)
                     self.support_levels.append(new_level)
                     _log("info", f"S/R [{self.symbol}]",
@@ -5066,6 +5049,10 @@ class TradingBot:
         print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
         print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
               f"rejects if contracts < 1 (no max(1,...) fallback)")
+        print(f"  Active Strategies : Strategy 1 (RSI), Range Break, Vol Expansion, "
+              f"S/R Breakout, S/R False Breakout Reversal")
+        print(f"  Removed Strategies: Bullish Engulfing, Bearish Engulfing, "
+              f"Bullish Doji, Bearish Doji (fully removed - cannot generate signals)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -5373,6 +5360,10 @@ def main() -> None:
     print(f"  Range Break Body  : breakout body >= {RANGE_BREAK_BODY_MULTIPLIER:.2f}x avg lookback body (previous {RANGE_BREAK_LOOKBACK} candles)")
     print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
           f"requires 1 confirmation candle after breakout")
+    print(f"  Active Strategies : Strategy 1 (RSI), Range Break, Vol Expansion, "
+          f"S/R Breakout, S/R False Breakout Reversal")
+    print(f"  Removed Strategies: Bullish Engulfing, Bearish Engulfing, "
+          f"Bullish Doji, Bearish Doji (fully removed)")
     print()
 
     if trading_capital <= 0:
