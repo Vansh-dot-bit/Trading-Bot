@@ -280,6 +280,8 @@ SuperTrend : Monitored post-entry"""
             body += f"\nReversal Close: {smart_fmt(signal['reversal_candle_close'])}"
         if "confirmation_close" in signal:
             body += f"\nConfirm Close: {smart_fmt(signal['confirmation_close'])}"
+        if signal.get("sr_exit_target"):
+            body += f"\nS/R Exit Target: {smart_fmt(signal['sr_exit_target'])} (touch-based)"
 
         self._dispatch_async(subject, body)
         return True
@@ -1139,6 +1141,15 @@ ST2_LENGTH = 21
 ST2_FACTOR = 1.0
 
 POST_EXIT_COOLDOWN_CANDLES = 2
+
+# Strategies whose exit uses the nearest S/R level (touch-based, immediate),
+# and which must NOT use SuperTrend-based exit.
+SR_TOUCH_EXIT_STRATEGIES = (
+    "RANGE_BREAK_LONG",
+    "RANGE_BREAK_SHORT",
+    "VOL_EXPANSION_LONG",
+    "VOL_EXPANSION_SHORT",
+)
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m": {"resolution": "1m", "api_resolution": "1m", "ws_channel": "candlestick_1m", "secs": 60},
@@ -2798,19 +2809,6 @@ class SRLevelManager:
         return expired_levels
 
     def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
-        """
-        S/R Replacement System - NOT a trading strategy.
-
-        When a genuine breakout occurs (close beyond the level) but the normal
-        breakout confirmation FAILS, the old level is removed and a new level
-        is created at the breakout candle's extreme (high for resistance,
-        low for support). This only updates S/R levels - it does NOT generate
-        any trade signals.
-
-        This is completely separate from the false-breakout reversal strategy,
-        which is handled elsewhere and requires the close to return INSIDE the
-        level (opposite condition).
-        """
         if len(candles) < 3:
             return
 
@@ -3509,6 +3507,37 @@ class TradingBot:
             except Exception as e:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
 
+    def _find_nearest_sr_exit_target(self, symbol: str, direction: str,
+                                      entry: float) -> Optional[float]:
+        """
+        Returns the nearest Resistance above entry for LONG, or nearest Support
+        below entry for SHORT, using the existing S/R levels. Returns None if
+        none found (in which case no S/R-based touch exit will be applied).
+        """
+        sr_manager = self.sr_managers.get(symbol)
+        if sr_manager is None or entry <= 0:
+            return None
+
+        with sr_manager._lock:
+            if direction == "LONG":
+                candidates = [
+                    l["price"] for l in sr_manager.resistance_levels
+                    if l.get("strength", 1) >= sr_manager.min_strength
+                    and l["price"] > entry
+                ]
+                if not candidates:
+                    return None
+                return float(min(candidates))
+            else:
+                candidates = [
+                    l["price"] for l in sr_manager.support_levels
+                    if l.get("strength", 1) >= sr_manager.min_strength
+                    and l["price"] < entry
+                ]
+                if not candidates:
+                    return None
+                return float(max(candidates))
+
     def _close_trade(self, symbol: str, trade: dict, reason: str,
                       exit_price: Optional[float] = None) -> None:
         try:
@@ -3521,7 +3550,7 @@ class TradingBot:
             local_exit_price: Optional[float] = None
             if exit_price is not None and exit_price > 0:
                 local_exit_price = float(exit_price)
-            elif reason == "TAKE_PROFIT" and trade.get("take_profit"):
+            elif reason in ("TAKE_PROFIT", "SR_TOUCH") and trade.get("take_profit"):
                 local_exit_price = float(trade["take_profit"])
             elif reason == "STOP_LOSS" and trade.get("stop_loss"):
                 local_exit_price = float(trade["stop_loss"])
@@ -3605,7 +3634,7 @@ class TradingBot:
             if local_exit_price is not None:
                 trade["exit_price"] = local_exit_price
 
-            if reason in ("TAKE_PROFIT", "ST_EXIT"):
+            if reason in ("TAKE_PROFIT", "ST_EXIT", "SR_TOUCH"):
                 tp = local_exit_price or trade.get("take_profit")
                 trade["exit_price"] = tp
                 self.tp_events.append({
@@ -3699,6 +3728,11 @@ class TradingBot:
     def _check_supertrend_conditions(self, symbol: str, closed_candles: List[dict]) -> None:
         trade = self.active_trades.get(symbol)
         if not trade or "_reserved" in trade:
+            return
+
+        # Range Break / Volume Expansion do NOT use SuperTrend exit or entry
+        strategy = trade.get("strategy", "")
+        if strategy in SR_TOUCH_EXIT_STRATEGIES:
             return
 
         direction = trade.get("direction", "SHORT")
@@ -4364,9 +4398,34 @@ class TradingBot:
             if trade.get("st_mode", False):
                 return
 
-            tp = trade.get("take_profit")
             direction = trade.get("direction", "SHORT")
             entry = trade["entry"]
+
+            # --- S/R touch exit for Range Break / Volume Expansion ---
+            strategy = trade.get("strategy", "")
+            if strategy in SR_TOUCH_EXIT_STRATEGIES:
+                target = trade.get("sr_exit_target")
+                if target is None:
+                    return
+
+                if direction == "LONG" and candle["high"] >= target:
+                    _log("info", "SR-TOUCH-EXIT",
+                         f"[{symbol}] LONG {strategy} - price reached nearest Resistance "
+                         f"{smart_fmt(target)} (high={smart_fmt(candle['high'])}) -> exit immediately")
+                    self._close_trade(symbol, trade, "SR_TOUCH", exit_price=target)
+                    return
+
+                if direction == "SHORT" and candle["low"] <= target:
+                    _log("info", "SR-TOUCH-EXIT",
+                         f"[{symbol}] SHORT {strategy} - price reached nearest Support "
+                         f"{smart_fmt(target)} (low={smart_fmt(candle['low'])}) -> exit immediately")
+                    self._close_trade(symbol, trade, "SR_TOUCH", exit_price=target)
+                    return
+
+                return
+
+            # --- Original TP touch logic (Strategy 1 / S/R Breakout / S/R Reversal) ---
+            tp = trade.get("take_profit")
             if tp is None:
                 return
 
@@ -4433,6 +4492,21 @@ class TradingBot:
 
             tp = compute_take_profit(entry, sl, direction)
 
+            # For Range Break / Volume Expansion: resolve nearest S/R exit target
+            sr_exit_target: Optional[float] = None
+            if strategy_name in SR_TOUCH_EXIT_STRATEGIES:
+                sr_exit_target = self._find_nearest_sr_exit_target(symbol, direction, entry)
+                if sr_exit_target is None:
+                    self._log("warning", "SIGNAL",
+                              f"[{symbol}] {strategy_name} - no S/R exit target found "
+                              f"({'Resistance above' if direction == 'LONG' else 'Support below'} entry); "
+                              f"trade will rely on SL only.")
+                else:
+                    _log("info", "SIGNAL",
+                         f"[{symbol}] {strategy_name} - S/R touch exit target set to "
+                         f"{smart_fmt(sr_exit_target)} "
+                         f"({'nearest Resistance above' if direction == 'LONG' else 'nearest Support below'} entry)")
+
             with self._trade_lock:
                 if len(self.active_trades) >= self.max_trades:
                     self._log("info", "SIGNAL", f"[{symbol}] {direction} {strategy_name} REJECTED: Max trades reached")
@@ -4465,6 +4539,7 @@ class TradingBot:
                     "confirmation_close": signal_candle.get("confirmation_close", None),
                     "false_breakout_high": signal_candle.get("false_breakout_high", None),
                     "false_breakout_low": signal_candle.get("false_breakout_low", None),
+                    "sr_exit_target": sr_exit_target,
                 }
                 self.signals.append(signal)
 
@@ -4477,6 +4552,7 @@ class TradingBot:
                         "strategy": strategy_name, "rsi": rsi_value,
                         "st_mode": False, "no_rsi": no_rsi,
                         "balance_before_entry": current_capital,
+                        "sr_exit_target": sr_exit_target,
                     }
 
             rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
@@ -4491,12 +4567,16 @@ class TradingBot:
                 strategy_category = " [S/R BREAKOUT]"
             elif strategy_name in ("VOL_EXPANSION_SHORT", "VOL_EXPANSION_LONG"):
                 strategy_category = " [VOL EXPANSION + CONFIRMATION]"
+            elif strategy_name in ("RANGE_BREAK_LONG", "RANGE_BREAK_SHORT"):
+                strategy_category = " [RANGE BREAK]"
 
             print()
             print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] - {strategy_name}{strategy_category}")
             print(f"           Entry       : {smart_fmt(entry)}")
             print(f"           Stop Loss   : {smart_fmt(sl)} (distance={smart_fmt(stop_dist)}) [CANDLE CLOSE]")
             print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
+            if sr_exit_target is not None:
+                print(f"           S/R Exit    : {smart_fmt(sr_exit_target)} (touch-based, immediate)")
             print(f"           Risk        : ${risk_usd:,.2f} ({self.config['risk_pct']}%)")
             print(f"           Lot Size    : {self.user_lot_size}")
             print(f"           RSI(14)     : {rsi_str}")
@@ -4510,7 +4590,10 @@ class TradingBot:
                 if signal.get("break_candle_close"):
                     print(f"           Break Close  : {smart_fmt(signal['break_candle_close'])}")
             print(f"           Mode        : {signal['mode']}")
-            print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
+            if strategy_name in SR_TOUCH_EXIT_STRATEGIES:
+                print(f"           Exit Mode   : S/R touch (nearest level) - SuperTrend exit DISABLED")
+            else:
+                print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
             print()
 
             if self.notifier:
@@ -4615,15 +4698,25 @@ class TradingBot:
 
             print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | filled={actual_filled_size} contracts")
 
-            bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
-            bracket_ok = bracket_result and "error" not in bracket_result
+            strategy_name = signal.get("strategy", "")
+            sr_exit_target = signal.get("sr_exit_target")
 
-            if bracket_ok:
-                print(f"  [TP BRACKET OK] Take profit bracket placed at {smart_fmt(tp)}")
-                _log("info", "BRACKET", f"TP bracket placed for {symbol} at {smart_fmt(tp)}")
+            # For Range Break / Volume Expansion: do NOT place an exchange TP bracket.
+            # Exit is managed locally via S/R touch.
+            if strategy_name in SR_TOUCH_EXIT_STRATEGIES and sr_exit_target is not None:
+                bracket_ok = False
+                _log("info", "BRACKET", f"[{symbol}] {strategy_name}: no exchange TP bracket placed - "
+                                       f"exit managed locally at S/R touch {smart_fmt(sr_exit_target)}")
             else:
-                self._log("warning", "BRACKET", f"TP bracket FAILED for {symbol}: {bracket_result} "
-                                                  f"(local candle-close stop loss still protects the position)")
+                bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
+                bracket_ok = bracket_result and "error" not in bracket_result
+
+                if bracket_ok:
+                    print(f"  [TP BRACKET OK] Take profit bracket placed at {smart_fmt(tp)}")
+                    _log("info", "BRACKET", f"TP bracket placed for {symbol} at {smart_fmt(tp)}")
+                else:
+                    self._log("warning", "BRACKET", f"TP bracket FAILED for {symbol}: {bracket_result} "
+                                                      f"(local candle-close stop loss still protects the position)")
 
             self._log("info", "LOCAL-SL", f"Stop loss managed locally for {symbol} at {smart_fmt(sl)} (candle close)")
 
@@ -4644,6 +4737,7 @@ class TradingBot:
                 "no_rsi": signal.get("no_rsi", False),
                 "balance_before_entry": balance_before_entry,
                 "user_lot_size": self.user_lot_size,
+                "sr_exit_target": sr_exit_target,
             }
 
             with self._trade_lock:
@@ -4957,6 +5051,7 @@ class TradingBot:
         print("|   Position sizing uses user-provided lot/contract size.|")
         print("|   Strategy set: Strategy 1, Range Break, Vol Expansion,|")
         print("|   S/R Breakout, S/R False Breakout Reversal.           |")
+        print("|   Range Break & Vol Expansion: S/R touch exit (immediate)|")
         print("+========================================================+")
         print()
 
@@ -4985,6 +5080,9 @@ class TradingBot:
         print(f"  Range Break Body  : breakout body >= {RANGE_BREAK_BODY_MULTIPLIER:.2f}x avg lookback body (previous {RANGE_BREAK_LOOKBACK} candles)")
         print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
               f"requires 1 confirmation candle after breakout")
+        print(f"  Exit - Range Break: LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
+        print(f"  Exit - Vol Expand : LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
+        print(f"  Exit - Others     : Strategy 1 & S/R Breakout & S/R Reversal use TP touch + SuperTrend (unchanged)")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
         print(f"  S/R Init          : Complete historical scan (all swing points) - once at startup")
         print(f"  S/R Live          : Incremental updates per new candle - maintains processed-state")
@@ -5329,6 +5427,9 @@ def main() -> None:
     print(f"  Range Break Body  : breakout body >= {RANGE_BREAK_BODY_MULTIPLIER:.2f}x avg lookback body (previous {RANGE_BREAK_LOOKBACK} candles)")
     print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
           f"requires 1 confirmation candle after breakout")
+    print(f"  Exit - Range Break: LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
+    print(f"  Exit - Vol Expand : LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
+    print(f"  Exit - Others     : Strategy 1 & S/R Breakout & S/R Reversal use TP touch + SuperTrend (unchanged)")
     print(f"  Active Strategies : Strategy 1 (RSI), Range Break, Vol Expansion, "
           f"S/R Breakout, S/R False Breakout Reversal")
     print()
@@ -5384,6 +5485,10 @@ def main() -> None:
                 for sym, t in bot.active_trades.items():
                     if isinstance(t, dict) and t.get("st_mode"):
                         st_info += f"[{sym}:ST-MODE] "
+                sr_exit_info = ""
+                for sym, t in bot.active_trades.items():
+                    if isinstance(t, dict) and t.get("strategy") in SR_TOUCH_EXIT_STRATEGIES and t.get("sr_exit_target"):
+                        sr_exit_info += f"[{sym}:SR-EXIT {smart_fmt(t['sr_exit_target'])}] "
                 cooldown_info = ""
                 for sym, remaining in bot._post_exit_cooldown.items():
                     if remaining and remaining > 0:
@@ -5399,6 +5504,7 @@ def main() -> None:
                     f"{bot.daily_loss_tracker.status()}  "
                     + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
                     + (f"  {st_info}" if st_info else "")
+                    + (f"  {sr_exit_info}" if sr_exit_info else "")
                     + (f"  {cooldown_info}" if cooldown_info else "")
                 )
             except Exception as e:
