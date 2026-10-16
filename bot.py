@@ -2273,12 +2273,6 @@ class SRLevelManager:
         self._sr_last_batch_trigger_len = 0
         self._sr_last_confirmed_index = -1
 
-        # NEW-level notification deferral:
-        # levels created during the current batch are collected here and only
-        # notified AFTER merge / spacing / current-price filter / classification.
-        self._batch_new_levels: List[Dict] = []
-        self._new_level_seq = 0
-
         self._lock = threading.RLock()
 
     def _progress_log(self, msg: str) -> None:
@@ -2568,9 +2562,7 @@ class SRLevelManager:
 
         Uses the existing SR_MERGE_THRESHOLD (0.5%) to reinforce a nearby
         existing level instead of creating a duplicate. If no nearby level
-        exists, a new level is added and registered in
-        ``self._batch_new_levels`` for deferred NEW-email notification
-        (sent only after all post-processing filters have completed).
+        exists, a new level is added and a NEW S/R email is dispatched.
         """
         if price <= 0:
             return
@@ -2595,14 +2587,12 @@ class SRLevelManager:
                 return
 
         # No nearby level: add as new.
-        self._new_level_seq += 1
         new_level = {
             "price": price,
             "age": 0,
             "strength": 1,
             "touches": 1,
             "type": level_type,
-            "_new_uid": self._new_level_seq,
         }
         if level_type == "RESISTANCE":
             self.resistance_levels.append(new_level)
@@ -2614,8 +2604,8 @@ class SRLevelManager:
         self._log_new_level(level_type, price)
         self._progress_log(f"New {level_type} at {smart_fmt(price)} (swing)")
 
-        # Defer NEW email until after merge/spacing/current-price/classification.
-        self._batch_new_levels.append(new_level)
+        # Notify on genuinely new final level.
+        self._notify_sr_event("NEW", new_level)
 
     def _process_new_sr_batches(self, full_candles: List[dict]) -> None:
         """NEW S/R detection: swing highs/lows over batches of closed candles.
@@ -2700,48 +2690,6 @@ class SRLevelManager:
                 f"{smart_fmt(current_price)}"
             )
 
-    def _notify_surviving_new_levels(self) -> None:
-        """Send NEW emails only for levels created this batch that survived
-        every post-processing step (merge, 1.5% spacing, 0.5% current-price
-        filter, and SUPPORT/RESISTANCE classification).
-
-        Surviving levels are identified by their ``_new_uid`` marker. The
-        marker survives shallow ``dict(level)`` copies (used by
-        reclassification) and the pass-through of unmerged levels in
-        ``_merge_levels`` / ``_apply_final_proximity_filter``. It is lost
-        whenever a level is absorbed into a merged dict, which correctly
-        means it is not a genuinely new final level.
-
-        Called only from the non-initializing branch of ``update_levels``,
-        so historical detection never sends NEW emails.
-        """
-        if not self._batch_new_levels:
-            return
-
-        batch_uids = {
-            lv.get("_new_uid")
-            for lv in self._batch_new_levels
-            if "_new_uid" in lv
-        }
-        if not batch_uids:
-            self._batch_new_levels = []
-            return
-
-        surviving: Dict[int, dict] = {}
-        for lv in self.support_levels:
-            uid = lv.get("_new_uid")
-            if uid in batch_uids:
-                surviving[uid] = lv
-        for lv in self.resistance_levels:
-            uid = lv.get("_new_uid")
-            if uid in batch_uids:
-                surviving[uid] = lv
-
-        for uid, lv in surviving.items():
-            self._notify_sr_event("NEW", lv)
-
-        self._batch_new_levels = []
-
     def update_levels(self, candles: List[dict], initializing: bool = False) -> None:
         if len(candles) < self.lookback:
             self._progress_log(f"Not enough candles: {len(candles)} < {self.lookback}")
@@ -2793,9 +2741,6 @@ class SRLevelManager:
             else:
                 current_idx = len(candles) - 1
 
-                # Reset the deferred NEW-level collection for this batch.
-                self._batch_new_levels = []
-
                 # NEW: batch-based swing detection for incremental S/R
                 self._process_new_sr_batches(candles)
 
@@ -2845,10 +2790,6 @@ class SRLevelManager:
 
                 self._log_final_levels()
 
-                # NEW: notify ONLY for genuinely new levels that survived
-                # every merge, spacing, current-price, and classification step.
-                self._notify_surviving_new_levels()
-
     def _reset_all_levels(self) -> None:
         self.resistance_levels.clear()
         self.support_levels.clear()
@@ -2856,7 +2797,6 @@ class SRLevelManager:
         self.pending_swing_lows.clear()
         self._sr_last_batch_trigger_len = 0
         self._sr_last_confirmed_index = -1
-        self._batch_new_levels = []
 
     def _run_initial_scan(self, candles: List[dict]) -> None:
         """HISTORICAL S/R DETECTION - UNCHANGED.
@@ -3008,7 +2948,6 @@ class SRLevelManager:
             self._last_processed_index = -1
             self._sr_last_batch_trigger_len = 0
             self._sr_last_confirmed_index = -1
-            self._batch_new_levels = []
             _log("info", f"S/R [{self.symbol}]", "Levels reset")
 
 
@@ -5165,7 +5104,7 @@ class TradingBot:
         print(f"  S/R New (live)    : Swing-high/low over batches of {SR_NEW_BATCH_SIZE} closed candles "
               f"({SR_NEW_SWING_SENSITIVITY}-candle left/right sensitivity, deferred confirmation at batch boundaries)")
         print(f"  S/R Replacement   : DISABLED (no breakout-based level replacement)")
-        print(f"  S/R Email Alerts  : NEW + EXPIRED events (NEW sent only after all filters; deduped; marked sent only after delivery)")
+        print(f"  S/R Email Alerts  : NEW + EXPIRED events (deduped; marked sent only after delivery)")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
         print(f"  S/R Current-Price : New-detection filter = {NEW_SR_PRICE_FILTER_PCT*100:.1f}% (was 0.2%)")
         print(f"  S/R Merging       : ENABLED (weighted avg by touches/strength, threshold={SR_MERGE_THRESHOLD*100:.2f}%)")
@@ -5512,7 +5451,7 @@ def main() -> None:
     print(f"  S/R New (live)    : Swing-high/low over batches of {SR_NEW_BATCH_SIZE} closed candles "
           f"({SR_NEW_SWING_SENSITIVITY}-candle left/right sensitivity, deferred confirmation at batch boundaries)")
     print(f"  S/R Replacement   : DISABLED (no breakout-based level replacement)")
-    print(f"  S/R Email Alerts  : NEW + EXPIRED events (NEW sent only after all filters; deduped; marked sent only after delivery)")
+    print(f"  S/R Email Alerts  : NEW + EXPIRED events (deduped; marked sent only after delivery)")
     print(f"  S/R Current-Price : New-detection filter = {NEW_SR_PRICE_FILTER_PCT*100:.1f}% (was 0.2%)")
     print(f"  Active Strategies : Strategy 1 (RSI), Vol Expansion, "
           f"S/R Breakout, S/R False Breakout Reversal")
