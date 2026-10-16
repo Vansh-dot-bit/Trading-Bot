@@ -153,6 +153,7 @@ class GmailNotifier:
         self.recipient_emails = recipient_emails
         self.enabled = enabled
         self._last_sr_alert: Dict[str, str] = {}
+        self._pending_sr_alerts: set = set()
         self._last_rejection_alert: Dict[str, str] = {}
         self._consecutive_failures = 0
         self._disabled_until: float = 0.0
@@ -160,12 +161,31 @@ class GmailNotifier:
         self._backoff_seconds = 600
         self._failures_lock = threading.Lock()
 
-    def _dispatch_async(self, subject: str, body: str) -> None:
+    def _dispatch_async(self, subject: str, body: str,
+                        on_success: Optional[callable] = None,
+                        on_failure: Optional[callable] = None) -> None:
         def _runner():
             try:
-                self._send_email(subject, body)
+                ok = self._send_email(subject, body)
+                if ok:
+                    if on_success is not None:
+                        try:
+                            on_success()
+                        except Exception as e:
+                            _log_exc("GMAIL", f"on_success callback failed: {e}")
+                else:
+                    if on_failure is not None:
+                        try:
+                            on_failure()
+                        except Exception as e:
+                            _log_exc("GMAIL", f"on_failure callback failed: {e}")
             except Exception as e:
                 _log_exc("GMAIL", f"Background email send raised unexpectedly: {e}")
+                if on_failure is not None:
+                    try:
+                        on_failure()
+                    except Exception:
+                        pass
 
         t = threading.Thread(target=_runner, daemon=True, name="GmailSendAsync")
         t.start()
@@ -532,15 +552,13 @@ MONITORED SYMBOLS ({len(symbols)})
             return False
 
         event_key = f"{symbol}_{event_type}_{level_data.get('price', 0):.10f}"
+
+        # Dedup: already successfully sent for this exact event.
         if self._last_sr_alert.get(event_key) == event_type:
             return False
-
-        self._last_sr_alert[event_key] = event_type
-
-        if len(self._last_sr_alert) > 100:
-            keys = list(self._last_sr_alert.keys())
-            for k in keys[:-100]:
-                del self._last_sr_alert[k]
+        # Dedup: a send is already in flight for this exact event.
+        if event_key in self._pending_sr_alerts:
+            return False
 
         if event_type == "NEW":
             event_emoji = "NEW"
@@ -654,7 +672,21 @@ Touches = Number of times price has touched this level
 Age = Candles since level was created
 Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
 
-        self._dispatch_async(subject, body)
+        # Mark as pending so a concurrent duplicate call is suppressed while in flight.
+        self._pending_sr_alerts.add(event_key)
+
+        def _mark_sent():
+            self._pending_sr_alerts.discard(event_key)
+            self._last_sr_alert[event_key] = event_type
+            if len(self._last_sr_alert) > 100:
+                keys = list(self._last_sr_alert.keys())
+                for k in keys[:-100]:
+                    del self._last_sr_alert[k]
+
+        def _mark_failed():
+            self._pending_sr_alerts.discard(event_key)
+
+        self._dispatch_async(subject, body, on_success=_mark_sent, on_failure=_mark_failed)
         return True
 
     def send_sr_rejection(self, symbol: str, direction: str, level_price: float,
@@ -1153,6 +1185,11 @@ SR_MIN_LEVEL_AGE = 0
 SR_MAX_LEVEL_AGE = 100
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
+
+# ---- NEW/incremental S/R detection constants (historical scan untouched) ----
+SR_NEW_BATCH_SIZE = 24                # run new detection every 24 newly closed candles
+SR_NEW_SWING_SENSITIVITY = 5          # left/right candles required for a swing
+NEW_SR_PRICE_FILTER_PCT = 0.005       # 0.5% current-price filter for new detection
 
 MIN_SR_DISTANCE_PERCENT = 1.5
 
@@ -2232,6 +2269,16 @@ class SRLevelManager:
         self._processed_indices: set = set()
         self._last_processed_index = -1
 
+        # NEW/incremental S/R batch tracking (historical scan does not use these)
+        self._sr_last_batch_trigger_len = 0
+        self._sr_last_confirmed_index = -1
+
+        # NEW-level notification deferral:
+        # levels created during the current batch are collected here and only
+        # notified AFTER merge / spacing / current-price filter / classification.
+        self._batch_new_levels: List[Dict] = []
+        self._new_level_seq = 0
+
         self._lock = threading.RLock()
 
     def _progress_log(self, msg: str) -> None:
@@ -2261,17 +2308,17 @@ class SRLevelManager:
         _log("info", "S/R", f"[{self.symbol}] FINAL | S: {s_str} | R: {r_str}")
 
     # ------------------------------------------------------------
-    #  NEW: Safe S/R event notification helper
+    #  Safe S/R event notification helper
     # ------------------------------------------------------------
     def _notify_sr_event(self, event_type: str, level_data: dict) -> None:
         """Safely dispatch an S/R event to the notifier.
 
-        - Called only for new-level detection and expiry events.
+        - Called for new-level detection and expiry events.
         - Snapshots ALL active support/resistance levels for the email.
         - Never raises: notifier errors are logged, not propagated.
-        - GmailNotifier.send_sr_level_event() already dedupes by
-          (symbol, event_type, price), so repeated calls for the same
-          level do not produce duplicate emails.
+        - GmailNotifier.send_sr_level_event() dedupes by
+          (symbol, event_type, price) and marks the event as sent only
+          after a successful delivery, so failures are retried.
         """
         if self.notifier is None:
             return
@@ -2293,14 +2340,25 @@ class SRLevelManager:
                 f"type={event_type} price={level_data.get('price')!r}: {e}"
             )
 
-    def _reclassify_levels_by_price(self, current_price: float) -> None:
+    def _reclassify_levels_by_price(self, current_price: float,
+                                     equal_as_support: bool = False) -> None:
+        """Move levels between SUPPORT/RESISTANCE based on the current price.
+
+        When ``equal_as_support`` is True, a level whose price is exactly
+        equal to ``current_price`` is classified as SUPPORT (used by the
+        new/incremental detection path). The historical path calls this
+        with the default ``False`` to preserve its original behaviour.
+        """
         with self._lock:
             reclassified = []
 
             new_resistances = []
             for level in self.resistance_levels:
                 price = level["price"]
-                if price < current_price:
+                should_be_support = price < current_price or (
+                    equal_as_support and price == current_price
+                )
+                if should_be_support:
                     level_copy = dict(level)
                     level_copy["type"] = "SUPPORT"
                     self.support_levels.append(level_copy)
@@ -2502,6 +2560,188 @@ class SRLevelManager:
 
         return working
 
+    # ------------------------------------------------------------
+    #  NEW/incremental S/R detection (replaces old close-touch method)
+    # ------------------------------------------------------------
+    def _merge_new_candidate(self, level_type: str, price: float) -> None:
+        """Merge a newly detected swing candidate into the active levels.
+
+        Uses the existing SR_MERGE_THRESHOLD (0.5%) to reinforce a nearby
+        existing level instead of creating a duplicate. If no nearby level
+        exists, a new level is added and registered in
+        ``self._batch_new_levels`` for deferred NEW-email notification
+        (sent only after all post-processing filters have completed).
+        """
+        if price <= 0:
+            return
+
+        target_list = self.resistance_levels if level_type == "RESISTANCE" else self.support_levels
+
+        for level in target_list:
+            try:
+                lp = float(level["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if lp <= 0:
+                continue
+            if abs(lp - price) / max(price, 1) <= self.merge_threshold:
+                level["strength"] = min(5, level.get("strength", 1) + 1)
+                level["touches"] = level.get("touches", 1) + 1
+                level["age"] = 0
+                self._progress_log(
+                    f"Reinforced {level_type} at {smart_fmt(lp)} "
+                    f"(strength={level['strength']}, touches={level['touches']})"
+                )
+                return
+
+        # No nearby level: add as new.
+        self._new_level_seq += 1
+        new_level = {
+            "price": price,
+            "age": 0,
+            "strength": 1,
+            "touches": 1,
+            "type": level_type,
+            "_new_uid": self._new_level_seq,
+        }
+        if level_type == "RESISTANCE":
+            self.resistance_levels.append(new_level)
+            self.pending_swing_highs.append(price)
+        else:
+            self.support_levels.append(new_level)
+            self.pending_swing_lows.append(price)
+
+        self._log_new_level(level_type, price)
+        self._progress_log(f"New {level_type} at {smart_fmt(price)} (swing)")
+
+        # Defer NEW email until after merge/spacing/current-price/classification.
+        self._batch_new_levels.append(new_level)
+
+    def _process_new_sr_batches(self, full_candles: List[dict]) -> None:
+        """NEW S/R detection: swing highs/lows over batches of closed candles.
+
+        Triggered once per SR_NEW_BATCH_SIZE (24) newly processed closed
+        candles. For every candle in the confirmable range, a swing high
+        requires its high to exceed the highs of the
+        SR_NEW_SWING_SENSITIVITY (5) candles before and after it; a swing
+        low requires its low to be below the lows of the 5 candles before
+        and after it. Candles near the end of the batch whose right context
+        has not yet closed are deferred to a later batch, so batch
+        boundaries are handled correctly and incomplete candles are never
+        used.
+
+        Historical detection (_run_initial_scan) is unchanged and is not
+        called from here.
+        """
+        n = len(full_candles)
+
+        # Only run once a full new batch of closed candles has accumulated.
+        if n - self._sr_last_batch_trigger_len < SR_NEW_BATCH_SIZE:
+            return
+
+        self._sr_last_batch_trigger_len = n
+
+        sens = SR_NEW_SWING_SENSITIVITY
+        confirmable_end = n - 1 - sens
+        start = max(self._sr_last_confirmed_index + 1, sens)
+
+        if start > confirmable_end:
+            return
+
+        self._progress_log(
+            f"NEW S/R batch scan | candles={n} | confirmable range={start}..{confirmable_end} "
+            f"| left/right sensitivity={sens}"
+        )
+
+        for i in range(start, confirmable_end + 1):
+            c = full_candles[i]
+
+            is_high = True
+            for j in range(1, sens + 1):
+                if c["high"] <= full_candles[i - j]["high"] or c["high"] <= full_candles[i + j]["high"]:
+                    is_high = False
+                    break
+            if is_high:
+                self._merge_new_candidate("RESISTANCE", float(c["high"]))
+
+            is_low = True
+            for j in range(1, sens + 1):
+                if c["low"] >= full_candles[i - j]["low"] or c["low"] >= full_candles[i + j]["low"]:
+                    is_low = False
+                    break
+            if is_low:
+                self._merge_new_candidate("SUPPORT", float(c["low"]))
+
+        self._sr_last_confirmed_index = confirmable_end
+
+    def _filter_new_levels_near_price(self, current_price: float) -> None:
+        """Discard final levels within NEW_SR_PRICE_FILTER_PCT (0.5%) of current price.
+
+        Applied only to the new/incremental S/R detection process. Historical
+        detection remains unchanged.
+        """
+        if current_price <= 0:
+            return
+        threshold = current_price * NEW_SR_PRICE_FILTER_PCT
+
+        def _keep(level):
+            return abs(level["price"] - current_price) > threshold
+
+        before_r = len(self.resistance_levels)
+        before_s = len(self.support_levels)
+        self.resistance_levels = [l for l in self.resistance_levels if _keep(l)]
+        self.support_levels = [l for l in self.support_levels if _keep(l)]
+        removed_r = before_r - len(self.resistance_levels)
+        removed_s = before_s - len(self.support_levels)
+        if removed_r or removed_s:
+            self._progress_log(
+                f"Current-price filter ({NEW_SR_PRICE_FILTER_PCT*100:.1f}%): "
+                f"removed {removed_r} resistance(s), {removed_s} support(s) near "
+                f"{smart_fmt(current_price)}"
+            )
+
+    def _notify_surviving_new_levels(self) -> None:
+        """Send NEW emails only for levels created this batch that survived
+        every post-processing step (merge, 1.5% spacing, 0.5% current-price
+        filter, and SUPPORT/RESISTANCE classification).
+
+        Surviving levels are identified by their ``_new_uid`` marker. The
+        marker survives shallow ``dict(level)`` copies (used by
+        reclassification) and the pass-through of unmerged levels in
+        ``_merge_levels`` / ``_apply_final_proximity_filter``. It is lost
+        whenever a level is absorbed into a merged dict, which correctly
+        means it is not a genuinely new final level.
+
+        Called only from the non-initializing branch of ``update_levels``,
+        so historical detection never sends NEW emails.
+        """
+        if not self._batch_new_levels:
+            return
+
+        batch_uids = {
+            lv.get("_new_uid")
+            for lv in self._batch_new_levels
+            if "_new_uid" in lv
+        }
+        if not batch_uids:
+            self._batch_new_levels = []
+            return
+
+        surviving: Dict[int, dict] = {}
+        for lv in self.support_levels:
+            uid = lv.get("_new_uid")
+            if uid in batch_uids:
+                surviving[uid] = lv
+        for lv in self.resistance_levels:
+            uid = lv.get("_new_uid")
+            if uid in batch_uids:
+                surviving[uid] = lv
+
+        for uid, lv in surviving.items():
+            self._notify_sr_event("NEW", lv)
+
+        self._batch_new_levels = []
+
     def update_levels(self, candles: List[dict], initializing: bool = False) -> None:
         if len(candles) < self.lookback:
             self._progress_log(f"Not enough candles: {len(candles)} < {self.lookback}")
@@ -2519,6 +2759,13 @@ class SRLevelManager:
                 for i in range(len(candles)):
                     self._processed_indices.add(i)
                 self._last_processed_index = len(candles) - 1
+
+                # Initialise new/incremental batch tracking so the first live
+                # batch covers the last (SR_NEW_SWING_SENSITIVITY) historical
+                # candles that the historical scan deliberately excluded
+                # (they lacked right context) plus the first new candles.
+                self._sr_last_batch_trigger_len = len(candles)
+                self._sr_last_confirmed_index = len(candles) - 1 - SR_NEW_SWING_SENSITIVITY
 
                 self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
@@ -2546,26 +2793,16 @@ class SRLevelManager:
             else:
                 current_idx = len(candles) - 1
 
-                unprocessed = []
+                # Reset the deferred NEW-level collection for this batch.
+                self._batch_new_levels = []
+
+                # NEW: batch-based swing detection for incremental S/R
+                self._process_new_sr_batches(candles)
+
+                # Bookkeeping: mark all current indices as processed
                 for i in range(self._last_processed_index + 1, current_idx + 1):
-                    if i not in self._processed_indices:
-                        unprocessed.append(i)
-
-                if not unprocessed:
-                    self._progress_log("No new candles to process")
-                    return
-
-                self._progress_log(f"LIVE INCREMENTAL UPDATE | New Candles={len(unprocessed)} | Range={unprocessed[0]}→{unprocessed[-1]}")
-
-                for idx in unprocessed:
-                    context_start = max(0, idx - SR_SWING_SENSITIVITY - 1)
-                    context_end = min(len(candles), idx + SR_SWING_SENSITIVITY + 2)
-                    context = candles[context_start:context_end]
-
-                    self._process_candle_at_index(idx, context, candles)
-
-                    self._processed_indices.add(idx)
-                    self._last_processed_index = max(self._last_processed_index, idx)
+                    self._processed_indices.add(i)
+                self._last_processed_index = current_idx
 
                 # NOTE: Breakout-based level replacement is DISABLED.
                 # _check_broken_levels is retained as a no-op for compatibility.
@@ -2573,39 +2810,53 @@ class SRLevelManager:
 
                 expired = self._age_levels()
 
-                # NEW: Notify on expired levels (uses post-aging snapshots).
+                # Notify on expired levels (uses post-aging snapshots).
                 for lv in expired:
                     self._notify_sr_event("EXPIRED", lv)
 
                 if candles:
                     self._update_level_strength(candles)
 
+                # Merge nearby levels (0.5% threshold)
                 self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
 
-                current_price = candles[-1]["close"] if candles else 0
-                if current_price > 0:
-                    self._reclassify_levels_by_price(current_price)
-
+                # Minimum spacing (1.5%)
                 before_r = len(self.resistance_levels)
                 before_s = len(self.support_levels)
-
                 self.resistance_levels = self._apply_final_proximity_filter(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._apply_final_proximity_filter(self.support_levels, "SUPPORT")
-
                 after_r = len(self.resistance_levels)
                 after_s = len(self.support_levels)
-
                 if before_r != after_r or before_s != after_s:
-                    self._progress_log(f"Live update filtered | RESISTANCE: {before_r}→{after_r} | SUPPORT: {before_s}→{after_s}")
+                    self._progress_log(
+                        f"Live update filtered | RESISTANCE: {before_r}→{after_r} | "
+                        f"SUPPORT: {before_s}→{after_s}"
+                    )
+
+                # Current-price filter (0.5%) for the new-detection process
+                current_price = candles[-1]["close"] if candles else 0
+                if current_price > 0:
+                    self._filter_new_levels_near_price(current_price)
+
+                # Classify final levels (below/equal -> SUPPORT, above -> RESISTANCE)
+                if current_price > 0:
+                    self._reclassify_levels_by_price(current_price, equal_as_support=True)
 
                 self._log_final_levels()
+
+                # NEW: notify ONLY for genuinely new levels that survived
+                # every merge, spacing, current-price, and classification step.
+                self._notify_surviving_new_levels()
 
     def _reset_all_levels(self) -> None:
         self.resistance_levels.clear()
         self.support_levels.clear()
         self.pending_swing_highs.clear()
         self.pending_swing_lows.clear()
+        self._sr_last_batch_trigger_len = 0
+        self._sr_last_confirmed_index = -1
+        self._batch_new_levels = []
 
     def _run_initial_scan(self, candles: List[dict]) -> None:
         """HISTORICAL S/R DETECTION - UNCHANGED.
@@ -2663,122 +2914,6 @@ class SRLevelManager:
 
         self._progress_log(f"Initial scan complete: {len(self.support_levels)} supports, {len(self.resistance_levels)} resistances")
 
-    def _process_candle_at_index(self, idx: int, context: List[dict], full_candles: List[dict]) -> None:
-        """NEW S/R DETECTION (incremental only).
-
-        Detects a new S/R candidate when closed-candle CLOSING PRICES touch
-        approximately the same price level at least twice. Compares the
-        current candle's close against recent closes; if at least one prior
-        close is within SR_PRICE_TOUCH_THRESHOLD, the level qualifies.
-
-        Existing nearby levels are reinforced using the current merge
-        threshold; otherwise the candidate is added as a new level and an
-        S/R NEW email is dispatched. Multiple new candidates can be detected
-        across consecutive closed candles.
-
-        Historical S/R detection (_run_initial_scan) is UNCHANGED.
-        """
-        if idx < 0 or idx >= len(full_candles):
-            return
-
-        try:
-            current_close = float(full_candles[idx]["close"])
-        except (KeyError, TypeError, ValueError):
-            return
-        if current_close <= 0:
-            return
-
-        window = self.lookback if self.lookback > 0 else 100
-        start = max(0, idx - window)
-        if start >= idx:
-            # No prior closed candles available to compare against yet.
-            return
-
-        touch_tolerance = SR_PRICE_TOUCH_THRESHOLD
-
-        prior_closes: List[float] = []
-        for i in range(start, idx):
-            try:
-                c = float(full_candles[i]["close"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if c > 0:
-                prior_closes.append(c)
-
-        if not prior_closes:
-            return
-
-        touch_count = 0
-        for c in prior_closes:
-            if abs(c - current_close) / max(current_close, 1) <= touch_tolerance:
-                touch_count += 1
-
-        # "at least twice" -> current close + at least one prior touch
-        if touch_count < 1:
-            return
-
-        price = current_close
-
-        # Classify relative to latest known price; reclassification pass will
-        # correct later if needed.
-        try:
-            latest_price = float(full_candles[-1]["close"])
-        except (KeyError, TypeError, ValueError):
-            latest_price = price
-
-        if price <= latest_price:
-            level_type = "SUPPORT"
-            existing_levels = self.support_levels
-        else:
-            level_type = "RESISTANCE"
-            existing_levels = self.resistance_levels
-
-        # Merge into an existing nearby level if one exists (using current
-        # merge threshold). Otherwise add as a new level.
-        nearby = None
-        for level in existing_levels:
-            try:
-                lp = float(level["price"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if lp <= 0:
-                continue
-            if abs(lp - price) / max(price, 1) <= self.merge_threshold:
-                nearby = level
-                break
-
-        if nearby is not None:
-            nearby["strength"] = min(5, nearby.get("strength", 1) + 1)
-            nearby["touches"] = nearby.get("touches", 1) + touch_count
-            nearby["age"] = 0
-            self._progress_log(
-                f"Reinforced existing {level_type} at {smart_fmt(nearby['price'])} "
-                f"(strength={nearby['strength']}, touches={nearby['touches']})"
-            )
-            return
-
-        new_level = {
-            "price": price,
-            "age": 0,
-            "strength": 1,
-            "touches": touch_count + 1,
-            "type": level_type,
-        }
-        if level_type == "SUPPORT":
-            self.support_levels.append(new_level)
-            self.pending_swing_lows.append(price)
-        else:
-            self.resistance_levels.append(new_level)
-            self.pending_swing_highs.append(price)
-
-        self._log_new_level(level_type, price)
-        self._progress_log(
-            f"New {level_type} at {smart_fmt(price)} (touches={touch_count + 1})"
-        )
-
-        # NEW: Notify on newly detected S/R level.
-        self._notify_sr_event("NEW", new_level)
-
     def _level_exists(self, levels: List[Dict], price: float, tolerance: float = 0.002) -> bool:
         for level in levels:
             if abs(level["price"] - price) / max(price, 1) < tolerance:
@@ -2835,7 +2970,7 @@ class SRLevelManager:
     def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
         """DISABLED: Old S/R replacement-on-breakout logic removed.
 
-        Historical S/R detection, incremental close-touch detection, merging,
+        Historical S/R detection, incremental batch detection, merging,
         reclassification, and proximity filtering all remain active. Only the
         automatic replacement of levels after a breakout candle is disabled.
         """
@@ -2871,6 +3006,9 @@ class SRLevelManager:
             self.pending_swing_lows.clear()
             self._processed_indices.clear()
             self._last_processed_index = -1
+            self._sr_last_batch_trigger_len = 0
+            self._sr_last_confirmed_index = -1
+            self._batch_new_levels = []
             _log("info", f"S/R [{self.symbol}]", "Levels reset")
 
 
@@ -5024,12 +5162,14 @@ class TradingBot:
         print(f"  Exit - Vol Expand : LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
         print(f"  Exit - Others     : Strategy 1 & S/R Breakout & S/R Reversal use TP touch + SuperTrend (unchanged)")
         print(f"  S/R Historical    : Swing-high/low based detection (unchanged)")
-        print(f"  S/R New (live)    : Close-price touch detection (>= 2 touches)")
+        print(f"  S/R New (live)    : Swing-high/low over batches of {SR_NEW_BATCH_SIZE} closed candles "
+              f"({SR_NEW_SWING_SENSITIVITY}-candle left/right sensitivity, deferred confirmation at batch boundaries)")
         print(f"  S/R Replacement   : DISABLED (no breakout-based level replacement)")
-        print(f"  S/R Email Alerts  : NEW + EXPIRED events (with full active level list)")
+        print(f"  S/R Email Alerts  : NEW + EXPIRED events (NEW sent only after all filters; deduped; marked sent only after delivery)")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
+        print(f"  S/R Current-Price : New-detection filter = {NEW_SR_PRICE_FILTER_PCT*100:.1f}% (was 0.2%)")
         print(f"  S/R Merging       : ENABLED (weighted avg by touches/strength, threshold={SR_MERGE_THRESHOLD*100:.2f}%)")
-        print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price)")
+        print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price; equal -> SUPPORT for new detection)")
         print(f"  S/R Min Distance  : ENABLED ({MIN_SR_DISTANCE_PERCENT}% minimum separation - runs ITERATIVELY)")
         print(f"  S/R Logging       : NEW → MERGED → RECLASSIFIED → FILTERED → FINAL (clean concise)")
         print(f"  Price Precision   : auto dp via smart_fmt() - supports micro-price alts")
@@ -5369,9 +5509,11 @@ def main() -> None:
     print(f"  Exit - Vol Expand : LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
     print(f"  Exit - Others     : Strategy 1 & S/R Breakout & S/R Reversal use TP touch + SuperTrend (unchanged)")
     print(f"  S/R Historical    : Swing-high/low based detection (unchanged)")
-    print(f"  S/R New (live)    : Close-price touch detection (>= 2 touches)")
+    print(f"  S/R New (live)    : Swing-high/low over batches of {SR_NEW_BATCH_SIZE} closed candles "
+          f"({SR_NEW_SWING_SENSITIVITY}-candle left/right sensitivity, deferred confirmation at batch boundaries)")
     print(f"  S/R Replacement   : DISABLED (no breakout-based level replacement)")
-    print(f"  S/R Email Alerts  : NEW + EXPIRED events (with full active level list)")
+    print(f"  S/R Email Alerts  : NEW + EXPIRED events (NEW sent only after all filters; deduped; marked sent only after delivery)")
+    print(f"  S/R Current-Price : New-detection filter = {NEW_SR_PRICE_FILTER_PCT*100:.1f}% (was 0.2%)")
     print(f"  Active Strategies : Strategy 1 (RSI), Vol Expansion, "
           f"S/R Breakout, S/R False Breakout Reversal")
     print()
