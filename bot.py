@@ -37,6 +37,11 @@ from enum import Enum
 import requests
 import websocket
 
+# Integrated companion services; trading strategy code below remains unchanged.
+import fed_rate_detector
+import tech_stock
+import serede
+
 # ================================================================
 #  3.  LOGGING
 # ================================================================
@@ -153,7 +158,6 @@ class GmailNotifier:
         self.recipient_emails = recipient_emails
         self.enabled = enabled
         self._last_sr_alert: Dict[str, str] = {}
-        self._pending_sr_alerts: set = set()
         self._last_rejection_alert: Dict[str, str] = {}
         self._consecutive_failures = 0
         self._disabled_until: float = 0.0
@@ -161,31 +165,12 @@ class GmailNotifier:
         self._backoff_seconds = 600
         self._failures_lock = threading.Lock()
 
-    def _dispatch_async(self, subject: str, body: str,
-                        on_success: Optional[callable] = None,
-                        on_failure: Optional[callable] = None) -> None:
+    def _dispatch_async(self, subject: str, body: str) -> None:
         def _runner():
             try:
-                ok = self._send_email(subject, body)
-                if ok:
-                    if on_success is not None:
-                        try:
-                            on_success()
-                        except Exception as e:
-                            _log_exc("GMAIL", f"on_success callback failed: {e}")
-                else:
-                    if on_failure is not None:
-                        try:
-                            on_failure()
-                        except Exception as e:
-                            _log_exc("GMAIL", f"on_failure callback failed: {e}")
+                self._send_email(subject, body)
             except Exception as e:
                 _log_exc("GMAIL", f"Background email send raised unexpectedly: {e}")
-                if on_failure is not None:
-                    try:
-                        on_failure()
-                    except Exception:
-                        pass
 
         t = threading.Thread(target=_runner, daemon=True, name="GmailSendAsync")
         t.start()
@@ -230,6 +215,13 @@ class GmailNotifier:
                      f"Too many consecutive Gmail failures - backing off for "
                      f"{self._backoff_seconds}s before trying again automatically.")
             return False
+
+    def send_custom_alert(self, subject: str, body: str) -> bool:
+        """Dispatch a custom-format alert through the same Gmail transport."""
+        if not self.enabled:
+            return False
+        self._dispatch_async(subject, body)
+        return True
 
     def send_signal(self, signal: dict) -> bool:
         if not self.enabled:
@@ -300,8 +292,6 @@ SuperTrend : Monitored post-entry"""
             body += f"\nReversal Close: {smart_fmt(signal['reversal_candle_close'])}"
         if "confirmation_close" in signal:
             body += f"\nConfirm Close: {smart_fmt(signal['confirmation_close'])}"
-        if signal.get("sr_exit_target"):
-            body += f"\nS/R Exit Target: {smart_fmt(signal['sr_exit_target'])} (touch-based)"
 
         self._dispatch_async(subject, body)
         return True
@@ -552,13 +542,15 @@ MONITORED SYMBOLS ({len(symbols)})
             return False
 
         event_key = f"{symbol}_{event_type}_{level_data.get('price', 0):.10f}"
-
-        # Dedup: already successfully sent for this exact event.
         if self._last_sr_alert.get(event_key) == event_type:
             return False
-        # Dedup: a send is already in flight for this exact event.
-        if event_key in self._pending_sr_alerts:
-            return False
+
+        self._last_sr_alert[event_key] = event_type
+
+        if len(self._last_sr_alert) > 100:
+            keys = list(self._last_sr_alert.keys())
+            for k in keys[:-100]:
+                del self._last_sr_alert[k]
 
         if event_type == "NEW":
             event_emoji = "NEW"
@@ -623,37 +615,13 @@ Age         : {age} candles"""
         if event_type == "EXPIRED":
             body += "\nReason      : Level aged out (max age reached)"
         elif event_type == "REPLACED":
-            old_price = level_data.get("old_price")
-            new_price = level_data.get("new_price", price)
-            break_price = level_data.get("break_price", 0)
-            candle_type = level_data.get("candle_type", "")
-            direction_label = level_data.get("direction", "")
-
-            if level_type == "RESISTANCE":
-                direction_text = "HIGHER than the old Resistance"
-                constraint_text = "New Resistance > Old Resistance (required)"
-            else:
-                direction_text = "LOWER than the old Support"
-                constraint_text = "New Support < Old Support (required)"
-
-            body += "\nReason      : Breakout candle closed beyond the level,"
-            body += "\n              but the confirmation candle FAILED."
-            body += "\n              -> Old level removed, replacement level created at the"
-            body += "\n                 breakout candle extreme, and type is preserved."
-
-            body += f"""
-
-REPLACEMENT DETAILS
------------------------------
-Level Type      : {level_type}
-Old Level       : {smart_fmt(old_price) if old_price is not None else 'N/A'}
-New Level       : {smart_fmt(new_price)}
-Direction       : {direction_text}
-Constraint      : {constraint_text}
-Break Close     : {smart_fmt(break_price) if break_price else 'N/A'}
-Break Candle    : {candle_type if candle_type else 'N/A'}
-Replacement Type: {direction_label if direction_label else 'N/A'}
-"""
+            body += "\nReason      : Level was broken but confirmation failed\n            -> Immediate replacement at new level"
+            if "old_price" in level_data:
+                body += (
+                    f"\nOld Level   : {smart_fmt(level_data['old_price'])}"
+                    f"\nNew Level   : {smart_fmt(level_data['new_price'])}"
+                    f"\nBreak Candle: {level_data.get('candle_type', '')} at {smart_fmt(level_data.get('break_price', 0))}"
+                )
 
         body += f"""
 
@@ -672,21 +640,7 @@ Touches = Number of times price has touched this level
 Age = Candles since level was created
 Max Age = {SR_MAX_LEVEL_AGE} candles base (extends +15 per strength level)"""
 
-        # Mark as pending so a concurrent duplicate call is suppressed while in flight.
-        self._pending_sr_alerts.add(event_key)
-
-        def _mark_sent():
-            self._pending_sr_alerts.discard(event_key)
-            self._last_sr_alert[event_key] = event_type
-            if len(self._last_sr_alert) > 100:
-                keys = list(self._last_sr_alert.keys())
-                for k in keys[:-100]:
-                    del self._last_sr_alert[k]
-
-        def _mark_failed():
-            self._pending_sr_alerts.discard(event_key)
-
-        self._dispatch_async(subject, body, on_success=_mark_sent, on_failure=_mark_failed)
+        self._dispatch_async(subject, body)
         return True
 
     def send_sr_rejection(self, symbol: str, direction: str, level_price: float,
@@ -1157,26 +1111,30 @@ def to_candle_symbol(symbol: str) -> str:
 REST_BASE_INDIA = "https://api.india.delta.exchange"
 REST_BASE_GLOBAL = "https://api.delta.exchange"
 
-CANDLE_LIMIT = 300
+CANDLE_LIMIT = 200
 MAX_RETRIES = 3
 RETRY_DELAYS = [5, 10, 15]
 TIMEOUT = 30
 CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70.0
-RSI_OVERSOLD = 30.0
+RSI_OVERBOUGHT = 55.0
+RSI_OVERSOLD = 40.0
 RSI_MIN_CANDLES = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL = 0.5
 FILL_POLL_TIMEOUT = 15
 
+DOJI_BODY_RATIO_MAX = 0.20
+
 TP_RR_RATIO = 2.0
 TP_MAX_PCT = 0.05
 DAILY_LOSS_LIMIT_PCT = 0.05
 
+MIN_ENGULF_BODY_PCT = 0.30
+RANGE_BREAK_LOOKBACK = 7
 VOL_EXP_LOOKBACK = 21
-VOL_EXP_TOLERANCE = 0.002
+VOL_EXP_TOLERANCE = 0.002   # CHANGED: 0.30% -> 0.20%
 
 SR_LOOKBACK = 100
 SR_SWING_SENSITIVITY = 5
@@ -1186,11 +1144,6 @@ SR_MAX_LEVEL_AGE = 100
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
 
-# ---- NEW/incremental S/R detection constants (historical scan untouched) ----
-SR_NEW_BATCH_SIZE = 24                # run new detection every 24 newly closed candles
-SR_NEW_SWING_SENSITIVITY = 5          # left/right candles required for a swing
-NEW_SR_PRICE_FILTER_PCT = 0.005       # 0.5% current-price filter for new detection
-
 MIN_SR_DISTANCE_PERCENT = 1.5
 
 ST1_LENGTH = 14
@@ -1199,11 +1152,6 @@ ST2_LENGTH = 21
 ST2_FACTOR = 1.0
 
 POST_EXIT_COOLDOWN_CANDLES = 2
-
-SR_TOUCH_EXIT_STRATEGIES = (
-    "VOL_EXPANSION_LONG",
-    "VOL_EXPANSION_SHORT",
-)
 
 TIMEFRAME_MAP: Dict[str, Dict] = {
     "1m": {"resolution": "1m", "api_resolution": "1m", "ws_channel": "candlestick_1m", "secs": 60},
@@ -1249,7 +1197,7 @@ class APIRequestHandler:
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "python-DeltaBot/15.0",
+            "User-Agent": "python-DeltaBot/14.9",
             "Accept": "application/json",
             "Connection": "keep-alive",
         })
@@ -1616,6 +1564,13 @@ def is_bearish(c: dict) -> bool:
     return c["close"] < c["open"]
 
 
+def is_doji(c: dict, body_ratio_max: float = DOJI_BODY_RATIO_MAX) -> bool:
+    r = candle_range(c)
+    if r <= 0:
+        return False
+    return (candle_body(c) / r) <= body_ratio_max
+
+
 # ================================================================
 #  13a. SHORT STRATEGIES
 # ================================================================
@@ -1645,8 +1600,96 @@ def check_short_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[d
     return True, sc, "STRATEGY_1_SHORT"
 
 
+def check_short_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    if len(candles) < 5:
+        return False, None, ""
+
+    signal_c = candles[-2]
+    doji_c = candles[-3]
+    bullish_2 = candles[-4]
+    bullish_1 = candles[-5]
+
+    if not is_bullish(bullish_1):
+        return False, None, ""
+    if not is_bullish(bullish_2):
+        return False, None, ""
+    if bullish_2["close"] <= bullish_1["close"]:
+        return False, None, ""
+    if not is_doji(doji_c):
+        return False, None, ""
+    if not is_bearish(signal_c):
+        return False, None, ""
+    if signal_c["close"] >= doji_c["low"]:
+        return False, None, ""
+
+    result = signal_c.copy()
+    result["doji_low"] = doji_c["low"]
+    result["pattern_high"] = doji_c["high"]
+
+    _log("info", "BEARISH_DOJI",
+         f"Bullish breakout: C2 close {smart_fmt(bullish_2['close'])} > C1 close {smart_fmt(bullish_1['close'])} | "
+         f"Doji (body ratio: {candle_body(doji_c) / candle_range(doji_c) * 100:.1f}%) -> Bearish confirmation: "
+         f"Signal close {smart_fmt(signal_c['close'])} < doji low {smart_fmt(doji_c['low'])}")
+    return True, result, "BEARISH_DOJI"
+
+
+def check_short_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    lookback = RANGE_BREAK_LOOKBACK
+    if len(candles) < lookback + 3:
+        return False, None, ""
+
+    confirm_candle = candles[-2]
+    break_candle = candles[-3]
+    range_candles = candles[-(lookback + 3):-3]
+    if len(range_candles) != lookback:
+        return False, None, ""
+
+    range_high = max(c["high"] for c in range_candles)
+    range_low = min(c["low"] for c in range_candles)
+    range_size = range_high - range_low
+
+    if range_size <= 0:
+        return False, None, ""
+
+    if break_candle["close"] >= range_low:
+        return False, None, ""
+    if not is_bearish(confirm_candle):
+        return False, None, ""
+    if confirm_candle["close"] >= break_candle["close"]:
+        return False, None, ""
+
+    range_bodies = [candle_body(c) for c in range_candles]
+    avg_range_body = sum(range_bodies) / len(range_bodies)
+    breakout_body = candle_body(break_candle)
+
+    if breakout_body <= 0 or avg_range_body > 0.5 * breakout_body:
+        return False, None, ""
+
+    confirm_candle_copy = confirm_candle.copy()
+    confirm_candle_copy["pattern_high"] = break_candle["high"]
+
+    _log("info", "RANGE_BREAK_SHORT",
+         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
+         f"Break close {smart_fmt(break_candle['close'])} < range low | "
+         f"Confirm close {smart_fmt(confirm_candle['close'])} < break close | "
+         f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
+    return True, confirm_candle_copy, "RANGE_BREAK_SHORT"
+
+
 def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Volume Expansion SHORT — UPDATED:
+      - Requires one extra closed confirmation candle after the breakout candle.
+      - SHORT structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
+        candles[-3] = breakout candle
+        candles[-2] = confirmation candle (must close BELOW breakout candle low)
+        candles[-1] = currently forming candle (never used)
+      - 21-candle lookback, repeated low detection (tolerance = VOL_EXP_TOLERANCE),
+        and volume expansion condition all unchanged.
+      - SL anchored to the breakout candle's HIGH (unchanged behavior).
+    """
     lookback = VOL_EXP_LOOKBACK
+    # Need: 21 prior + breakout + confirmation + forming = 24 candles
     if len(candles) < lookback + 3:
         return False, None, ""
 
@@ -1677,6 +1720,7 @@ def check_short_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optiona
     if breakout_candle["volume"] <= max_vol_prev:
         return False, None, ""
 
+    # NEW: confirmation candle must close BELOW the breakout candle's LOW
     if confirm_candle["close"] >= breakout_candle["low"]:
         return False, None, ""
 
@@ -1774,7 +1818,7 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         if not is_bearish(confirm_candle):
             continue
 
-        if confirm_candle["close"] >= false_breakout_candle["low"]:
+        if confirm_candle["close"] >= false_breakout_candle["close"]:
             continue
 
         signal_candle = confirm_candle.copy()
@@ -1785,14 +1829,13 @@ def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
         signal_candle["false_breakout_high"] = false_breakout_candle["high"]
-        signal_candle["false_breakout_low"] = false_breakout_candle["low"]
 
         stars = "*" * level_dict["strength"]
 
         _log("info", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT",
              f"SHORT: Resistance false breakout reversal at {smart_fmt(resistance)} "
              f"(High {smart_fmt(false_breakout_candle['high'])} > Resistance > Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout low {smart_fmt(false_breakout_candle['low'])} "
+             f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout close "
              f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
 
         return True, signal_candle, "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
@@ -1829,8 +1872,96 @@ def check_long_signal_strategy_1(candles: List[dict]) -> Tuple[bool, Optional[di
     return True, sc, "STRATEGY_1_LONG"
 
 
+def check_long_signal_strategy_5(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    if len(candles) < 5:
+        return False, None, ""
+
+    signal_c = candles[-2]
+    doji_c = candles[-3]
+    bearish_2 = candles[-4]
+    bearish_1 = candles[-5]
+
+    if not is_bearish(bearish_1):
+        return False, None, ""
+    if not is_bearish(bearish_2):
+        return False, None, ""
+    if bearish_2["close"] >= bearish_1["close"]:
+        return False, None, ""
+    if not is_doji(doji_c):
+        return False, None, ""
+    if not is_bullish(signal_c):
+        return False, None, ""
+    if signal_c["close"] <= doji_c["high"]:
+        return False, None, ""
+
+    result = signal_c.copy()
+    result["doji_high"] = doji_c["high"]
+    result["pattern_low"] = doji_c["low"]
+
+    _log("info", "BULLISH_DOJI",
+         f"Bearish breakout: C2 close {smart_fmt(bearish_2['close'])} < C1 close {smart_fmt(bearish_1['close'])} | "
+         f"Doji (body ratio: {candle_body(doji_c) / candle_range(doji_c) * 100:.1f}%) -> Bullish confirmation: "
+         f"Signal close {smart_fmt(signal_c['close'])} > doji high {smart_fmt(doji_c['high'])}")
+    return True, result, "BULLISH_DOJI"
+
+
+def check_long_signal_range_break(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    lookback = RANGE_BREAK_LOOKBACK
+    if len(candles) < lookback + 3:
+        return False, None, ""
+
+    confirm_candle = candles[-2]
+    break_candle = candles[-3]
+    range_candles = candles[-(lookback + 3):-3]
+    if len(range_candles) != lookback:
+        return False, None, ""
+
+    range_high = max(c["high"] for c in range_candles)
+    range_low = min(c["low"] for c in range_candles)
+    range_size = range_high - range_low
+
+    if range_size <= 0:
+        return False, None, ""
+
+    if break_candle["close"] <= range_high:
+        return False, None, ""
+    if not is_bullish(confirm_candle):
+        return False, None, ""
+    if confirm_candle["close"] <= break_candle["close"]:
+        return False, None, ""
+
+    range_bodies = [candle_body(c) for c in range_candles]
+    avg_range_body = sum(range_bodies) / len(range_bodies)
+    breakout_body = candle_body(break_candle)
+
+    if breakout_body <= 0 or avg_range_body > 0.5 * breakout_body:
+        return False, None, ""
+
+    confirm_candle_copy = confirm_candle.copy()
+    confirm_candle_copy["pattern_low"] = break_candle["low"]
+
+    _log("info", "RANGE_BREAK_LONG",
+         f"Range {smart_fmt(range_low)} - {smart_fmt(range_high)} | "
+         f"Break close {break_candle['close']} > range high | "
+         f"Confirm close {confirm_candle['close']} > break close | "
+         f"AvgRangeBody={smart_fmt(avg_range_body)} <= 50% BreakBody={smart_fmt(0.5 * breakout_body)}")
+    return True, confirm_candle_copy, "RANGE_BREAK_LONG"
+
+
 def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    """
+    Volume Expansion LONG — UPDATED:
+      - Requires one extra closed confirmation candle after the breakout candle.
+      - LONG structure: [prev 21 candles] -> Breakout candle -> Confirmation candle
+        candles[-3] = breakout candle
+        candles[-2] = confirmation candle (must close ABOVE breakout candle high)
+        candles[-1] = currently forming candle (never used)
+      - 21-candle lookback, repeated high detection (tolerance = VOL_EXP_TOLERANCE),
+        and volume expansion condition all unchanged.
+      - SL anchored to the breakout candle's LOW (unchanged behavior).
+    """
     lookback = VOL_EXP_LOOKBACK
+    # Need: 21 prior + breakout + confirmation + forming = 24 candles
     if len(candles) < lookback + 3:
         return False, None, ""
 
@@ -1861,6 +1992,7 @@ def check_long_signal_vol_expansion(candles: List[dict]) -> Tuple[bool, Optional
     if breakout_candle["volume"] <= max_vol_prev:
         return False, None, ""
 
+    # NEW: confirmation candle must close ABOVE the breakout candle's HIGH
     if confirm_candle["close"] <= breakout_candle["high"]:
         return False, None, ""
 
@@ -1958,7 +2090,7 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
         if not is_bullish(confirm_candle):
             continue
 
-        if confirm_candle["close"] <= false_breakout_candle["high"]:
+        if confirm_candle["close"] <= false_breakout_candle["close"]:
             continue
 
         signal_candle = confirm_candle.copy()
@@ -1969,19 +2101,100 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
         signal_candle["confirmation_close"] = confirm_candle["close"]
         signal_candle["false_breakout_low"] = false_breakout_candle["low"]
-        signal_candle["false_breakout_high"] = false_breakout_candle["high"]
 
         stars = "*" * level_dict["strength"]
 
         _log("info", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG",
              f"LONG: Support false breakout reversal at {smart_fmt(support)} "
              f"(Low {smart_fmt(false_breakout_candle['low'])} < Support < Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout high {smart_fmt(false_breakout_candle['high'])} "
+             f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout close "
              f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
 
         return True, signal_candle, "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
 
     return False, None, ""
+
+
+# ================================================================
+#  13c. ENGULFING STRATEGIES
+# ================================================================
+
+def check_short_signal_bearish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    if len(candles) < 4:
+        return False, None, ""
+
+    confirm_candle = candles[-2]
+    signal = candles[-3]
+    prev = candles[-4]
+
+    if not is_bullish(prev):
+        return False, None, ""
+    if not is_bearish(signal):
+        return False, None, ""
+    if signal["open"] <= prev["close"] or signal["close"] >= prev["open"]:
+        return False, None, ""
+
+    signal_body = candle_body(signal)
+    signal_range = candle_range(signal)
+
+    if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
+        return False, None, ""
+
+    if not is_bearish(confirm_candle):
+        return False, None, ""
+    if confirm_candle["close"] >= signal["close"]:
+        return False, None, ""
+
+    signal_candle = confirm_candle.copy()
+    signal_candle["pattern_high"] = signal["high"]
+    signal_candle["engulfing_close"] = signal["close"]
+    signal_candle["confirmation_close"] = confirm_candle["close"]
+
+    _log("info", "BEARISH_ENGULFING",
+         f"Bearish Engulfing + Confirmation: "
+         f"Engulf body {smart_fmt(signal_body)} (range ratio: {(signal_body / signal_range) * 100:.1f}%) | "
+         f"Engulf close {smart_fmt(signal['close'])} | "
+         f"Confirmation close {smart_fmt(confirm_candle['close'])} < Engulf close -> CONFIRMED")
+    return True, signal_candle, "BEARISH_ENGULFING"
+
+
+def check_long_signal_bullish_engulfing(candles: List[dict]) -> Tuple[bool, Optional[dict], str]:
+    if len(candles) < 4:
+        return False, None, ""
+
+    confirm_candle = candles[-2]
+    signal = candles[-3]
+    prev = candles[-4]
+
+    if not is_bearish(prev):
+        return False, None, ""
+    if not is_bullish(signal):
+        return False, None, ""
+    if signal["open"] >= prev["close"] or signal["close"] <= prev["open"]:
+        return False, None, ""
+
+    signal_body = candle_body(signal)
+    signal_range = candle_range(signal)
+
+    if signal_range <= 0 or (signal_body / signal_range) < MIN_ENGULF_BODY_PCT:
+        return False, None, ""
+
+    if not is_bullish(confirm_candle):
+        return False, None, ""
+    if confirm_candle["close"] <= signal["close"]:
+        return False, None, ""
+
+    signal_candle = confirm_candle.copy()
+    signal_candle["pattern_low"] = signal["low"]
+    signal_candle["engulfing_close"] = signal["close"]
+    signal_candle["confirmation_close"] = confirm_candle["close"]
+
+    _log("info", "BULLISH_ENGULFING",
+         f"Bullish Engulfing + Confirmation: "
+         f"Engulf body {smart_fmt(signal_body)} (range ratio: {(signal_body / signal_range) * 100:.1f}%) | "
+         f"Engulf close {smart_fmt(signal['close'])} | "
+         f"Confirmation close {smart_fmt(confirm_candle['close'])} > Engulf close -> CONFIRMED")
+    return True, signal_candle, "BULLISH_ENGULFING"
 
 
 # ================================================================
@@ -2003,6 +2216,16 @@ def check_short_signal(
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
 
+    triggered, signal_candle, strategy = check_short_signal_strategy_5(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
+        return True, signal_candle, strategy, rsi_value
+
+    triggered, signal_candle, strategy = check_short_signal_bearish_engulfing(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
+        return True, signal_candle, strategy, rsi_value
+
     return False, None, "", rsi_value
 
 
@@ -2010,6 +2233,11 @@ def check_short_signal_no_rsi(
     candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
+    triggered, signal_candle, strategy = check_short_signal_range_break(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
+        return True, signal_candle, strategy, None
+
     triggered, signal_candle, strategy = check_short_signal_vol_expansion(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
@@ -2090,8 +2318,8 @@ def check_short_signal_no_rsi(
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
                     continue
 
-                if confirm_candle["close"] >= false_breakout_candle["low"]:
-                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout low {smart_fmt(false_breakout_candle['low'])}"
+                if confirm_candle["close"] >= false_breakout_candle["close"]:
+                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout close {smart_fmt(false_breakout_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
                     continue
 
@@ -2131,6 +2359,16 @@ def check_long_signal(
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
 
+    triggered, signal_candle, strategy = check_long_signal_strategy_5(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
+        return True, signal_candle, strategy, rsi
+
+    triggered, signal_candle, strategy = check_long_signal_bullish_engulfing(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
+        return True, signal_candle, strategy, rsi
+
     return False, None, "", rsi
 
 
@@ -2138,6 +2376,11 @@ def check_long_signal_no_rsi(
     candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
     notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
+    triggered, signal_candle, strategy = check_long_signal_range_break(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
+        return True, signal_candle, strategy, None
+
     triggered, signal_candle, strategy = check_long_signal_vol_expansion(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
@@ -2218,8 +2461,8 @@ def check_long_signal_no_rsi(
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
                     continue
 
-                if confirm_candle["close"] <= false_breakout_candle["high"]:
-                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout high {smart_fmt(false_breakout_candle['high'])}"
+                if confirm_candle["close"] <= false_breakout_candle["close"]:
+                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout close {smart_fmt(false_breakout_candle['close'])}"
                     _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
                     continue
 
@@ -2269,10 +2512,6 @@ class SRLevelManager:
         self._processed_indices: set = set()
         self._last_processed_index = -1
 
-        # NEW/incremental S/R batch tracking (historical scan does not use these)
-        self._sr_last_batch_trigger_len = 0
-        self._sr_last_confirmed_index = -1
-
         self._lock = threading.RLock()
 
     def _progress_log(self, msg: str) -> None:
@@ -2301,58 +2540,14 @@ class SRLevelManager:
 
         _log("info", "S/R", f"[{self.symbol}] FINAL | S: {s_str} | R: {r_str}")
 
-    # ------------------------------------------------------------
-    #  Safe S/R event notification helper
-    # ------------------------------------------------------------
-    def _notify_sr_event(self, event_type: str, level_data: dict) -> None:
-        """Safely dispatch an S/R event to the notifier.
-
-        - Called for new-level detection and expiry events.
-        - Snapshots ALL active support/resistance levels for the email.
-        - Never raises: notifier errors are logged, not propagated.
-        - GmailNotifier.send_sr_level_event() dedupes by
-          (symbol, event_type, price) and marks the event as sent only
-          after a successful delivery, so failures are retried.
-        """
-        if self.notifier is None:
-            return
-        try:
-            with self._lock:
-                supports_snapshot = [dict(l) for l in self.support_levels]
-                resistances_snapshot = [dict(l) for l in self.resistance_levels]
-            self.notifier.send_sr_level_event(
-                symbol=self.symbol,
-                event_type=event_type,
-                level_data=dict(level_data),
-                all_supports=supports_snapshot,
-                all_resistances=resistances_snapshot,
-            )
-        except Exception as e:
-            _log_exc(
-                "S/R-NOTIFY",
-                f"[{self.symbol}] failed to dispatch S/R event "
-                f"type={event_type} price={level_data.get('price')!r}: {e}"
-            )
-
-    def _reclassify_levels_by_price(self, current_price: float,
-                                     equal_as_support: bool = False) -> None:
-        """Move levels between SUPPORT/RESISTANCE based on the current price.
-
-        When ``equal_as_support`` is True, a level whose price is exactly
-        equal to ``current_price`` is classified as SUPPORT (used by the
-        new/incremental detection path). The historical path calls this
-        with the default ``False`` to preserve its original behaviour.
-        """
+    def _reclassify_levels_by_price(self, current_price: float) -> None:
         with self._lock:
             reclassified = []
 
             new_resistances = []
             for level in self.resistance_levels:
                 price = level["price"]
-                should_be_support = price < current_price or (
-                    equal_as_support and price == current_price
-                )
-                if should_be_support:
+                if price < current_price:
                     level_copy = dict(level)
                     level_copy["type"] = "SUPPORT"
                     self.support_levels.append(level_copy)
@@ -2554,142 +2749,6 @@ class SRLevelManager:
 
         return working
 
-    # ------------------------------------------------------------
-    #  NEW/incremental S/R detection (replaces old close-touch method)
-    # ------------------------------------------------------------
-    def _merge_new_candidate(self, level_type: str, price: float) -> None:
-        """Merge a newly detected swing candidate into the active levels.
-
-        Uses the existing SR_MERGE_THRESHOLD (0.5%) to reinforce a nearby
-        existing level instead of creating a duplicate. If no nearby level
-        exists, a new level is added and a NEW S/R email is dispatched.
-        """
-        if price <= 0:
-            return
-
-        target_list = self.resistance_levels if level_type == "RESISTANCE" else self.support_levels
-
-        for level in target_list:
-            try:
-                lp = float(level["price"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if lp <= 0:
-                continue
-            if abs(lp - price) / max(price, 1) <= self.merge_threshold:
-                level["strength"] = min(5, level.get("strength", 1) + 1)
-                level["touches"] = level.get("touches", 1) + 1
-                level["age"] = 0
-                self._progress_log(
-                    f"Reinforced {level_type} at {smart_fmt(lp)} "
-                    f"(strength={level['strength']}, touches={level['touches']})"
-                )
-                return
-
-        # No nearby level: add as new.
-        new_level = {
-            "price": price,
-            "age": 0,
-            "strength": 1,
-            "touches": 1,
-            "type": level_type,
-        }
-        if level_type == "RESISTANCE":
-            self.resistance_levels.append(new_level)
-            self.pending_swing_highs.append(price)
-        else:
-            self.support_levels.append(new_level)
-            self.pending_swing_lows.append(price)
-
-        self._log_new_level(level_type, price)
-        self._progress_log(f"New {level_type} at {smart_fmt(price)} (swing)")
-
-        # Notify on genuinely new final level.
-        self._notify_sr_event("NEW", new_level)
-
-    def _process_new_sr_batches(self, full_candles: List[dict]) -> None:
-        """NEW S/R detection: swing highs/lows over batches of closed candles.
-
-        Triggered once per SR_NEW_BATCH_SIZE (24) newly processed closed
-        candles. For every candle in the confirmable range, a swing high
-        requires its high to exceed the highs of the
-        SR_NEW_SWING_SENSITIVITY (5) candles before and after it; a swing
-        low requires its low to be below the lows of the 5 candles before
-        and after it. Candles near the end of the batch whose right context
-        has not yet closed are deferred to a later batch, so batch
-        boundaries are handled correctly and incomplete candles are never
-        used.
-
-        Historical detection (_run_initial_scan) is unchanged and is not
-        called from here.
-        """
-        n = len(full_candles)
-
-        # Only run once a full new batch of closed candles has accumulated.
-        if n - self._sr_last_batch_trigger_len < SR_NEW_BATCH_SIZE:
-            return
-
-        self._sr_last_batch_trigger_len = n
-
-        sens = SR_NEW_SWING_SENSITIVITY
-        confirmable_end = n - 1 - sens
-        start = max(self._sr_last_confirmed_index + 1, sens)
-
-        if start > confirmable_end:
-            return
-
-        self._progress_log(
-            f"NEW S/R batch scan | candles={n} | confirmable range={start}..{confirmable_end} "
-            f"| left/right sensitivity={sens}"
-        )
-
-        for i in range(start, confirmable_end + 1):
-            c = full_candles[i]
-
-            is_high = True
-            for j in range(1, sens + 1):
-                if c["high"] <= full_candles[i - j]["high"] or c["high"] <= full_candles[i + j]["high"]:
-                    is_high = False
-                    break
-            if is_high:
-                self._merge_new_candidate("RESISTANCE", float(c["high"]))
-
-            is_low = True
-            for j in range(1, sens + 1):
-                if c["low"] >= full_candles[i - j]["low"] or c["low"] >= full_candles[i + j]["low"]:
-                    is_low = False
-                    break
-            if is_low:
-                self._merge_new_candidate("SUPPORT", float(c["low"]))
-
-        self._sr_last_confirmed_index = confirmable_end
-
-    def _filter_new_levels_near_price(self, current_price: float) -> None:
-        """Discard final levels within NEW_SR_PRICE_FILTER_PCT (0.5%) of current price.
-
-        Applied only to the new/incremental S/R detection process. Historical
-        detection remains unchanged.
-        """
-        if current_price <= 0:
-            return
-        threshold = current_price * NEW_SR_PRICE_FILTER_PCT
-
-        def _keep(level):
-            return abs(level["price"] - current_price) > threshold
-
-        before_r = len(self.resistance_levels)
-        before_s = len(self.support_levels)
-        self.resistance_levels = [l for l in self.resistance_levels if _keep(l)]
-        self.support_levels = [l for l in self.support_levels if _keep(l)]
-        removed_r = before_r - len(self.resistance_levels)
-        removed_s = before_s - len(self.support_levels)
-        if removed_r or removed_s:
-            self._progress_log(
-                f"Current-price filter ({NEW_SR_PRICE_FILTER_PCT*100:.1f}%): "
-                f"removed {removed_r} resistance(s), {removed_s} support(s) near "
-                f"{smart_fmt(current_price)}"
-            )
-
     def update_levels(self, candles: List[dict], initializing: bool = False) -> None:
         if len(candles) < self.lookback:
             self._progress_log(f"Not enough candles: {len(candles)} < {self.lookback}")
@@ -2707,13 +2766,6 @@ class SRLevelManager:
                 for i in range(len(candles)):
                     self._processed_indices.add(i)
                 self._last_processed_index = len(candles) - 1
-
-                # Initialise new/incremental batch tracking so the first live
-                # batch covers the last (SR_NEW_SWING_SENSITIVITY) historical
-                # candles that the historical scan deliberately excluded
-                # (they lacked right context) plus the first new candles.
-                self._sr_last_batch_trigger_len = len(candles)
-                self._sr_last_confirmed_index = len(candles) - 1 - SR_NEW_SWING_SENSITIVITY
 
                 self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
@@ -2741,52 +2793,50 @@ class SRLevelManager:
             else:
                 current_idx = len(candles) - 1
 
-                # NEW: batch-based swing detection for incremental S/R
-                self._process_new_sr_batches(candles)
-
-                # Bookkeeping: mark all current indices as processed
+                unprocessed = []
                 for i in range(self._last_processed_index + 1, current_idx + 1):
-                    self._processed_indices.add(i)
-                self._last_processed_index = current_idx
+                    if i not in self._processed_indices:
+                        unprocessed.append(i)
 
-                # NOTE: Breakout-based level replacement is DISABLED.
-                # _check_broken_levels is retained as a no-op for compatibility.
-                self._check_broken_levels(candles, initializing=False)
+                if not unprocessed:
+                    self._progress_log("No new candles to process")
+                    return
 
-                expired = self._age_levels()
+                self._progress_log(f"LIVE INCREMENTAL UPDATE | New Candles={len(unprocessed)} | Range={unprocessed[0]}→{unprocessed[-1]}")
 
-                # Notify on expired levels (uses post-aging snapshots).
-                for lv in expired:
-                    self._notify_sr_event("EXPIRED", lv)
+                for idx in unprocessed:
+                    context_start = max(0, idx - SR_SWING_SENSITIVITY - 1)
+                    context_end = min(len(candles), idx + SR_SWING_SENSITIVITY + 2)
+                    context = candles[context_start:context_end]
+
+                    self._process_candle_at_index(idx, context, candles)
+
+                    self._processed_indices.add(idx)
+                    self._last_processed_index = max(self._last_processed_index, idx)
+
+                self._age_levels()
 
                 if candles:
                     self._update_level_strength(candles)
 
-                # Merge nearby levels (0.5% threshold)
                 self.resistance_levels = self._merge_levels(self.resistance_levels, "RESISTANCE")
                 self.support_levels = self._merge_levels(self.support_levels, "SUPPORT")
 
-                # Minimum spacing (1.5%)
-                before_r = len(self.resistance_levels)
-                before_s = len(self.support_levels)
-                self.resistance_levels = self._apply_final_proximity_filter(self.resistance_levels, "RESISTANCE")
-                self.support_levels = self._apply_final_proximity_filter(self.support_levels, "SUPPORT")
-                after_r = len(self.resistance_levels)
-                after_s = len(self.support_levels)
-                if before_r != after_r or before_s != after_s:
-                    self._progress_log(
-                        f"Live update filtered | RESISTANCE: {before_r}→{after_r} | "
-                        f"SUPPORT: {before_s}→{after_s}"
-                    )
-
-                # Current-price filter (0.5%) for the new-detection process
                 current_price = candles[-1]["close"] if candles else 0
                 if current_price > 0:
-                    self._filter_new_levels_near_price(current_price)
+                    self._reclassify_levels_by_price(current_price)
 
-                # Classify final levels (below/equal -> SUPPORT, above -> RESISTANCE)
-                if current_price > 0:
-                    self._reclassify_levels_by_price(current_price, equal_as_support=True)
+                before_r = len(self.resistance_levels)
+                before_s = len(self.support_levels)
+
+                self.resistance_levels = self._apply_final_proximity_filter(self.resistance_levels, "RESISTANCE")
+                self.support_levels = self._apply_final_proximity_filter(self.support_levels, "SUPPORT")
+
+                after_r = len(self.resistance_levels)
+                after_s = len(self.support_levels)
+
+                if before_r != after_r or before_s != after_s:
+                    self._progress_log(f"Live update filtered | RESISTANCE: {before_r}→{after_r} | SUPPORT: {before_s}→{after_s}")
 
                 self._log_final_levels()
 
@@ -2795,13 +2845,8 @@ class SRLevelManager:
         self.support_levels.clear()
         self.pending_swing_highs.clear()
         self.pending_swing_lows.clear()
-        self._sr_last_batch_trigger_len = 0
-        self._sr_last_confirmed_index = -1
 
     def _run_initial_scan(self, candles: List[dict]) -> None:
-        """HISTORICAL S/R DETECTION - UNCHANGED.
-        Swing-high / swing-low based detection over the full historical batch.
-        """
         n = len(candles)
         sensitivity = SR_SWING_SENSITIVITY
 
@@ -2853,6 +2898,59 @@ class SRLevelManager:
         self._update_level_strength(candles)
 
         self._progress_log(f"Initial scan complete: {len(self.support_levels)} supports, {len(self.resistance_levels)} resistances")
+
+    def _process_candle_at_index(self, idx: int, context: List[dict], full_candles: List[dict]) -> None:
+        if len(context) < SR_SWING_SENSITIVITY * 2 + 1:
+            return
+
+        sensitivity = SR_SWING_SENSITIVITY
+        check_pos = sensitivity
+
+        is_high = True
+        for j in range(1, sensitivity + 1):
+            if (check_pos - j < 0 or check_pos + j >= len(context)):
+                is_high = False
+                break
+            if context[check_pos]["high"] <= context[check_pos - j]["high"] or context[check_pos]["high"] <= context[check_pos + j]["high"]:
+                is_high = False
+                break
+        if is_high:
+            price = context[check_pos]["high"]
+            if not self._level_exists(self.resistance_levels, price):
+                new_level = {
+                    "price": price,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1,
+                    "type": "RESISTANCE"
+                }
+                self.resistance_levels.append(new_level)
+                self.pending_swing_highs.append(price)
+                self._log_new_level("RESISTANCE", price)
+                self._progress_log(f"New RESISTANCE at {smart_fmt(price)}")
+
+        is_low = True
+        for j in range(1, sensitivity + 1):
+            if (check_pos - j < 0 or check_pos + j >= len(context)):
+                is_low = False
+                break
+            if context[check_pos]["low"] >= context[check_pos - j]["low"] or context[check_pos]["low"] >= context[check_pos + j]["low"]:
+                is_low = False
+                break
+        if is_low:
+            price = context[check_pos]["low"]
+            if not self._level_exists(self.support_levels, price):
+                new_level = {
+                    "price": price,
+                    "age": 0,
+                    "strength": 1,
+                    "touches": 1,
+                    "type": "SUPPORT"
+                }
+                self.support_levels.append(new_level)
+                self.pending_swing_lows.append(price)
+                self._log_new_level("SUPPORT", price)
+                self._progress_log(f"New SUPPORT at {smart_fmt(price)}")
 
     def _level_exists(self, levels: List[Dict], price: float, tolerance: float = 0.002) -> bool:
         for level in levels:
@@ -2908,13 +3006,82 @@ class SRLevelManager:
         return expired_levels
 
     def _check_broken_levels(self, candles: List[dict], initializing: bool = False) -> None:
-        """DISABLED: Old S/R replacement-on-breakout logic removed.
+        if len(candles) < 3:
+            return
 
-        Historical S/R detection, incremental batch detection, merging,
-        reclassification, and proximity filtering all remain active. Only the
-        automatic replacement of levels after a breakout candle is disabled.
-        """
-        return
+        break_candle = candles[-3] if len(candles) >= 3 else None
+        confirm_candle = candles[-2] if len(candles) >= 2 else None
+
+        if not break_candle or not confirm_candle:
+            return
+
+        for i, level in enumerate(self.resistance_levels):
+            resistance_price = level["price"]
+            if break_candle["close"] > resistance_price:
+                confirm_failed = (
+                    not is_bullish(confirm_candle) or
+                    confirm_candle["close"] <= break_candle["close"]
+                )
+                if confirm_failed:
+                    old_resistance = self.resistance_levels.pop(i)
+                    new_price = break_candle["high"]
+                    new_level = {
+                        "price": new_price,
+                        "age": 0,
+                        "strength": max(1, old_resistance.get("strength", 1)),
+                        "touches": old_resistance.get("touches", 0) + 1,
+                        "type": "RESISTANCE",
+                        "old_price": old_resistance["price"],
+                        "new_price": new_price,
+                        "break_price": break_candle["close"],
+                        "candle_type": "BREAKOUT"
+                    }
+                    self.resistance_levels.append(new_level)
+                    _log("info", f"S/R [{self.symbol}]",
+                         f"RESISTANCE REPLACED: {smart_fmt(old_resistance['price'])} -> {smart_fmt(new_price)}")
+                    if self.notifier and not initializing:
+                        self.notifier.send_sr_level_event(
+                            symbol=self.symbol,
+                            event_type="REPLACED",
+                            level_data=new_level,
+                            all_supports=self.support_levels,
+                            all_resistances=self.resistance_levels
+                        )
+                    break
+
+        for i, level in enumerate(self.support_levels):
+            support_price = level["price"]
+            if break_candle["close"] < support_price:
+                confirm_failed = (
+                    not is_bearish(confirm_candle) or
+                    confirm_candle["close"] >= break_candle["close"]
+                )
+                if confirm_failed:
+                    old_support = self.support_levels.pop(i)
+                    new_price = break_candle["low"]
+                    new_level = {
+                        "price": new_price,
+                        "age": 0,
+                        "strength": max(1, old_support.get("strength", 1)),
+                        "touches": old_support.get("touches", 0) + 1,
+                        "type": "SUPPORT",
+                        "old_price": old_support["price"],
+                        "new_price": new_price,
+                        "break_price": break_candle["close"],
+                        "candle_type": "BREAKDOWN"
+                    }
+                    self.support_levels.append(new_level)
+                    _log("info", f"S/R [{self.symbol}]",
+                         f"SUPPORT REPLACED: {smart_fmt(old_support['price'])} -> {smart_fmt(new_price)}")
+                    if self.notifier and not initializing:
+                        self.notifier.send_sr_level_event(
+                            symbol=self.symbol,
+                            event_type="REPLACED",
+                            level_data=new_level,
+                            all_supports=self.support_levels,
+                            all_resistances=self.resistance_levels
+                        )
+                    break
 
     def get_relevant_levels(self, current_price: float) -> Tuple[List[Dict], List[Dict]]:
         with self._lock:
@@ -2946,8 +3113,6 @@ class SRLevelManager:
             self.pending_swing_lows.clear()
             self._processed_indices.clear()
             self._last_processed_index = -1
-            self._sr_last_batch_trigger_len = 0
-            self._sr_last_confirmed_index = -1
             _log("info", f"S/R [{self.symbol}]", "Levels reset")
 
 
@@ -3437,6 +3602,45 @@ class DailyLossTracker:
 
 
 # ================================================================
+#  SINGLE-COIN MEAN-REVERSION STRATEGY (OPTIONAL)
+#  Uses the main bot's symbols, candles, risk sizing, orders, exits,
+#  notifications, daily-loss guard, cooldown, and recovery pipeline.
+# ================================================================
+
+Z_LOOKBACK = 200
+Z_ENTRY_THRESHOLD = 6.0
+Z_MEAN_EXIT_BAND = 0.25
+Z_HARD_STOP = 11.0
+Z_RSI_UPPER = 65.0  # Mean-reversion SHORT entries require RSI >= this level
+Z_RSI_LOWER = 35.0  # Mean-reversion LONG entries require RSI <= this level
+Z_STRATEGY_NAME = "SINGLE_COIN_MEAN_REVERSION"
+
+
+def calculate_price_zscore(candles: List[dict], lookback: int = Z_LOOKBACK) -> Optional[dict]:
+    """Calculate latest completed close's Z-score against a rolling close-price window."""
+    valid = [c for c in candles if isinstance(c, dict)
+             and isinstance(c.get("close"), (int, float))
+             and math.isfinite(float(c["close"])) and float(c["close"]) > 0]
+    if len(valid) < lookback:
+        return None
+    window = valid[-lookback:]
+    closes = [float(c["close"]) for c in window]
+    mean = sum(closes) / len(closes)
+    variance = sum((x - mean) ** 2 for x in closes) / len(closes)
+    std = math.sqrt(variance)
+    if std <= 1e-12 or not math.isfinite(std):
+        return None
+    latest = closes[-1]
+    z = (latest - mean) / std
+    if not math.isfinite(z):
+        return None
+    return {"timestamp": int(window[-1]["time"]), "close": latest,
+            "mean": mean, "std": std, "z": z,
+            "stop_high": mean + Z_HARD_STOP * std,
+            "stop_low": mean - Z_HARD_STOP * std, "count": len(closes)}
+
+
+# ================================================================
 #  22. TRADING BOT
 # ================================================================
 
@@ -3454,6 +3658,8 @@ class TradingBot:
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
         self.enable_short = config.get("enable_short", True)
         self.enable_long = config.get("enable_long", True)
+        self.enable_mean_reversion = bool(config.get("enable_mean_reversion", False))
+        self._z_last_eval_time: Dict[str, int] = {}
 
         self.user_lot_size = float(config.get("user_lot_size", 0.0))
         if self.user_lot_size <= 0:
@@ -3537,32 +3743,6 @@ class TradingBot:
             except Exception as e:
                 _log_exc("LOG-CALLBACK", f"on_log_callback raised: {e}")
 
-    def _find_nearest_sr_exit_target(self, symbol: str, direction: str,
-                                      entry: float) -> Optional[float]:
-        sr_manager = self.sr_managers.get(symbol)
-        if sr_manager is None or entry <= 0:
-            return None
-
-        with sr_manager._lock:
-            if direction == "LONG":
-                candidates = [
-                    l["price"] for l in sr_manager.resistance_levels
-                    if l.get("strength", 1) >= sr_manager.min_strength
-                    and l["price"] > entry
-                ]
-                if not candidates:
-                    return None
-                return float(min(candidates))
-            else:
-                candidates = [
-                    l["price"] for l in sr_manager.support_levels
-                    if l.get("strength", 1) >= sr_manager.min_strength
-                    and l["price"] < entry
-                ]
-                if not candidates:
-                    return None
-                return float(max(candidates))
-
     def _close_trade(self, symbol: str, trade: dict, reason: str,
                       exit_price: Optional[float] = None) -> None:
         try:
@@ -3575,7 +3755,7 @@ class TradingBot:
             local_exit_price: Optional[float] = None
             if exit_price is not None and exit_price > 0:
                 local_exit_price = float(exit_price)
-            elif reason in ("TAKE_PROFIT", "SR_TOUCH") and trade.get("take_profit"):
+            elif reason == "TAKE_PROFIT" and trade.get("take_profit"):
                 local_exit_price = float(trade["take_profit"])
             elif reason == "STOP_LOSS" and trade.get("stop_loss"):
                 local_exit_price = float(trade["stop_loss"])
@@ -3659,7 +3839,7 @@ class TradingBot:
             if local_exit_price is not None:
                 trade["exit_price"] = local_exit_price
 
-            if reason in ("TAKE_PROFIT", "ST_EXIT", "SR_TOUCH"):
+            if reason in ("TAKE_PROFIT", "ST_EXIT"):
                 tp = local_exit_price or trade.get("take_profit")
                 trade["exit_price"] = tp
                 self.tp_events.append({
@@ -3755,10 +3935,6 @@ class TradingBot:
         if not trade or "_reserved" in trade:
             return
 
-        strategy = trade.get("strategy", "")
-        if strategy in SR_TOUCH_EXIT_STRATEGIES:
-            return
-
         direction = trade.get("direction", "SHORT")
         entry = trade.get("entry", 0)
         st_mode = trade.get("st_mode", False)
@@ -3779,7 +3955,7 @@ class TradingBot:
                 trade["st_mode"] = True
                 trade["st_confirmed_at"] = datetime.now(timezone.utc).isoformat()
 
-                if not self.paper:
+                if not self.paper and not trade.get("local_exit_only", False):
                     pid = trade.get("product_id")
                     if pid:
                         self.rest.cancel_bracket_tp(pid)
@@ -3873,7 +4049,7 @@ class TradingBot:
             return
 
         for sym in self.symbols:
-            self.candle_store[sym] = deque(maxlen=600)
+            self.candle_store[sym] = deque(maxlen=500)
             self.sr_managers[sym] = SRLevelManager(symbol=sym, notifier=self.notifier)
             self._forming_candle[sym] = None
             self._last_closed_time[sym] = 0
@@ -3888,7 +4064,7 @@ class TradingBot:
 
         self._print_startup_summary()
 
-        self._log("info", "STARTUP", f"STEP  5/15: Fetching {CANDLE_LIMIT} historical OHLCV candles for all symbols...")
+        self._log("info", "STARTUP", "STEP  5/15: Fetching historical OHLCV data for all symbols...")
         self._log("info", "STARTUP", "STEP  6/15: Storing historical closed candles...")
         self._fetch_historical_candles()
 
@@ -4083,6 +4259,21 @@ class TradingBot:
         min_rsi = RSI_MIN_CANDLES
         min_st = ST2_LENGTH + 2
         for sym in self.symbols:
+            historical = list(self.candle_store.get(sym, []))
+            if self.enable_mean_reversion:
+                z_metrics = calculate_price_zscore(historical)
+                self._z_last_eval_time[sym] = (z_metrics["timestamp"] if z_metrics
+                                               else (int(historical[-1]["time"]) if historical else 0))
+                if z_metrics:
+                    self._log("info", "Z-INIT",
+                              f"[{sym}] mean-reversion historical seed | n={z_metrics['count']} "
+                              f"close={smart_fmt(z_metrics['close'])} mean={smart_fmt(z_metrics['mean'])} "
+                              f"std={smart_fmt(z_metrics['std'])} Z={z_metrics['z']:.4f}; "
+                              "will only consider new closed candles for entries.")
+                else:
+                    self._log("warning", "Z-INIT",
+                              f"[{sym}] mean-reversion waiting for {Z_LOOKBACK} valid completed candles "
+                              f"(currently {len(historical)}).")
             have = len(self.candle_store.get(sym, []))
             rsi_ok = have >= min_rsi
             st_ok = have >= min_st
@@ -4329,6 +4520,23 @@ class TradingBot:
             if symbol in self.sr_managers:
                 self.sr_managers[symbol].update_levels(store_snapshot, initializing=False)
 
+            z_metrics = None
+            if self.enable_mean_reversion:
+                candidate_metrics = calculate_price_zscore(store_snapshot)
+                if candidate_metrics and candidate_metrics["timestamp"] > self._z_last_eval_time.get(symbol, 0):
+                    self._z_last_eval_time[symbol] = candidate_metrics["timestamp"]
+                    z_metrics = candidate_metrics
+                    self.last_eval_time[symbol] = time.time()
+                    self._log("info", "Z-UPDATE",
+                              f"[{symbol}] closed candle Z-score | close={smart_fmt(z_metrics['close'])} "
+                              f"mean={smart_fmt(z_metrics['mean'])} std={smart_fmt(z_metrics['std'])} "
+                              f"Z={z_metrics['z']:.4f} lookback={z_metrics['count']} "
+                              f"timestamp={z_metrics['timestamp']}")
+                elif not candidate_metrics:
+                    self._log("info", "Z-UPDATE",
+                              f"[{symbol}] mean-reversion waiting for {Z_LOOKBACK} valid completed candles "
+                              f"(store={len(store_snapshot)}).")
+
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
                 if trade and not trade.get("_reserved"):
@@ -4337,7 +4545,18 @@ class TradingBot:
                     trade = self.active_trades.get(symbol)
                     if trade and not trade.get("_reserved"):
                         st_mode = trade.get("st_mode", False)
-                        if not st_mode:
+                        if (trade.get("strategy") == Z_STRATEGY_NAME and not st_mode
+                                and z_metrics is not None):
+                            z = float(z_metrics["z"])
+                            if abs(z) >= Z_HARD_STOP:
+                                self._log("warning", "Z-EXIT",
+                                          f"[{symbol}] mean-reversion hard Z-stop | Z={z:.4f}; closing trade.")
+                                self._close_trade(symbol, trade, "STOP_LOSS", exit_price=z_metrics["close"])
+                            elif abs(z) <= Z_MEAN_EXIT_BAND:
+                                self._log("info", "Z-EXIT",
+                                          f"[{symbol}] price returned to rolling mean | Z={z:.4f}; closing trade.")
+                                self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=z_metrics["close"])
+                        elif not st_mode and trade.get("strategy") != Z_STRATEGY_NAME:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
             if symbol not in self.active_trades:
@@ -4400,6 +4619,55 @@ class TradingBot:
                                                  rsi_value, "LONG", no_rsi=False)
                                 signal_found = True
 
+                    if (self.enable_mean_reversion and not signal_found
+                            and symbol not in self.active_trades and z_metrics is not None):
+                        z = float(z_metrics["z"])
+                        # RSI is calculated only from completed candles and is an additional
+                        # direction-specific filter for mean-reversion entries.
+                        z_rsi = compute_rsi(store_snapshot, RSI_PERIOD)
+                        direction = None
+                        z_stop = 0.0
+                        rsi_block_reason = None
+
+                        if Z_ENTRY_THRESHOLD <= z < Z_HARD_STOP and self.enable_short:
+                            if z_rsi is not None and z_rsi >= Z_RSI_UPPER:
+                                direction = "SHORT"
+                                z_stop = float(z_metrics["stop_high"])
+                            else:
+                                rsi_block_reason = (f"SHORT requires RSI >= {Z_RSI_UPPER}; "
+                                                    f"current RSI={z_rsi if z_rsi is not None else 'N/A'}")
+                        elif -Z_HARD_STOP < z <= -Z_ENTRY_THRESHOLD and self.enable_long:
+                            if z_rsi is not None and z_rsi <= Z_RSI_LOWER:
+                                direction = "LONG"
+                                z_stop = float(z_metrics["stop_low"])
+                            else:
+                                rsi_block_reason = (f"LONG requires RSI <= {Z_RSI_LOWER}; "
+                                                    f"current RSI={z_rsi if z_rsi is not None else 'N/A'}")
+
+                        if direction:
+                            z_signal_candle = dict(closed_candle)
+                            z_signal_candle.update({
+                                "z_stop_loss": z_stop,
+                                "z_score": z,
+                                "z_mean": float(z_metrics["mean"]),
+                                "z_std": float(z_metrics["std"]),
+                                "z_timestamp": int(z_metrics["timestamp"]),
+                                "local_exit_only": True,
+                            })
+                            self._log("info", "Z-SIGNAL",
+                                      f"[{symbol}] {direction} signal | Z={z:.4f} RSI({RSI_PERIOD})={z_rsi:.2f} "
+                                      f"| entry=±{Z_ENTRY_THRESHOLD} hard_stop=±{Z_HARD_STOP} "
+                                      f"| mean={smart_fmt(z_metrics['mean'])} std={smart_fmt(z_metrics['std'])}")
+                            self._on_signal(symbol, z_signal_candle, Z_STRATEGY_NAME,
+                                            z_rsi, direction, no_rsi=False)
+                            signal_found = True
+                        else:
+                            reason = (rsi_block_reason or
+                                      f"requires {Z_ENTRY_THRESHOLD}<=|Z|<{Z_HARD_STOP} and the matching trade direction enabled")
+                            self._log("info", "Z-NO-SIGNAL",
+                                      f"[{symbol}] no mean-reversion entry | Z={z:.4f} "
+                                      f"RSI({RSI_PERIOD})={z_rsi if z_rsi is not None else 'N/A'}; {reason}.")
+
                     self._log("info", "PIPELINE",
                               f"[{symbol}] Strategy evaluation COMPLETE - "
                               f"{'signal generated' if signal_found else 'no signal, all strategies rejected'}")
@@ -4419,35 +4687,12 @@ class TradingBot:
             trade = self.active_trades.get(symbol)
             if not trade or "_reserved" in trade:
                 return
-            if trade.get("st_mode", False):
-                return
-
-            direction = trade.get("direction", "SHORT")
-            entry = trade["entry"]
-
-            strategy = trade.get("strategy", "")
-            if strategy in SR_TOUCH_EXIT_STRATEGIES:
-                target = trade.get("sr_exit_target")
-                if target is None:
-                    return
-
-                if direction == "LONG" and candle["high"] >= target:
-                    _log("info", "SR-TOUCH-EXIT",
-                         f"[{symbol}] LONG {strategy} - price reached nearest Resistance "
-                         f"{smart_fmt(target)} (high={smart_fmt(candle['high'])}) -> exit immediately")
-                    self._close_trade(symbol, trade, "SR_TOUCH", exit_price=target)
-                    return
-
-                if direction == "SHORT" and candle["low"] <= target:
-                    _log("info", "SR-TOUCH-EXIT",
-                         f"[{symbol}] SHORT {strategy} - price reached nearest Support "
-                         f"{smart_fmt(target)} (low={smart_fmt(candle['low'])}) -> exit immediately")
-                    self._close_trade(symbol, trade, "SR_TOUCH", exit_price=target)
-                    return
-
+            if trade.get("st_mode", False) or trade.get("local_exit_only", False):
                 return
 
             tp = trade.get("take_profit")
+            direction = trade.get("direction", "SHORT")
+            entry = trade["entry"]
             if tp is None:
                 return
 
@@ -4466,7 +4711,7 @@ class TradingBot:
             trade = self.active_trades.get(symbol)
             if not trade or "_reserved" in trade:
                 return
-            if trade.get("st_mode", False):
+            if trade.get("st_mode", False) or trade.get("local_exit_only", False):
                 return
 
             sl = trade["stop_loss"]
@@ -4489,11 +4734,15 @@ class TradingBot:
         try:
             entry = signal_candle["close"]
 
-            if direction == "SHORT":
+            if strategy_name == Z_STRATEGY_NAME:
+                sl = float(signal_candle.get("z_stop_loss", 0.0))
+            elif direction == "SHORT":
                 if strategy_name in ("SUPPORT_BREAKDOWN_SHORT", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"):
                     sl = signal_candle.get("pattern_high", signal_candle["high"])
-                elif strategy_name in ("STRATEGY_1_SHORT",
-                                        "VOL_EXPANSION_SHORT") and "pattern_high" in signal_candle:
+                elif strategy_name == "BEARISH_DOJI":
+                    sl = signal_candle.get("pattern_high", signal_candle["high"])
+                elif strategy_name in ("STRATEGY_1_SHORT", "RANGE_BREAK_SHORT",
+                                        "VOL_EXPANSION_SHORT", "BEARISH_ENGULFING") and "pattern_high" in signal_candle:
                     sl = signal_candle["pattern_high"]
                 else:
                     store = self.candle_store.get(symbol)
@@ -4501,8 +4750,10 @@ class TradingBot:
             else:
                 if strategy_name in ("RESISTANCE_BREAKOUT_LONG", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"):
                     sl = signal_candle.get("pattern_low", signal_candle["low"])
-                elif strategy_name in ("STRATEGY_1_LONG",
-                                        "VOL_EXPANSION_LONG") and "pattern_low" in signal_candle:
+                elif strategy_name == "BULLISH_DOJI":
+                    sl = signal_candle.get("pattern_low", signal_candle["low"])
+                elif strategy_name in ("STRATEGY_1_LONG", "RANGE_BREAK_LONG",
+                                        "VOL_EXPANSION_LONG", "BULLISH_ENGULFING") and "pattern_low" in signal_candle:
                     sl = signal_candle["pattern_low"]
                 else:
                     store = self.candle_store.get(symbol)
@@ -4512,21 +4763,8 @@ class TradingBot:
                 self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} - skip")
                 return
 
-            tp = compute_take_profit(entry, sl, direction)
-
-            sr_exit_target: Optional[float] = None
-            if strategy_name in SR_TOUCH_EXIT_STRATEGIES:
-                sr_exit_target = self._find_nearest_sr_exit_target(symbol, direction, entry)
-                if sr_exit_target is None:
-                    self._log("warning", "SIGNAL",
-                              f"[{symbol}] {strategy_name} - no S/R exit target found "
-                              f"({'Resistance above' if direction == 'LONG' else 'Support below'} entry); "
-                              f"trade will rely on SL only.")
-                else:
-                    _log("info", "SIGNAL",
-                         f"[{symbol}] {strategy_name} - S/R touch exit target set to "
-                         f"{smart_fmt(sr_exit_target)} "
-                         f"({'nearest Resistance above' if direction == 'LONG' else 'nearest Support below'} entry)")
+            local_exit_only = strategy_name == Z_STRATEGY_NAME
+            tp = 0.0 if local_exit_only else compute_take_profit(entry, sl, direction)
 
             with self._trade_lock:
                 if len(self.active_trades) >= self.max_trades:
@@ -4560,7 +4798,11 @@ class TradingBot:
                     "confirmation_close": signal_candle.get("confirmation_close", None),
                     "false_breakout_high": signal_candle.get("false_breakout_high", None),
                     "false_breakout_low": signal_candle.get("false_breakout_low", None),
-                    "sr_exit_target": sr_exit_target,
+                    "local_exit_only": local_exit_only,
+                    "z_score": signal_candle.get("z_score"),
+                    "rolling_mean": signal_candle.get("z_mean"),
+                    "rolling_std": signal_candle.get("z_std"),
+                    "signal_timestamp": signal_candle.get("z_timestamp"),
                 }
                 self.signals.append(signal)
 
@@ -4573,7 +4815,10 @@ class TradingBot:
                         "strategy": strategy_name, "rsi": rsi_value,
                         "st_mode": False, "no_rsi": no_rsi,
                         "balance_before_entry": current_capital,
-                        "sr_exit_target": sr_exit_target,
+                        "local_exit_only": local_exit_only,
+                        "z_score": signal_candle.get("z_score"),
+                        "rolling_mean": signal_candle.get("z_mean"),
+                        "rolling_std": signal_candle.get("z_std"),
                     }
 
             rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
@@ -4586,16 +4831,23 @@ class TradingBot:
                 strategy_category = " [S/R FALSE BREAKOUT REVERSAL]"
             elif strategy_name in ("RESISTANCE_BREAKOUT_LONG", "SUPPORT_BREAKDOWN_SHORT"):
                 strategy_category = " [S/R BREAKOUT]"
+            elif strategy_name in ("BEARISH_ENGULFING", "BULLISH_ENGULFING"):
+                strategy_category = " [ENGULFING + CONFIRMATION]"
             elif strategy_name in ("VOL_EXPANSION_SHORT", "VOL_EXPANSION_LONG"):
                 strategy_category = " [VOL EXPANSION + CONFIRMATION]"
+            elif strategy_name in ("BEARISH_DOJI", "BULLISH_DOJI"):
+                strategy_category = f" [DOJI - body <= {DOJI_BODY_RATIO_MAX * 100:.0f}%]"
 
             print()
             print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] - {strategy_name}{strategy_category}")
             print(f"           Entry       : {smart_fmt(entry)}")
             print(f"           Stop Loss   : {smart_fmt(sl)} (distance={smart_fmt(stop_dist)}) [CANDLE CLOSE]")
-            print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
-            if sr_exit_target is not None:
-                print(f"           S/R Exit    : {smart_fmt(sr_exit_target)} (touch-based, immediate)")
+            if local_exit_only:
+                print(f"           Z-score     : {signal_candle.get('z_score', float('nan')):.4f}")
+                print(f"           Rolling Mean: {smart_fmt(signal_candle.get('z_mean', 0.0))}")
+                print("           Take Profit : Managed by Z-score mean exit / Supertrend mode")
+            else:
+                print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
             print(f"           Risk        : ${risk_usd:,.2f} ({self.config['risk_pct']}%)")
             print(f"           Lot Size    : {self.user_lot_size}")
             print(f"           RSI(14)     : {rsi_str}")
@@ -4609,10 +4861,7 @@ class TradingBot:
                 if signal.get("break_candle_close"):
                     print(f"           Break Close  : {smart_fmt(signal['break_candle_close'])}")
             print(f"           Mode        : {signal['mode']}")
-            if strategy_name in SR_TOUCH_EXIT_STRATEGIES:
-                print(f"           Exit Mode   : S/R touch (nearest level) - SuperTrend exit DISABLED")
-            else:
-                print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
+            print(f"           SuperTrend  : Monitoring ST(14,2) + ST(21,1) post-entry")
             print()
 
             if self.notifier:
@@ -4717,25 +4966,22 @@ class TradingBot:
 
             print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | filled={actual_filled_size} contracts")
 
-            strategy_name = signal.get("strategy", "")
-            sr_exit_target = signal.get("sr_exit_target")
-
-            if strategy_name in SR_TOUCH_EXIT_STRATEGIES and sr_exit_target is not None:
+            local_exit_only = bool(signal.get("local_exit_only", False))
+            if local_exit_only:
                 bracket_ok = False
-                _log("info", "BRACKET", f"[{symbol}] {strategy_name}: no exchange TP bracket placed - "
-                                       f"exit managed locally at S/R touch {smart_fmt(sr_exit_target)}")
+                self._log("info", "Z-EXIT-MODE",
+                          f"[{symbol}] no exchange TP bracket for mean-reversion trade; Z-score exits before ST mode "
+                          "and shared Supertrend reversal exits after confirmation are managed by the main pipeline.")
             else:
                 bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
                 bracket_ok = bracket_result and "error" not in bracket_result
-
                 if bracket_ok:
                     print(f"  [TP BRACKET OK] Take profit bracket placed at {smart_fmt(tp)}")
                     _log("info", "BRACKET", f"TP bracket placed for {symbol} at {smart_fmt(tp)}")
                 else:
                     self._log("warning", "BRACKET", f"TP bracket FAILED for {symbol}: {bracket_result} "
                                                       f"(local candle-close stop loss still protects the position)")
-
-            self._log("info", "LOCAL-SL", f"Stop loss managed locally for {symbol} at {smart_fmt(sl)} (candle close)")
+                self._log("info", "LOCAL-SL", f"Stop loss managed locally for {symbol} at {smart_fmt(sl)} (candle close)")
 
             signal["executed"] = True
             signal["size"] = actual_filled_size
@@ -4754,7 +5000,10 @@ class TradingBot:
                 "no_rsi": signal.get("no_rsi", False),
                 "balance_before_entry": balance_before_entry,
                 "user_lot_size": self.user_lot_size,
-                "sr_exit_target": sr_exit_target,
+                "local_exit_only": local_exit_only,
+                "z_score": signal.get("z_score"),
+                "rolling_mean": signal.get("rolling_mean"),
+                "rolling_std": signal.get("rolling_std"),
             }
 
             with self._trade_lock:
@@ -5064,12 +5313,9 @@ class TradingBot:
     def _print_banner(self) -> None:
         print()
         print("+========================================================+")
-        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v15.0            |")
-        print("|   Position sizing uses user-provided lot/contract size.|")
-        print("|   Strategy set: Strategy 1, Vol Expansion,             |")
-        print("|   S/R Breakout, S/R False Breakout Reversal.           |")
-        print("|   Vol Expansion: S/R touch exit (immediate)            |")
-        print("|   Historical candles loaded at startup: 300            |")
+        print("|   DELTA EXCHANGE INDIA - TRADING BOT  v14.9 (FIXED)     |")
+        print("|   Position sizing uses user-provided lot/contract size. |")
+        print("|   Volume Expansion now requires a confirmation candle.  |")
         print("+========================================================+")
         print()
 
@@ -5080,7 +5326,6 @@ class TradingBot:
         print("+--------------------------------------------------------+")
         print(f"  Mode              : {mode_str}")
         print(f"  Timeframe         : {self.timeframe}")
-        print(f"  Historical candles: {CANDLE_LIMIT} per symbol (loaded at startup)")
         print(f"  Trading capital   : ${self.trading_capital:,.2f} USD")
         print(f"  Risk / trade      : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
         print(f"  Lot / contract    : {self.user_lot_size} (user-provided)")
@@ -5092,25 +5337,25 @@ class TradingBot:
         print(f"  Max open trades   : {self.max_trades}")
         print(f"  SHORT TRADES      : {'ENABLED' if self.enable_short else 'DISABLED'}")
         print(f"  LONG TRADES       : {'ENABLED' if self.enable_long else 'DISABLED'}")
+        print(f"  Mean Reversion    : {'ENABLED' if self.enable_mean_reversion else 'DISABLED'} "
+              f"(lookback={Z_LOOKBACK}, entry |Z| in [{Z_ENTRY_THRESHOLD}, {Z_HARD_STOP}), "
+              f"hard stop |Z|>={Z_HARD_STOP}, mean exit |Z|<={Z_MEAN_EXIT_BAND}, "
+              f"RSI SHORT>={Z_RSI_UPPER}/LONG<={Z_RSI_LOWER}, ST mode after both confirm)")
         print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
         print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
         print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
-        print(f"  NO RSI FILTER     : Vol Expansion, S/R Breakout, S/R Reversal")
+        print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
         print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
               f"requires 1 confirmation candle after breakout")
-        print(f"  Exit - Vol Expand : LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
-        print(f"  Exit - Others     : Strategy 1 & S/R Breakout & S/R Reversal use TP touch + SuperTrend (unchanged)")
-        print(f"  S/R Historical    : Swing-high/low based detection (unchanged)")
-        print(f"  S/R New (live)    : Swing-high/low over batches of {SR_NEW_BATCH_SIZE} closed candles "
-              f"({SR_NEW_SWING_SENSITIVITY}-candle left/right sensitivity, deferred confirmation at batch boundaries)")
-        print(f"  S/R Replacement   : DISABLED (no breakout-based level replacement)")
-        print(f"  S/R Email Alerts  : NEW + EXPIRED events (deduped; marked sent only after delivery)")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
-        print(f"  S/R Current-Price : New-detection filter = {NEW_SR_PRICE_FILTER_PCT*100:.1f}% (was 0.2%)")
+        print(f"  S/R Init          : Complete historical scan (all swing points) - once at startup")
+        print(f"  S/R Live          : Incremental updates per new candle - maintains processed-state")
         print(f"  S/R Merging       : ENABLED (weighted avg by touches/strength, threshold={SR_MERGE_THRESHOLD*100:.2f}%)")
-        print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price; equal -> SUPPORT for new detection)")
+        print(f"  S/R Reclassify    : ENABLED (fixes classification based on current price)")
         print(f"  S/R Min Distance  : ENABLED ({MIN_SR_DISTANCE_PERCENT}% minimum separation - runs ITERATIVELY)")
         print(f"  S/R Logging       : NEW → MERGED → RECLASSIFIED → FILTERED → FINAL (clean concise)")
+        print(f"  S/R Rejection Log : Detailed reasons (logs only - no email)")
+        print(f"  S/R Email Alerts  : REJECTION EMAILS DISABLED - all rejection details in logs only")
         print(f"  Price Precision   : auto dp via smart_fmt() - supports micro-price alts")
         print(f"  GMAIL             : {'ENABLED' if self.notifier and self.notifier.enabled else 'DISABLED'} (non-blocking async send)")
         print(f"  Health Watchdog   : ENABLED (checks every {WATCHDOG_CHECK_INTERVAL // 60} min, "
@@ -5136,8 +5381,10 @@ class TradingBot:
         print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
         print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
               f"rejects if contracts < 1 (no max(1,...) fallback)")
-        print(f"  Active Strategies : Strategy 1 (RSI), Vol Expansion, "
-              f"S/R Breakout, S/R False Breakout Reversal")
+        print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
+        print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
+        print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
+        print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
         print(f"  Symbols ({len(self.symbols)}):")
         for sym in self.symbols:
             pid = self.product_map.get(sym, "???")
@@ -5369,10 +5616,12 @@ def test_gmail():
 def main() -> None:
     print()
     print("  +========================================================+")
-    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v15.0          |")
+    print("  |   DELTA EXCHANGE INDIA  -  TRADING BOT  v14.9 (FIXED)   |")
     print("  +========================================================+")
 
     _divider("SETUP")
+    enable_mean_reversion = input("  Enable Single-Coin Mean Reversion strategy? (y/N) : ").strip().lower() == "y"
+    print(f"  Single-Coin Mean Reversion: {'ENABLED' if enable_mean_reversion else 'DISABLED'} (uses the same configured coins)")
     test_gmail_first = input("  Test Gmail notifications first? (y/N) : ").strip().lower()
     if test_gmail_first == 'y':
         test_gmail()
@@ -5389,9 +5638,10 @@ def main() -> None:
     print("  Loading product catalogue...")
     product_map = rest_tmp.fetch_product_map()
     if not product_map:
-        print("  [ERROR] Could not load product catalogue. Check network.")
-        return
-    print(f"  {len(product_map)} products loaded.")
+        print("  [WARNING] Could not load product catalogue. Main bot may not start;")
+        print("            independent Fed and tech detectors will still be configured and launched.")
+    else:
+        print(f"  {len(product_map)} products loaded.")
 
     raw_symbols = ask_symbols(product_map)
 
@@ -5414,12 +5664,17 @@ def main() -> None:
     risk_pct, max_trades = ask_risk_params()
     daily_loss_limit_pct = ask_daily_loss_limit()
 
+    # Configuration order: main bot questions first, then Fed, then tech.
+    _divider("FED RATE DETECTOR")
+    fed_config = fed_rate_detector.ask_runtime_config()
+    _divider("TECH STOCK INDEX DETECTOR")
+    tech_config = tech_stock.ask_runtime_config()
+
     _divider("CONFIRM")
     risk_usd = trading_capital * risk_pct / 100
     daily_limit_usd = trading_capital * (daily_loss_limit_pct / 100)
     print(f"  Mode              : {'PAPER' if paper else 'LIVE TRADING'}")
     print(f"  Timeframe         : {timeframe}")
-    print(f"  Historical candles: {CANDLE_LIMIT} per symbol (loaded at startup)")
     print(f"  Short Trades      : {'ENABLED' if enable_short else 'DISABLED'}")
     print(f"  Long Trades       : {'ENABLED' if enable_long else 'DISABLED'}")
     print(f"  Symbols           : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
@@ -5433,6 +5688,9 @@ def main() -> None:
     print(f"  Daily loss cap    : {daily_loss_limit_pct}%  =  ~${daily_limit_usd:,.2f}")
     print(f"  Max open trades   : {max_trades}")
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
+    print(f"  Fed detector      : {'ENABLED' if fed_config.get('enabled') else 'DISABLED'}")
+    print(f"  Tech index        : {'ENABLED' if tech_config.get('enabled') else 'DISABLED'}")
+    print(f"  Mean Reversion    : {'ENABLED' if enable_mean_reversion else 'DISABLED'} | lookback={Z_LOOKBACK} | entry |Z|>={Z_ENTRY_THRESHOLD} | mean exit |Z|<={Z_MEAN_EXIT_BAND} | hard stop |Z|>={Z_HARD_STOP} | RSI short>={Z_RSI_UPPER}, long<={Z_RSI_LOWER}")
     print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} closed candles per symbol")
     print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry)")
     print(f"  PnL Calculation   : realized_pnl = final_balance - balance_before_entry")
@@ -5445,16 +5703,10 @@ def main() -> None:
           f"rejects if contracts < 1 (no max(1,...) fallback)")
     print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
           f"requires 1 confirmation candle after breakout")
-    print(f"  Exit - Vol Expand : LONG exits at nearest Resistance touch; SHORT exits at nearest Support touch (immediate)")
-    print(f"  Exit - Others     : Strategy 1 & S/R Breakout & S/R Reversal use TP touch + SuperTrend (unchanged)")
-    print(f"  S/R Historical    : Swing-high/low based detection (unchanged)")
-    print(f"  S/R New (live)    : Swing-high/low over batches of {SR_NEW_BATCH_SIZE} closed candles "
-          f"({SR_NEW_SWING_SENSITIVITY}-candle left/right sensitivity, deferred confirmation at batch boundaries)")
-    print(f"  S/R Replacement   : DISABLED (no breakout-based level replacement)")
-    print(f"  S/R Email Alerts  : NEW + EXPIRED events (deduped; marked sent only after delivery)")
-    print(f"  S/R Current-Price : New-detection filter = {NEW_SR_PRICE_FILTER_PCT*100:.1f}% (was 0.2%)")
-    print(f"  Active Strategies : Strategy 1 (RSI), Vol Expansion, "
-          f"S/R Breakout, S/R False Breakout Reversal")
+    print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
+    print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
+    print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
+    print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
     if trading_capital <= 0:
@@ -5483,24 +5735,81 @@ def main() -> None:
         "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
         "enable_short": enable_short,
         "enable_long": enable_long,
+        "enable_mean_reversion": enable_mean_reversion,
         "user_lot_size": user_lot_size,
     }
 
-    bot = TradingBot(cfg, notifier=notifier)
-    bot.start()
+    # Bind legacy security helpers to this runtime and create shared API recovery.
+    serede.bind_runtime_globals(globals())
+    stop_event = threading.Event()
+    api_guard = serede.ApiResilience(notifier=notifier)
+    service_threads = []
 
-    if not bot.running or not bot.symbols:
-        print("  [ERROR] Bot failed to start. See log above.")
-        return
+    bot = None
+    main_bot_supervisor = None
+    try:
+        bot = TradingBot(cfg, notifier=notifier)
+        bot.start()
+        if bot.running and bot.symbols:
+            main_bot_supervisor = serede.MainBotSupervisor(bot, notifier=notifier)
+            main_bot_supervisor.start()
+    except Exception as exc:
+        _log_exc("STARTUP", f"Main trading bot failed during startup: {exc}")
+
+    # Start the main bot first, then Fed, then tech. Each service owns its loop/thread.
+    # A failed bot startup must not prevent the independent detectors from running.
+    if fed_config.get("enabled"):
+        t = threading.Thread(
+            target=serede.run_supervised_service,
+            kwargs={
+                "label": "FED",
+                "target": fed_rate_detector.run_service,
+                "config": fed_config,
+                "notifier": notifier,
+                "api_guard": api_guard,
+                "stop_event": stop_event,
+            },
+            name="FedRateDetector",
+            daemon=True,
+        )
+        t.start()
+        service_threads.append(t)
+        print("  [START] Fed rate detector launched independently.")
+
+    if tech_config.get("enabled"):
+        t = threading.Thread(
+            target=serede.run_supervised_service,
+            kwargs={
+                "label": "TECH",
+                "target": tech_stock.run_service,
+                "config": tech_config,
+                "notifier": notifier,
+                "api_guard": api_guard,
+                "stop_event": stop_event,
+            },
+            name="TechStockDetector",
+            daemon=True,
+        )
+        t.start()
+        service_threads.append(t)
+        print("  [START] Tech stock detector launched independently.")
+
+    if bot is None or not bot.running or not bot.symbols:
+        print("  [WARNING] Main trading bot did not fully start. Detector services continue independently.")
+    else:
+        print("  [START] Main trading bot is running.")
 
     print()
-    print("  Bot is running. Press Ctrl+C to stop.")
+    print("  Integrated services are running independently. Press Ctrl+C to stop all.")
     print()
 
     try:
         while True:
             time.sleep(60)
             try:
+                if bot is None:
+                    print("  [STATUS] Trading bot unavailable; independent detector services remain active.")
+                    continue
                 open_n = len(bot.active_trades)
                 open_syms = list(bot.active_trades.keys())
                 ws_state = bot.ws_manager.get_state() if bot.ws_manager else "N/A"
@@ -5508,10 +5817,6 @@ def main() -> None:
                 for sym, t in bot.active_trades.items():
                     if isinstance(t, dict) and t.get("st_mode"):
                         st_info += f"[{sym}:ST-MODE] "
-                sr_exit_info = ""
-                for sym, t in bot.active_trades.items():
-                    if isinstance(t, dict) and t.get("strategy") in SR_TOUCH_EXIT_STRATEGIES and t.get("sr_exit_target"):
-                        sr_exit_info += f"[{sym}:SR-EXIT {smart_fmt(t['sr_exit_target'])}] "
                 cooldown_info = ""
                 for sym, remaining in bot._post_exit_cooldown.items():
                     if remaining and remaining > 0:
@@ -5527,15 +5832,26 @@ def main() -> None:
                     f"{bot.daily_loss_tracker.status()}  "
                     + (f"Trades={open_syms}" if open_syms else "NoOpenTrades")
                     + (f"  {st_info}" if st_info else "")
-                    + (f"  {sr_exit_info}" if sr_exit_info else "")
                     + (f"  {cooldown_info}" if cooldown_info else "")
                 )
             except Exception as e:
                 _log_exc("STATUS", f"Status print failed (bot itself keeps running): {e}")
     except KeyboardInterrupt:
-        bot.stop()
-        print()
-        print("  Bot stopped. Goodbye.")
+        print("\n  Stopping all services...")
+        stop_event.set()
+        try:
+            if main_bot_supervisor is not None:
+                main_bot_supervisor.stop()
+        except Exception as exc:
+            _log_exc("SHUTDOWN", f"Main bot supervisor stop raised: {exc}")
+        try:
+            if bot is not None:
+                bot.stop()
+        except Exception as exc:
+            _log_exc("SHUTDOWN", f"Trading bot stop raised: {exc}")
+        for worker in service_threads:
+            worker.join(timeout=5)
+        print("  All services stopped. Goodbye.")
         print()
 
 
