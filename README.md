@@ -1,1184 +1,515 @@
-DELTA EXCHANGE INDIA TRADING BOT - v12.8
-📋 Overview
-A sophisticated algorithmic trading bot for Delta Exchange India that implements multiple trading strategies including reversal detection, volatility expansion, support/resistance breakouts, and trend-following systems. The bot features dual SuperTrend analysis for dynamic take-profit management, Market Strength Index (MSI) filtering, and comprehensive email notifications via Gmail.
+TradePilot
+TradePilot is an automated cryptocurrency trading system built
+around the Delta Exchange India API. It combines a Python trading engine
+with market-monitoring services, email alerts, a FastAPI backend,
+PostgreSQL persistence, and a Next.js dashboard.
+> **Important:** Trading involves substantial financial risk. TradePilot
+> is software, not financial advice or a guarantee of profit. Start in
+> paper mode, verify exchange settings and position sizing, and never
+> deploy live trading without reviewing the code and testing it
+> independently.
+---
+Table of contents
+Project overview
+Architecture
+Features
+Trading engine
+Market-monitoring services
+Dashboard and backend
+Project structure
+Requirements
+Installation
+Configuration and secrets
+Run the trading engine
+Run the web application
+Backend API
+Database
+Logging and generated data
+Deployment notes
+Security checklist
+Current development status
+Disclaimer
+Project overview
+TradePilot is organized into three main parts:
+Trading engine --- Python code that retrieves market data,
+evaluates trading conditions, manages positions, and communicates
+with Delta Exchange India.
+Backend --- FastAPI services that expose bot controls and data
+to the web application, with SQLAlchemy/PostgreSQL persistence.
+Frontend --- A Next.js application that provides the TradePilot
+dashboard and navigation for signals, trades, strategies, market
+information, analytics, notifications, and settings.
+The trading engine remains the source of truth for trading decisions.
+The dashboard should display backend/engine data rather than
+independently reimplementing trading indicators or strategy rules.
+Architecture
+``` text
+                 Next.js dashboard
+                        |
+                 HTTP / API requests
+                        |
+                   FastAPI backend
+                  /       |       \
+             BotManager  Services  PostgreSQL
+                  |
+             TradingBot engine
+                  |
+          Delta Exchange India
+                  |
+       REST API + market WebSocket
 
-🚀 Key Features
-Multiple Trading Strategies:
+Additional monitoring services:
+  - Federal Reserve rate detector
+  - US technology-stock index detector
+  - Quant Pairs Divergence strategy
+  - Other companion modules imported by the trading engine
+```
+Features
+Trading and exchange connectivity
+Delta Exchange India REST API integration.
+Delta Exchange India WebSocket market-data connection.
+Historical candle loading and completed-candle processing.
+Configurable trading symbols and timeframes.
+Paper and live execution modes.
+Long and short direction controls.
+Configurable leverage, trading capital, risk percentage, and maximum
+concurrent trades.
+Position monitoring, stop-loss handling, take-profit handling, and
+trade-close processing.
+Local logging to the terminal and rotating `bot.log` files.
+The exchange API credentials must remain private and must never be
+placed in frontend code.
+Risk and position management
+The trading engine contains risk controls such as:
+Risk percentage per trade.
+Position sizing based on the trade's stop-loss distance and
+contract/exchange constraints.
+Maximum concurrent trades.
+Daily realized-loss tracking and a daily loss limit.
+Stop-loss and take-profit exit handling.
+Post-exit cooldown handling for symbols.
+Actual position size can depend on contract specifications, lot-size
+conversion, available capital, leverage, and exchange validation. Do not
+assume that leverage alone determines the maximum loss on a trade.
+Signals and notifications
+The engine maintains in-memory signal and trade state and supports
+callback hooks for dashboard integration. The Gmail notifier can send
+alerts for events such as signals, trade execution, trade closure,
+SuperTrend exits, and risk-limit events. Email delivery depends on valid
+Gmail SMTP credentials and configuration.
+Trading engine
+The main engine is in `bot.py` (or the current project-specific
+trading-engine module). It is responsible for:
+Exchange communication.
+Candle buffers and closed-candle evaluation.
+Strategy evaluation.
+Entry and exit decisions.
+Position sizing and exchange order handling.
+Stop-loss and take-profit monitoring.
+Daily risk controls.
+Logging and notification callbacks.
+Strategy families
+The project has developed multiple strategy families, including:
+Reversal / price-action setups.
+Doji reversal setups.
+Range-break setups.
+Volatility-expansion setups.
+Support/resistance breakout setups.
+Support/resistance false-breakout reversal setups.
+Engulfing-candle setups.
+Harami-candle setups.
+The exact enabled strategies and their current conditions are defined by
+the version of the trading-engine source and runtime configuration.
+Review the current source before assuming that every historical strategy
+is enabled.
+Indicators and trade management
+The trading engine has used RSI/MSI-style momentum filtering and dual
+SuperTrend monitoring. The dual SuperTrend configuration documented in
+the project is:
+SuperTrend (14, 2)
+SuperTrend (21, 1)
+When both SuperTrend readings align with the trade direction, the engine
+can use that confirmation in its trade-management logic. A reversal of
+both readings can be used as an exit condition. Indicator values and
+thresholds should be checked against the current source code before
+changing configuration.
+Support and resistance
+The engine maintains support/resistance levels and uses them in the
+relevant breakout and false-breakout strategies. Levels are derived from
+candle history and evaluated against current market price. A newly
+detected level is not, by itself, necessarily a trade signal or an email
+alert; alerts depend on the configured signal/notification conditions.
+Market-monitoring services
+Federal Reserve rate detector --- `fed_rate_detector.py`
+This service:
+Finds the latest Federal Reserve FOMC statement from the official
+Federal Reserve website.
+Extracts the federal funds target range and the decision wording.
+Compares the new decision with the previously saved state.
+Records state/history in JSON files.
+Can send an informational alert when the target range changes.
+Supports a configurable polling interval when run as a background
+service.
+A first run establishes a baseline and does not send a change alert. A
+new statement with an unchanged target range is recorded without
+treating it as a rate change. The market interpretation in an alert is
+informational, not a guaranteed crypto-market prediction.
+Technology-stock index detector --- `tech_stock.py`
+This companion service builds a synthetic US technology-stock index
+using:
+Massive for daily OHLC market data.
+Financial Modeling Prep (FMP) for float-share data.
+Estimated free-float market-cap weights.
+A synthetic index base value of 1,000.
+For each new completed index candle, it compares the latest close and
+candle range with the averages of the previous 100 completed index
+candles. The current implementation evaluates:
+LONG alert: latest close is above the previous-100-candle
+average close and latest range is above the previous-100-candle
+average range.
+SHORT alert: latest close is below the previous-100-candle
+average close and latest range is above the previous-100-candle
+average range.
+The index is a current-weight synthetic calculation, not an official
+historical index. Its weighted OHLC range is approximate because
+component stock highs and lows do not necessarily occur at the same
+time. Alerts are written to the terminal and
+`tech_index_data/alerts.log`; the service can also use the shared
+notifier when integrated.
+Quant Pairs Divergence --- `quant_strategy.py`
+This is a separate pairs-analysis module. It calculates statistics from
+the latest 200 synchronized completed candles for two symbols.
+Current strategy constants in the module:
+Parameter                                                   Value
+---
+Entry Z-score                                                2.25
+Hard-stop absolute Z-score                                    4.0
+Mean-reversion exit zone                           -0.25 to +0.25
+ADF maximum p-value                                          0.05
+ADF recheck interval                                   10 candles
+Lookback                       200 synchronized completed candles
+Direction logic:
+Z-score at or below -2.25: long leg A and short leg B.
+Z-score at or above +2.25: short leg A and long leg B.
+Entry requires the ADF condition to pass as well as the Z-score
+threshold.
+Exit can occur when the Z-score returns to the mean-reversion zone.
+A hard exit condition is defined when the absolute Z-score reaches
+4.0.
+The main bot remains responsible for exchange execution and
+account-level risk checks. Quant pair symbols and contract lot
+conversions must follow the format expected by the current bot
+configuration.
+Other companion modules
+The main engine imports additional companion modules, including
+`serede.py`. Their behavior should be documented from the current source
+implementation rather than inferred from the filename.
+Dashboard and backend
+Backend
+The backend uses:
+FastAPI for HTTP endpoints.
+SQLAlchemy for database access.
+PostgreSQL for persistent records.
+`BotManager` to start, stop, and inspect the Python trading engine.
+The backend currently exposes bot status, start/stop controls, signals,
+active trades, and stop-loss-event routes. The exact schemas are defined
+in `backend/config.py`, `backend/models.py`, and the route definitions
+in `backend/main.py`.
+Frontend
+The frontend is a Next.js application using TypeScript and Tailwind CSS.
+The planned dashboard navigation includes:
+Route              Purpose
+---
+`/`                Dashboard
+`/signals`         Generated trading signals
+`/trades`          Active and historical trades
+`/strategies`      Strategy information and controls
+`/market`          Market information
+`/analytics`       Performance analytics
+`/notifications`   Alerts and events
+`/settings`        Bot configuration
+Some pages may still be placeholders while the UI and backend
+integration are being developed. Do not assume that every dashboard card
+or route is already backed by live database data.
+Project structure
+The local development project is organized approximately as follows:
+``` text
+Trade Pilot/
+├── backend/
+│   ├── main.py
+│   ├── bot_manager.py
+│   ├── config.py
+│   ├── database.py
+│   ├── models.py
+│   └── db_service.py
+│
+├── bot/
+│   ├── __init__.py
+│   └── trading_bot.py
+│
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx
+│   │   ├── analytics/
+│   │   ├── market/
+│   │   ├── notifications/
+│   │   ├── settings/
+│   │   ├── signals/
+│   │   ├── strategies/
+│   │   └── trades/
+│   └── components/
+│
+├── bot.py
+├── quant_strategy.py
+├── fed_rate_detector.py
+├── tech_stock.py
+├── serede.py
+├── bot.log
+└── README.md
+```
+This is a guide to the project layout, not a guarantee that every listed
+file exists in every branch or deployment. Keep the actual repository
+structure and import paths consistent. In particular, the standalone bot
+entry point and the dashboard-integrated bot module should not be
+confused or substituted without checking their imports.
+Requirements
+Python
+Use a Python version compatible with all installed dependencies and the
+current project source.
+Core packages used across the project include:
+``` text
+requests
+websocket-client
+numpy
+pandas
+statsmodels
+beautifulsoup4
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+```
+The exact dependency set can vary by enabled module. Maintain a project
+`requirements.txt` or separate dependency files and install from those
+files for repeatable deployments.
+Frontend
+Node.js (LTS recommended).
+npm.
+Next.js.
+React.
+TypeScript.
+Tailwind CSS.
+Installation
+Clone the repository:
+``` bash
+git clone <YOUR_REPOSITORY_URL>
+cd "Trade Pilot"
+```
+Create and activate a Python virtual environment.
+Windows PowerShell:
+``` powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+Linux / macOS:
+``` bash
+python3 -m venv venv
+source venv/bin/activate
+```
+Install the Python dependencies:
+``` bash
+pip install -r requirements.txt
+```
+If the repository uses separate dependency files for optional services,
+install the relevant file as documented in that module.
+Install frontend dependencies:
+``` bash
+cd frontend
+npm install
+```
+Configuration and secrets
+Do not commit API keys, passwords, private keys, or account information.
+The project may require the following credentials, depending on which
+services are enabled:
+Credential                      Used for
+---
+Delta Exchange API key          Authenticated exchange requests
+Delta Exchange API secret       Request signing
+Gmail sender and app password   Email notifications
+Massive API key                 US stock daily market data
+FMP API key                     Float-share data for index weights
+PostgreSQL connection URL       Backend database connection
+Use environment variables or a secrets manager. A local `.env` file
+should be excluded from Git using `.gitignore`. Never expose backend
+secrets through `NEXT_PUBLIC_*` variables or browser-side JavaScript.
+Example placeholder names (adapt them to the exact names read by your
+current code):
+``` env
+DELTA_API_KEY=
+DELTA_API_SECRET=
 
-Reversal Model: Identifies potential trend reversals using price action patterns
+GMAIL_SENDER=
+GMAIL_APP_PASSWORD=
+GMAIL_RECIPIENT=
 
-Volatility Expansion: Catches momentum breakouts from consolidation
+MASSIVE_API_KEY=
+FMP_API_KEY=
 
-Range Break: Identifies when price breaks out of trading ranges
-
-Support/Resistance Strategies: Trades breaks, rejections, and false breakouts at key price levels
-
-Trend Following: Uses dual SuperTrend analysis to capture sustained moves
-
-Dual SuperTrend System:
-
-SuperTrend (14, 2.0): Fast/Accurate trend detection
-
-SuperTrend (21, 1.0): Slow/Stable trend confirmation
-
-Dynamic TP: Enter trend-following mode when both confirm
-
-Exit when both SuperTrends reverse direction
-
-Market Strength Index (MSI):
-
-Measures momentum and market conditions
-
-Short trades require MSI > 55 (overbought/strong bearish momentum)
-
-Long trades require MSI < 40 (oversold/strong bullish momentum)
-
-Blocks long trades when MSI < 24 (extreme oversold)
-
-Risk Management:
-
-Daily loss limit (based on realized PnL)
-
-Configurable risk per trade (percentage of capital)
-
-Max concurrent trades limitation
-
-Stop-loss triggers on candle close only
-
-Smart Price Formatting:
-
-Auto-detects decimal places based on price magnitude
-
-Full precision for altcoins (micro-prices up to 10 decimals)
-
-Clean formatting for BTC/ETH (2-3 decimals)
-
-Gmail Notifications:
-
-Trade signals
-
-Trade execution confirmations
-
-Trade closure (profit/loss)
-
-SuperTrend confirmations and exits
-
-Daily loss warnings and limits
-
-Startup report
-
-📦 Installation
-Prerequisites
-Python 3.8 or higher
-
-Delta Exchange India account
-
-(Optional) Gmail App Password for notifications
-
-Dependencies
-bash
-pip install requests websocket-client
-🚀 Quick Start
-python
+DATABASE_URL=
+```
+Do not paste real credentials into README files, source files,
+screenshots, issue trackers, or chat messages.
+Run the trading engine
+The exact entry point depends on the deployment mode and current branch.
+For the standalone interactive bot, the source has historically been
+launched with:
+``` bash
 python bot.py
-Follow the interactive setup prompts:
-
-Select timeframe (1m, 5m, 15m, 1h)
-
-Choose paper or live trading mode
-
-Enter API credentials (live mode)
-
-Configure trade directions
-
-Set up Gmail notifications (optional)
-
-Enter trading parameters
-
-⚙️ Configuration
-Interactive Parameters
-Parameter	Description	Default
-Timeframe	Chart timeframe for analysis	1h
-Mode	Paper or Live trading	Paper
-Leverage	Trading leverage (1-200x)	5x
-Risk per trade	Percentage of capital to risk	2%
-Max open trades	Maximum concurrent trades	2
-Daily loss limit	% of capital to stop trading	5%
-Pattern tolerance	Tolerance for reversal pattern detection	0.1%
-Environment Variables (Optional)
-For automated deployment, you can set these environment variables:
-
-bash
-export DELTA_API_KEY="your_api_key"
-export DELTA_API_SECRET="your_api_secret"
-export GMAIL_SENDER="your_email@gmail.com"
-export GMAIL_APP_PASSWORD="your_app_password"
-📊 Trading Strategies
-1. Reversal Model (With Market Strength Index Filter)
-This strategy identifies potential trend reversals by detecting specific price action patterns that signal exhaustion of the current trend.
-
-Pattern Formation Process:
-Phase 1: Trend Continuation (2 Candles)
-
-For Short Trades: Two consecutive bullish candles with the second closing higher than the first
-
-Indicates strong buying momentum that may be exhausting
-
-Shows aggressive buying pressure
-
-For Long Trades: Two consecutive bearish candles with the second closing lower than the first
-
-Indicates strong selling momentum that may be exhausting
-
-Shows aggressive selling pressure
-
-Phase 2: Indecision Pattern (1 Candle)
-
-A small-bodied candle appears after the strong momentum
-
-Body size ≤ 10% of total candle range
-
-Represents buyer-seller indecision/equilibrium
-
-Often appears at potential turning points
-
-Higher lows (for bullish reversal) or lower highs (for bearish reversal)
-
-Phase 3: Confirmation (1 Candle)
-
-Short Trade Confirmation: Bearish candle closes below the indecision candle's LOW
-
-Confirms sellers have taken control
-
-Momentum has shifted from bullish to bearish
-
-Long Trade Confirmation: Bullish candle closes above the indecision candle's HIGH
-
-Confirms buyers have taken control
-
-Momentum has shifted from bearish to bullish
-
-Entry & Exit Rules:
-
-Entry: On confirmation candle close
-
-Stop Loss: Indecision pattern's HIGH (shorts) or LOW (longs)
-
-Take Profit: 2:1 Risk-Reward ratio
-
-Market Strength Index Filter:
-
-Short Trades: Require MSI > 55 (overbought/strong bearish momentum)
-
-Confirms price has moved too far, too fast
-
-Increases probability of reversal
-
-Long Trades: Require MSI < 40 (oversold/strong bullish momentum)
-
-Confirms price has dropped too far, too fast
-
-Increases probability of reversal
-
-BLOCKS trades when MSI < 24 (extreme oversold)
-
-Prevents catching falling knives
-
-Waits for more reliable reversal signals
-
-2. Volatility Expansion (No MSI Filter)
-This strategy identifies when price breaks out of a consolidation range with strong momentum.
-
-Pattern Formation Process:
-Phase 1: Range Identification
-
-Look back 21 candles to find the trading range
-
-Identify the HIGHEST HIGH and LOWEST LOW of these 21 candles
-
-This represents the recent consolidation zone
-
-Phase 2: Breakout Detection
-
-Short Setup: Current candle breaks BELOW the lowest low
-
-Price has broken support
-
-Indicates bearish momentum building
-
-Long Setup: Current candle breaks ABOVE the highest high
-
-Price has broken resistance
-
-Indicates bullish momentum building
-
-Phase 3: Quality Validation
-
-Check the breakout candle's wick length
-
-Wick must be ≤ 10% of total candle range
-
-Small wick = strong breakout conviction
-
-Large wick = rejection/indecision
-
-Entry & Exit Rules:
-
-Entry: Immediately at candle close (no waiting for confirmation)
-
-Stop Loss: Breakout candle's HIGH (shorts) or LOW (longs)
-
-Take Profit: 2:1 Risk-Reward ratio
-
-Rationale:
-
-Low volatility periods (consolidation) are often followed by high volatility
-
-Clean breaks with small wicks tend to have stronger follow-through
-
-Momentum often continues in breakout direction
-
-3. Range Break Strategy (No MSI Filter)
-This strategy identifies when price breaks out of a well-defined trading range.
-
-Pattern Formation Process:
-Phase 1: Range Definition
-
-Latest 7 completed candles define the range
-
-Calculate RANGE HIGH (maximum high)
-
-Calculate RANGE LOW (minimum low)
-
-This is a rolling range (recalculated each candle)
-
-Phase 2: First Breakout
-
-Short Setup: Break candle closes BELOW range low
-
-Initial breakdown of support
-
-First sign of bearish momentum
-
-Long Setup: Break candle closes ABOVE range high
-
-Initial breakout of resistance
-
-First sign of bullish momentum
-
-Phase 3: Confirmation
-
-Short Setup: Next bearish candle closes BELOW break candle's close
-
-Confirms breakdown is real (not a fakeout)
-
-Shows continued selling pressure
-
-Long Setup: Next bullish candle closes ABOVE break candle's close
-
-Confirms breakout is real (not a fakeout)
-
-Shows continued buying pressure
-
-Entry & Exit Rules:
-
-Entry: On confirmation candle close
-
-Stop Loss: Break candle's HIGH (shorts) or LOW (longs)
-
-Take Profit: 2:1 Risk-Reward ratio
-
-Rationale:
-
-Ranges represent equilibrium between buyers and sellers
-
-Breakout indicates one side has gained control
-
-Confirmation helps reduce false breakouts
-
-4. Support/Resistance Strategies (No MSI Filter)
-This module identifies key price levels where the market has historically shown interest.
-
-Level Detection Process:
-Phase 1: Swing Point Identification
-
-Analyze the last 100 completed candles
-
-Swing High: A candle whose high is greater than the highs of the previous 5 candles and the next 5 candles
-
-Swing Low: A candle whose low is lower than the lows of the previous 5 candles and the next 5 candles
-
-Swing levels are confirmed only after enough future candles exist (minimum age of 3 candles)
-
-Phase 2: Level Merging
-
-Nearby levels within the merge threshold (0.5%) are combined into a single level
-
-Reduces noise from multiple nearby swing points
-
-Creates cleaner support/resistance zones
-
-Phase 3: Level Aging
-
-Each level has an age counter that increments each candle
-
-Levels expire after maximum age (50 candles) unless refreshed
-
-Stronger levels (more touches) can stay longer (up to 100 candles)
-
-Levels younger than minimum age (3 candles) are not considered valid
-
-Phase 4: Strength Tracking
-
-Each level stores a strength value which increases whenever price respects or retests the level
-
-Strength increases when:
-
-Price touches the level (within threshold)
-
-A new swing point forms near the level
-
-Stronger levels are prioritized during strategy evaluation
-
-Minimum strength of 1 required for trading
-
-Sub-Strategy A: Breakout (Confirmation Required)
-Short Setup (Support Breakdown):
-
-Break candle closes BELOW support level
-
-Bearish confirmation candle closes BELOW break candle's close
-
-Entry on confirmation candle close
-
-Stop Loss = Break candle HIGH
-
-Long Setup (Resistance Breakout):
-
-Break candle closes ABOVE resistance level
-
-Bullish confirmation candle closes ABOVE break candle's close
-
-Entry on confirmation candle close
-
-Stop Loss = Break candle LOW
-
-Rationale:
-
-Levels that have been tested multiple times are more significant
-
-Breakouts with confirmation help reduce false signals
-
-Stronger levels tend to produce better risk-reward opportunities
-
-Sub-Strategy B: Rejection (Immediate Execution)
-Monitoring Process:
-
-Identify level zones (0.5% tolerance around exact level)
-
-When price reaches zone, start monitoring
-
-Monitor for up to 25 candles
-
-Execute at the close of the rejection candle without waiting for an additional confirmation candle
-
-Expire if no rejection within 25 candles
-
-Short Setup (Resistance Rejection):
-
-Price reaches resistance zone
-
-Bearish candle forms (close < high)
-
-Indicates rejection at resistance
-
-Execute at the close of the rejection candle
-
-Stop Loss = Rejection candle HIGH
-
-Long Setup (Support Rejection):
-
-Price reaches support zone
-
-Bullish candle forms (close > low)
-
-Indicates rejection at support
-
-Execute at the close of the rejection candle
-
-Stop Loss = Rejection candle LOW
-
-Rationale:
-
-Zone-based approach is more realistic than exact levels
-
-Immediate execution captures the reversal
-
-Window prevents stale setups from being considered
-
-Sub-Strategy C: False Breakout (Confirmation Required)
-Short Setup (Resistance Fakeout):
-
-Price breaks ABOVE resistance
-
-SAME candle closes BACK BELOW resistance
-
-Bearish reversal candle forms
-
-Bearish confirmation candle closes BELOW reversal candle's close
-
-Entry on confirmation candle close
-
-Stop Loss = Reversal candle HIGH
-
-Long Setup (Support Fakeout):
-
-Price breaks BELOW support
-
-SAME candle closes BACK ABOVE support
-
-Bullish reversal candle forms
-
-Bullish confirmation candle closes ABOVE reversal candle's close
-
-Entry on confirmation candle close
-
-Stop Loss = Reversal candle LOW
-
-Rationale:
-
-Attempts to identify failed breakout scenarios
-
-Designed to reduce false signals from fakeouts
-
-Confirmation required for additional safety
-
-5. Momentum Reversal (With Market Strength Index Filter)
-This is a fallback strategy when the Reversal Model doesn't trigger.
-
-Pattern Formation Process:
-Short Setup (Bullish→Bearish→Bearish):
-
-Bullish candle (strong buying)
-
-Bearish candle (selling starts)
-
-Bearish signal candle closes BELOW first candle's LOW
-
-Confirms momentum has shifted to downside
-
-Long Setup (Bearish→Bullish→Bullish):
-
-Bearish candle (strong selling)
-
-Bullish candle (buying starts)
-
-Bullish signal candle closes ABOVE first candle's HIGH
-
-Confirms momentum has shifted to upside
-
-Market Strength Index Filter:
-
-Short: Requires MSI > 55 (overbought/strong bearish momentum)
-
-Long: Requires MSI < 40 (oversold/strong bullish momentum)
-
-Block Long: When MSI < 24 (extreme oversold)
-
-🔄 Dual SuperTrend System
-Overview
-The bot uses a dual SuperTrend analysis system that works in two phases:
-
-Phase 1: Initial Entry
-Trade enters with standard 2:1 R:R take-profit
-
-SuperTrend indicators monitor in background
-
-No trend confirmation required for entry
-
-Phase 2: Trend Confirmation
-The bot analyzes market trends using two SuperTrend indicators:
-
-SuperTrend (14, 2.0):
-
-Length: 14 periods
-
-Factor: 2.0
-
-More sensitive to recent price action
-
-Catches trends early
-
-SuperTrend (21, 1.0):
-
-Length: 21 periods
-
-Factor: 1.0
-
-More stable, fewer false signals
-
-Confirms trend strength
-
-Confirmation Conditions:
-
-Short Trade: Both SuperTrends show bearish trend (RED)
-
-Confirms strong bearish momentum
-
-Cancels fixed take-profit
-
-Switches to trend-following exit
-
-Long Trade: Both SuperTrends show bullish trend (GREEN)
-
-Confirms strong bullish momentum
-
-Cancels fixed take-profit
-
-Switches to trend-following exit
-
-Phase 3: Trend-Following Exit
-Exit Conditions:
-
-Short Trade: Both SuperTrends flip to bullish (GREEN)
-
-Bearish trend has reversed
-
-Exit to protect profits
-
-Long Trade: Both SuperTrends flip to bearish (RED)
-
-Bullish trend has reversed
-
-Exit to protect profits
-
-Rationale:
-
-Combines fast and slow SuperTrend analysis
-
-Fast indicator catches trends early
-
-Slow indicator confirms trend strength
-
-Both required for confirmation (reduces false signals)
-
-Both required for exit (ensures true reversal)
-
-📧 Gmail Notifications
-Setting Up Gmail App Password
-Go to Google Account → Security
-
-Enable 2-Step Verification
-
-Go to App Passwords
-
-Generate a 16-character password
-
-Use this password (not your regular password)
-
-Notification Types
-Type	When	Content
-Signal Alert	Strategy identifies trade	Entry, SL, TP, MSI, risk details
-Trade Executed	Order fills	Size, entry price, order ID
-SuperTrend Confirmed	Both STs confirm	Updated exit strategy
-SuperTrend Exit	STs reverse	Exit price, PnL
-Trade Closed	TP/SL hit	Close reason, PnL
-Daily Loss Warning	80% of limit	Current loss percentage
-Daily Limit Hit	Limit reached	Trading stopped
-Startup Report	Bot starts	Configuration summary
-📈 Price Precision (smart_fmt)
-The bot automatically formats prices based on magnitude:
-
-Price Range	Decimal Places	Example
-≥ 10,000	2	65,000.00
-≥ 1,000	3	3,456.789
-≥ 100	4	456.7890
-≥ 10	5	12.34567
-≥ 1	6	1.234567
-≥ 0.1	7	0.1234567
-≥ 0.01	8	0.01234567
-< 0.01	10	0.0012345678
-📁 File Structure
-text
-DeltaBot/
-├── bot.py              # Main bot code
-├── bot.log             # Rotating log file (auto-created)
-├── README.md           # This file
-└── requirements.txt    # Python dependencies
-🔧 Advanced Customization
-Constants You Can Modify
-python
-# Market Strength Index Parameters
-MSI_PERIOD = 14
-MSI_OVERBOUGHT = 55.0      # Bearish momentum threshold
-MSI_OVERSOLD = 40.0        # Bullish momentum threshold
-MSI_MIN_CANDLES = MSI_PERIOD + 1
-MSI_EXTREME_OVERSOLD = 24.0  # Blocks long trades
-
-# Reversal Pattern Parameters
-REVERSAL_BODY_RATIO_MAX = 0.10  # Max body size for reversal patterns
-
-# Risk Parameters
-TP_RR_RATIO = 2.0
-TP_MAX_PCT = 0.05
-DAILY_LOSS_LIMIT_PCT = 0.05
-
-# Range Break
-RANGE_BREAK_LOOKBACK = 7
-
-# Volatility Expansion
-VOL_EXP_LOOKBACK = 21
-VOL_EXP_MAX_WICK_RATIO = 0.10
-
-# Support/Resistance
-SR_LOOKBACK = 100
-SR_SWING_SENSITIVITY = 5
-SR_MERGE_THRESHOLD = 0.005
-SR_MIN_LEVEL_AGE = 3
-SR_MAX_LEVEL_AGE = 50
-SR_MIN_STRENGTH = 1
-SR_PRICE_TOUCH_THRESHOLD = 0.002
-
-# S/R Rejection
-SR_REVERSAL_MONITOR_WINDOW = 25
-SR_ZONE_TOLERANCE = 0.005
-
-# SuperTrend
-ST1_LENGTH = 14
-ST1_FACTOR = 2.0
-ST2_LENGTH = 21
-ST2_FACTOR = 1.0
-🛡️ Error Handling
-The bot includes comprehensive error handling for:
-
-WebSocket disconnections (auto-reconnect with backoff)
-
-API rate limiting (exponential backoff)
-
-Authentication failures
-
-Network timeouts
-
-Missing data
-
-Invalid candles
-
-📊 Monitoring
-The bot provides real-time status updates every 60 seconds:
-
-text
-[STATUS] Open=2/2  Signals=45  TPs=18  SLs=12  WS=connected  
-Daily loss: $23.40 / $100.00 (23.4%)  
-Trades=['BTCUSD_PERP', 'ETHUSD_PERP']  [BTCUSD:ST-MODE] [ETHUSD:NO-MSI]
-Status Fields
-Open: Active trades / Max allowed
-
-Signals: Total signals generated
-
-TPs: Take-profit hits
-
-SLs: Stop-loss hits
-
-WS: WebSocket state (connected/disconnected/reconnecting)
-
-Daily loss: Current loss / Limit
-
-Trades: Active trade symbols
-
-ST-MODE: Trade in SuperTrend exit mode
-
-NO-MSI: Trade using no MSI filter
-
-🧪 Testing Gmail
-Before starting the bot, you can test Gmail notifications:
-
-python
-# Run the bot and select 'y' when asked
-Test Gmail notifications first? (y/N) : y
-🔒 Security Best Practices
-Never share API credentials
-
-Use read-only keys for paper trading
-
-Enable 2FA on your Delta account
-
-Use Gmail App Password (not regular password)
-
-Monitor trade execution logs
-
-📝 Logging
-The bot creates a rotating log file (bot.log):
-
-Max size: 5MB
-
-Backup count: 3
-
-Log levels: DEBUG (file), INFO (console)
-
-🐛 Troubleshooting
-Common Issues
-Authentication Failed
-
-Verify API key and secret
-
-Check Delta Exchange India URL
-
-Ensure account has trading permissions
-
-WebSocket Disconnects
-
-Check network connectivity
-
-Firewall blocking WebSocket ports
-
-Increase max_reconnect_attempts
-
-No Signals Generated
-
-Check timeframe and symbol availability
-
-Verify MSI filters (may be too restrictive)
-
-Ensure sufficient historical candles
-
-Gmail Notifications Fail
-
-Verify App Password (16 characters, no spaces)
-
-Check sender and recipient emails
-
-Ensure Less Secure Apps is enabled
-
-📚 API References
-Delta Exchange API
-
-WebSocket Documentation
-
-📄 License
-This project is for educational purposes. Use at your own risk.
-
-⚠️ Disclaimer
-This is not financial advice. Trading cryptocurrencies carries substantial risk. The bot is provided as-is without warranty. Past performance does not guarantee future results. Always test strategies in paper mode first.
-
-🔄 Version History
-v12.8 (Current)
-Consolidated all candle patterns into unified reversal detection
-
-Added S/R Rejection strategy with 25-candle monitoring window
-
-Added S/R False Breakout strategy
-
-Implemented Support/Resistance strength tracking
-
-Added auto-formatting price precision (smart_fmt)
-
-Improved error handling and reconnection logic
-
-Renamed RSI to Market Strength Index (MSI) for better clarity
-
-v12.7
-Added Range Break strategy
-
-Added S/R Breakout strategy with confirmation
-
-Improved SuperTrend exit logic
-
-Enhanced PnL fetching with retries
-
-v12.6
-Initial release with reversal detection
-
-Dual SuperTrend system
-
-Gmail notifications
-
-Paper/Live trading modes
-
-🤝 Support
-For issues and questions:
-
-Check the troubleshooting section
-
-Review bot.log for error details
-
-Verify your configuration settings
-
-Test in paper mode first
-
-📈 Strategy Decision Flow
-text
-Market Analysis
-    │
-    ├── With Market Strength Index Filter
-    │       │
-    │       ├── Reversal Model (2-candle continuation + indecision + confirmation)
-    │       │   • Short: MSI > 55 required (strong bearish momentum)
-    │       │   • Long: MSI < 40 required (strong bullish momentum)
-    │       │   • Block Long: MSI < 24 (extreme oversold)
-    │       │
-    │       └── Momentum Reversal (3-candle reversal pattern)
-    │           • Short: MSI > 55 required
-    │           • Long: MSI < 40 required
-    │
-    └── Without MSI Filter
-            │
-            ├── Volatility Expansion (21-candle break + wick ≤ 10%)
-            │   • Immediate execution at candle close
-            │
-            ├── Range Break (7-candle range + confirmation)
-            │   • Entry on confirmation candle close
-            │
-            ├── S/R Breakout (100-candle S/R + strength + confirmation)
-            │   • Entry on confirmation candle close
-            │
-            ├── S/R Rejection (Zone-based + 25-candle window)
-            │   • Execute at rejection candle close
-            │
-            └── S/R False Breakout (Fakeout + confirmation)
-                • Entry on confirmation candle close
-🎯 Strategy Selection Guide
-Market Condition	Recommended Strategy	Rationale
-Strong Trending	Volatility Expansion	Catches momentum early
-Sideways/Ranging	Range Break	Identifies range breakouts
-Near Support/Resistance	S/R Breakout or Rejection	Key levels offer high probability
-Fakeouts	S/R False Breakout	Attempts to identify failed breakouts
-Volatile/Exhausted	Reversal Model	Identifies trend exhaustion
-Stable Trend	Dual SuperTrend System	Captures sustained moves
-📊 Position Sizing
-Position size is calculated based on multiple factors:
-
-Account Balance: Current available trading capital
-
-Risk Percentage: Configured risk per trade (e.g., 2%)
-
-Stop-Loss Distance: Difference between entry and stop-loss price
-
-Leverage: Configured leverage multiplier
-
-Contract Specifications: Delta Exchange contract sizes
-
-The calculation ensures that the maximum loss per trade does not exceed the configured risk percentage of the trading capital, while also respecting margin requirements based on the selected leverage.
-
-Daily Loss Limit Example
-text
-Trading Capital: $10,000
-Daily Loss Limit: 5% ($500)
-
-If losses reach $400 (80% of limit):
-→ Warning notification sent
-
-If losses reach $500 (100% of limit):
-→ Trading halted until UTC day reset
-→ Limit hit notification sent
-🏆 Best Practices
-For Optimal Performance
-Start with Paper Trading: Test strategies without real money
-
-Use Appropriate Timeframes: Match strategy to market conditions
-
-Monitor Daily Loss: Review daily PnL to prevent large drawdowns
-
-Keep Logs: Review bot.log for debugging and optimization
-
-Update Regularly: Use latest version with improvements
-
-Strategy Selection Tips
-Trending Markets: Volatility Expansion + S/R Breakout
-
-Ranging Markets: Range Break + S/R Rejection
-
-Volatile Markets: Reversal Model + S/R False Breakout
-
-Mixed Markets: Run all strategies (let market decide)
-
-Risk Management Rules
-Never risk more than configured percentage per trade
-
-Always use stop-losses
-
-Respect daily loss limits
-
-Don't over-leverage (max 5x recommended)
-
-Diversify across symbols
-
-🔄 WebSocket Reconnection Flow
-text
-Initial Connection
-    │
-    ├── Success → Connected
-    │
-    └── Failed → Reconnecting
-            │
-            ├── Attempt 1: Wait 5s
-            ├── Attempt 2: Wait 10s
-            ├── Attempt 3: Wait 20s
-            ├── Attempt 4: Wait 30s
-            └── After 10 attempts: Disconnected
-📈 SuperTrend Exit Example
-text
-SHORT Trade Entry
-    │
-    ├── Entry Price: $50,000
-    ├── Take Profit: $48,000 (2:1 R:R)
-    └── Stop Loss: $51,000
-    │
-    ├── Price drops to $49,000
-    │   └── SuperTrend (14,2) turns BEARISH
-    │   └── SuperTrend (21,1) turns BEARISH
-    │       └── ✓ Both confirmed → Switch to Trend mode
-    │           └── Cancel TP bracket
-    │           └── Exit when both turn BULLISH
-    │
-    └── Price continues to $45,000
-        └── SuperTrend (14,2) turns BULLISH
-        └── SuperTrend (21,1) turns BULLISH
-            └── ✓ Both reversed → EXIT
-                └── Realized PnL: +$5,000
-🎨 Customization Examples
-Adjust Market Strength Index Thresholds for Volatile Coins
-python
-MSI_OVERBOUGHT = 60.0  # Higher for volatile coins
-MSI_OVERSOLD = 35.0    # Lower for volatile coins
-MSI_EXTREME_OVERSOLD = 20.0  # Adjust extreme oversold level
-Make Reversal Patterns More Sensitive
-python
-REVERSAL_BODY_RATIO_MAX = 0.15  # 15% instead of 10%
-Adjust S/R Detection
-python
-SR_MERGE_THRESHOLD = 0.01       # 1% instead of 0.5%
-SR_MIN_STRENGTH = 2             # Require minimum strength of 2
-Modify SuperTrend for Different Timeframes
-python
-# For 5m timeframe (more sensitive)
-ST1_LENGTH = 10
-ST1_FACTOR = 2.5
-
-# For 1h timeframe (less sensitive)  
-ST1_LENGTH = 20
-ST1_FACTOR = 1.5
-🏗️ System Architecture
-text
-Market Data
-    │
-    ▼
-Historical Candle Collection
-    │
-    ▼
-Indicator Calculation
-    │
-    ▼
-Strategy Evaluation
-    │
-    ▼
-Risk Management
-    │
-    ▼
-Order Execution
-    │
-    ▼
-Trade Monitoring
-    │
-    ▼
-Email Notifications
-    │
-    ▼
-Logging & Performance Tracking
-Architecture Components
-1. Market Data
-
-Receives real-time price data via WebSocket
-
-Collects historical candle data via REST API
-
-Maintains synchronized candle store
-
-2. Historical Candle Collection
-
-Loads initial historical data on startup
-
-Updates candle store with each new candle
-
-Maintains configurable lookback periods
-
-3. Indicator Calculation
-
-Calculates Market Strength Index (MSI) for momentum analysis
-
-Computes SuperTrend values for trend detection
-
-Identifies support/resistance levels
-
-Detects swing points and patterns
-
-4. Strategy Evaluation
-
-Evaluates all configured strategies in order
-
-Applies MSI filters where configured
-
-Validates pattern requirements
-
-Generates trade signals
-
-5. Risk Management
-
-Calculates position sizes based on risk parameters
-
-Enforces daily loss limits
-
-Manages concurrent trade limits
-
-Places stop-loss and take-profit orders
-
-6. Order Execution
-
-Places market orders for entry
-
-Sets bracket orders for take-profit
-
-Closes positions on exit signals
-
-Handles order fill confirmations
-
-7. Trade Monitoring
-
-Tracks active trades
-
-Monitors for TP/SL triggers
-
-Checks SuperTrend confirmations and exits
-
-Updates trade status and PnL
-
-8. Email Notifications
-
-Sends signal alerts
-
-Notifies trade execution and closure
-
-Reports SuperTrend events
-
-Warns of daily loss limits
-
-9. Logging & Performance Tracking
-
-Records all bot activity
-
-Trades performance metrics
-
-Generates status reports
-
-Maintains audit trail
-
-📋 Strategy Evaluation Order
-The bot evaluates strategies in the following order within each candle processing cycle:
-
-Short Trades (in order):
-With Market Strength Index Filter:
-
-Reversal Model (check_short_signal)
-
-Requires MSI > 55 (strong bearish momentum)
-
-Pattern: 2 Bullish continuation + Indecision + Bearish confirmation
-
-Momentum Reversal (fallback in check_short_signal)
-
-Requires MSI > 55
-
-Pattern: Bullish → Bearish → Bearish
-
-Without MSI Filter:
-
-Range Break (check_short_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: 7-candle range breakdown + confirmation
-
-Volatility Expansion (check_short_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: 21-candle low break + wick check
-
-S/R Breakout (check_short_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: Support breakdown + confirmation
-
-S/R False Breakout (check_short_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: Resistance fakeout + confirmation
-
-S/R Rejection (check_short_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: Resistance rejection (immediate execution)
-
-Long Trades (in order):
-With Market Strength Index Filter:
-
-Reversal Model (check_long_signal)
-
-Requires MSI < 40 (strong bullish momentum)
-
-Blocks if MSI < 24 (extreme oversold)
-
-Pattern: 2 Bearish continuation + Indecision + Bullish confirmation
-
-Momentum Reversal (fallback in check_long_signal)
-
-Requires MSI < 40
-
-Blocks if MSI < 24
-
-Pattern: Bearish → Bullish → Bullish
-
-Without MSI Filter:
-
-Range Break (check_long_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: 7-candle range breakout + confirmation
-
-Volatility Expansion (check_long_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: 21-candle high break + wick check
-
-S/R Breakout (check_long_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: Resistance breakout + confirmation
-
-S/R False Breakout (check_long_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: Support fakeout + confirmation
-
-S/R Rejection (check_long_signal_no_rsi)
-
-No MSI requirement
-
-Pattern: Support rejection (immediate execution)
-
-Important Notes:
-Once a valid strategy generates a trade signal, the bot follows its normal risk management and execution flow
-
-The bot stops evaluating further strategies for that symbol after a signal is generated
-
-MSI-filtered strategies are always evaluated before no-MSI strategies
-
-Short and long trades are evaluated independently
-
-The evaluation order is designed to prioritize strategies with additional confirmation filters
+```
+Follow the prompts and verify all selected symbols, timeframe, trading
+capital, lot size, risk settings, and mode before allowing the process
+to trade.
+For the dashboard-integrated engine, the backend's `BotManager` imports
+the configured `TradingBot` class and starts it in a background thread.
+Use the backend start route only after confirming that the API
+configuration model supplies every field required by the current
+`TradingBot` constructor and startup checks.
+Keep paper mode enabled during development. Do not start live
+trading just to verify that the website or API is working.
+Run the web application
+Run the backend from the repository root:
+``` bash
+uvicorn backend.main:app --reload
+```
+The local API is normally available at:
+``` text
+http://127.0.0.1:8000
+```
+FastAPI interactive documentation:
+``` text
+http://127.0.0.1:8000/docs
+```
+Run the frontend in a second terminal:
+``` bash
+cd frontend
+npm run dev
+```
+The local dashboard is normally available at:
+``` text
+http://localhost:3000
+```
+Keep both development processes running while using the dashboard. If
+the frontend cannot reach the backend, check that the backend process is
+running and that the FastAPI CORS configuration allows the exact
+frontend origin (for example, `http://localhost:3000`).
+Backend API
+The current backend route set includes:
+Method   Endpoint                      Purpose
+---
+`GET`    `/`                           Backend identity/health message
+`GET`    `/api/health`                 Health status
+`GET`    `/api/bot/status`             Bot running state and summary
+`POST`   `/api/bot/start`              Start bot using submitted configuration
+`POST`   `/api/bot/stop`               Stop the bot
+`GET`    `/api/bot/signals`            Current in-memory signals
+`GET`    `/api/bot/trades`             Current active trades
+`GET`    `/api/bot/stop-loss-events`   Current stop-loss events
+`POST`   `/api/bot/config`             Accept/return bot configuration
+The exact request and response fields are defined by the backend source.
+Some data routes currently return in-memory bot state; persistent
+history and complete dashboard analytics require the corresponding
+database writes and read endpoints to be implemented and connected.
+Database
+PostgreSQL is used for persistent application data through SQLAlchemy
+models and services.
+The current database service includes operations for:
+Saving signals.
+Saving newly opened trades.
+Updating a trade when it closes.
+Saving stop-loss events.
+Saving support/resistance levels.
+A successful database insert confirms that the database connection and
+insert path work; it does not by itself prove that every live bot event
+is already wired to persistence. Verify the callbacks and database
+service calls in the running bot integration.
+For local development, create the PostgreSQL database and configure the
+backend connection string before starting FastAPI. Database schema
+creation/migrations should be managed deliberately as the project
+evolves.
+Logging and generated data
+Depending on which services are enabled, the project can create files
+such as:
+`bot.log` --- main bot log, with rotating log files.
+`fed_rate_state.json` --- latest processed Fed decision.
+`fed_rate_history.json` --- Fed decision history.
+`fed_rate_detector.log` --- Fed detector log.
+`tech_index_data/state.json` --- last processed technology-index
+candle.
+`tech_index_data/stock_weights.csv` --- estimated stock weights.
+`tech_index_data/tech_index_daily.csv` --- synthetic index data.
+`tech_index_data/stock_daily_ohlc.csv` --- component stock data.
+`tech_index_data/alerts.log` --- technology-index alerts.
+Treat generated state and history files as runtime data. Decide
+explicitly which files should be backed up or persisted, and do not
+commit private or account-specific data.
+Deployment notes
+The intended cloud deployment architecture uses:
+AWS EC2 for the backend and trading process.
+PostgreSQL, preferably managed with Amazon RDS for production.
+Nginx as a reverse proxy.
+HTTPS for browser/API traffic.
+A process manager such as `systemd` for long-running services.
+AWS Secrets Manager or another secure secret store for credentials.
+For a first deployment:
+Provision the server and restrict SSH access.
+Clone the private repository.
+Create the Python environment and install dependencies.
+Configure secrets on the server, not in Git.
+Configure PostgreSQL connectivity and backups.
+Start and verify the backend in paper mode.
+Start the frontend behind the reverse proxy.
+Verify logs, restart behavior, API access, and database persistence.
+Only consider live mode after independent review and controlled
+testing.
+Do not run multiple bot instances against the same account and symbols
+unless the system has explicit coordination and duplicate-order
+protection.
+Security checklist
+[ ] Keep Delta API credentials out of Git and frontend code.
+[ ] Use the minimum exchange API permissions required.
+[ ] Keep paper mode enabled during development.
+[ ] Restrict live API credentials and rotate them if exposed.
+[ ] Use HTTPS outside local development.
+[ ] Restrict database network access.
+[ ] Use strong database credentials and backups.
+[ ] Protect the bot start/stop endpoints with authentication before
+public deployment.
+[ ] Configure CORS for trusted frontend origins only.
+[ ] Exclude `.env`, private keys, logs containing sensitive
+information, virtual environments, caches, and temporary data from
+Git.
+[ ] Review order sizing, contract multipliers, stop-loss behavior,
+and exchange responses before live use.
+Current development status
+TradePilot is under active development. The Python trading engine and
+its companion monitoring modules are separate from the dashboard work.
+The FastAPI backend, PostgreSQL persistence layer, and Next.js routes
+are being connected incrementally.
+The dashboard may contain placeholder pages or summary cards that are
+not yet connected to live database-backed data. Before describing a
+feature as production-ready, verify that:
+The engine emits the event.
+The backend receives it.
+The database persists it when required.
+The API returns it.
+The frontend displays the returned data correctly.
+Disclaimer
+TradePilot is provided for software development and research purposes.
+Cryptocurrency derivatives are high-risk products and can result in
+rapid losses, including losses exceeding expectations due to leverage,
+slippage, gaps, liquidity, exchange outages, API failures, or incorrect
+configuration. Historical behavior does not predict future results.
+You are solely responsible for exchange permissions, configuration,
+testing, monitoring, and trading decisions. Always review the current
+source code and exchange documentation before using live funds.
