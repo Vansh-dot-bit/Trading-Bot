@@ -1,0 +1,14 @@
+[
+    {
+        "statement_date": "2026-09-16",
+        "statement_url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260916a.htm",
+        "target_lower": 3.75,
+        "target_upper": 4.0,
+        "direction": "RAISED",
+        "decision_sentence": "The Committee decided to raise the target range for the federal funds rate by 1/4 percentage point to 3-3/4 to 4 percent, in support of the Federal Reserve's dual mandate.",
+        "comparison_result": "FIRST_RUN",
+        "checked_at_utc": "2026-10-24T17:32:01+00:00",
+        "previous_target_lower": null,
+        "previous_target_upper": null
+    }
+]
