@@ -533,6 +533,38 @@ MONITORED SYMBOLS ({len(symbols)})
                 else:
                     body += "\n    (none)"
 
+        market = config.get("startup_market_data", {}) or {}
+        fed = market.get("fed")
+        if fed:
+            body += "\n\nFEDERAL RESERVE POLICY RATE\n-----------------------------"
+            body += (f"\nStatement date : {fed.get('statement_date', 'N/A')}"
+                     f"\nTarget range   : {fed.get('target_lower', 0):.2f}% - {fed.get('target_upper', 0):.2f}%"
+                     f"\nDecision       : {fed.get('direction', 'N/A')}"
+                     f"\nOfficial text  : {fed.get('decision_sentence', 'N/A')}"
+                     f"\nSource         : {fed.get('statement_url', 'N/A')}")
+        elif market.get("fed_error"):
+            body += f"\n\nFEDERAL RESERVE POLICY RATE\n-----------------------------\nUnavailable at startup: {market['fed_error']}"
+
+        tech = market.get("tech")
+        if tech:
+            signal = tech.get("signal") or {}
+            body += "\n\nUS TECH SYNTHETIC INDEX\n-----------------------------"
+            body += (f"\nCompleted candle : {tech.get('date', 'N/A')}"
+                     f"\nSynthetic close  : {tech.get('index_close', 0):.4f}"
+                     f"\nOHLC             : {tech.get('index_open', 0):.4f} / {tech.get('index_high', 0):.4f} / "
+                     f"{tech.get('index_low', 0):.4f} / {tech.get('index_close', 0):.4f}"
+                     f"\nCandle range     : {tech.get('index_range', 0):.4f}"
+                     f"\nIndex condition  : {signal.get('direction') or 'NO LONG/SHORT TRIGGER'}"
+                     f"\nBaseline         : previous {tech.get('lookback', 100)} completed candles")
+            body += "\n\nSTOCK WEIGHTS AND INDEX CONTRIBUTION"
+            for item in tech.get("components", []):
+                body += (f"\n  {item['symbol']}: close={item['close']:.4f} | weight={item['weight_percent']:.2f}%"
+                         f" | daily={item['daily_return_percent']:+.2f}%"
+                         f" | index contribution={item['index_contribution_percent']:+.3f}%")
+        elif market.get("tech_error"):
+            body += f"\n\nUS TECH SYNTHETIC INDEX\n-----------------------------\nUnavailable at startup: {market['tech_error']}"
+
+        body += "\n\nStartup digest only. Subsequent alerts are sent only for new events/candles."
         self._dispatch_async(subject, body)
         return True
 
@@ -4057,7 +4089,17 @@ class TradingBot:
         self._fetch_historical_candles()
 
         self._log("info", "STARTUP", "STEP  7/15: Running initial Support/Resistance detection on historical data...")
-        self._run_initial_sr_detection()
+        # Historical seeding can discover many levels. Suppress individual event
+        # emails here; the single startup digest below contains the final S/R map.
+        saved_sr_notifiers = {}
+        for _sym, _manager in self.sr_managers.items():
+            saved_sr_notifiers[_sym] = _manager.notifier
+            _manager.notifier = None
+        try:
+            self._run_initial_sr_detection()
+        finally:
+            for _sym, _manager in self.sr_managers.items():
+                _manager.notifier = saved_sr_notifiers.get(_sym)
 
         sr_levels_for_email: Dict[str, Dict[str, List[dict]]] = {}
         for sym in self.symbols:
@@ -5773,7 +5815,26 @@ def main() -> None:
         print("  Cancelled.")
         return
 
+    # Collect the market context before bot.start(), so its existing startup
+    # report can deliver one combined message (S/R + tech index + Fed rate).
+    startup_market_data = {}
+    if fed_config.get("enabled"):
+        try:
+            startup_market_data["fed"] = fed_rate_detector.get_startup_snapshot()
+        except Exception as exc:
+            startup_market_data["fed_error"] = str(exc)
+            _log_exc("STARTUP-DIGEST", f"Fed snapshot unavailable: {exc}")
+    if tech_config.get("enabled"):
+        try:
+            startup_market_data["tech"] = tech_stock.get_startup_snapshot(
+                tech_config["tickers"], tech_config["massive_key"], tech_config["fmp_key"]
+            )
+        except Exception as exc:
+            startup_market_data["tech_error"] = str(exc)
+            _log_exc("STARTUP-DIGEST", f"Tech index snapshot unavailable: {exc}")
+
     cfg = {
+        "startup_market_data": startup_market_data,
         "paper_mode": paper,
         "symbols": raw_symbols,
         "risk_pct": risk_pct,
@@ -5795,7 +5856,9 @@ def main() -> None:
     # Bind legacy security helpers to this runtime and create shared API recovery.
     serede.bind_runtime_globals(globals())
     stop_event = threading.Event()
-    api_guard = serede.ApiResilience(notifier=notifier)
+    # Avoid separate API failure/recovery emails during the startup digest phase.
+    # After the single digest is queued, normal deduplicated service alerts resume.
+    api_guard = serede.ApiResilience(notifier=None)
     service_threads = []
 
     bot = None
@@ -5803,6 +5866,7 @@ def main() -> None:
     try:
         bot = TradingBot(cfg, notifier=notifier)
         bot.start()
+        api_guard.notifier = notifier
         if bot.running and bot.symbols:
             main_bot_supervisor = serede.MainBotSupervisor(bot, notifier=notifier)
             main_bot_supervisor.start()
