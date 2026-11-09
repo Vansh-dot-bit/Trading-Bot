@@ -54,7 +54,9 @@ REQUEST_TIMEOUT = 30
 
 # Keep False while testing. No Gmail credentials are required.
 
-ENABLE_EMAIL = False
+ENABLE_EMAIL = True
+SHARED_NOTIFIER = None
+API_GUARD = None
 
 GMAIL_SENDER = ""
 
@@ -111,16 +113,6 @@ logging.basicConfig(
 SESSION = requests.Session()
 
 SESSION.headers.update(HEADERS)
-
-# Injected by bot.py when running as part of the integrated system.
-SHARED_NOTIFIER = None
-API_GUARD = None
-
-def _request_get(url, **kwargs):
-    if API_GUARD is not None:
-        return API_GUARD.get(SESSION, url, service="Fed rate detector", **kwargs)
-    return SESSION.get(url, **kwargs)
-
 
 
 
@@ -337,148 +329,65 @@ def fraction_to_float(value):
 
 
 def extract_rate_decision(statement_url, statement_date):
-
-    """Extract the target range and decision sentence from an official statement."""
-
+    """Extract the official federal-funds target range and decision verb."""
     response = _request_get(statement_url, timeout=REQUEST_TIMEOUT)
-
     response.raise_for_status()
-
-
-
     soup = BeautifulSoup(response.text, "html.parser")
-
     page_text = " ".join(soup.get_text(" ", strip=True).split())
 
-
-
+    # Fed statements use mixed numbers (3-3/4), decimals (3.75), and
+    # occasionally put a percent sign after the first endpoint.
     number = r"\d+(?:-\d+/\d+|/\d+|\.\d+)?"
-
     pattern = re.compile(
-
         r"The Committee decided to\s+"
-
         r"(raise|lower|maintain|keep)"
-
-        r".{0,250}?target range for the federal funds rate"
-
-        r".{0,250}?\bto\s+"
-
-        rf"({number})\s+to\s+({number})\s+percent\b",
-
+        r".{0,300}?target range for the federal funds rate"
+        r".{0,100}?(?:at|to)\s+"
+        rf"({number})\s*%?\s+to\s+({number})\s*(?:percent\b|%)",
         re.IGNORECASE,
-
     )
-
-
-
     match = pattern.search(page_text)
 
+    # A second common official phrasing includes "at ..." without the
+    # trailing word percent, e.g. "at 3.75 to 4.00 percent" is covered above.
     if not match:
-
         logging.error("Could not extract a target range from %s", statement_url)
-
-        search_position = page_text.lower().find(
-
-            "target range for the federal funds rate"
-
-        )
-
-        if search_position >= 0:
-
-            logging.error(
-
-                "Source context: %s",
-
-                page_text[max(0, search_position - 250):search_position + 600],
-
-            )
-
-        raise ValueError(
-
-            "Target-rate decision not recognized. No state was changed."
-
-        )
-
-
+        pos = page_text.lower().find("target range for the federal funds rate")
+        if pos >= 0:
+            logging.error("Source context: %s", page_text[max(0, pos-250):pos+700])
+        raise ValueError("Target-rate decision not recognized. No state was changed.")
 
     action = match.group(1).lower()
-
     lower = fraction_to_float(match.group(2))
-
     upper = fraction_to_float(match.group(3))
-
-
-
     if lower >= upper:
+        raise ValueError(f"Extracted target range is invalid: {lower} - {upper}")
 
-        raise ValueError("Extracted target range is invalid.")
-
-
-
-    direction_map = {
-
-        "raise": "RAISED",
-
-        "lower": "LOWERED",
-
-        "maintain": "MAINTAINED",
-
-        "keep": "MAINTAINED",
-
-    }
-
-
-
-    # Start at the actual policy-decision phrase, not a preceding page element
-
-    # such as the time, social-share links, or page navigation.
-
-    decision_start = page_text.lower().rfind(
-
-        "the committee decided to", 0, match.start() + 1
-
-    )
-
+    direction_map = {"raise": "RAISED", "lower": "LOWERED",
+                     "maintain": "MAINTAINED", "keep": "MAINTAINED"}
+    decision_start = page_text.lower().rfind("the committee decided to", 0, match.start()+1)
     if decision_start < 0:
-
         decision_start = match.start()
-
-
-
     sentence_end = page_text.find(".", match.end())
-
     if sentence_end < 0:
-
-        sentence_end = min(len(page_text), match.end() + 250)
-
+        sentence_end = min(len(page_text), match.end()+250)
     else:
-
         sentence_end += 1
-
-
-
-    decision_sentence = page_text[decision_start:sentence_end].strip()
-
-
-
     return {
-
         "statement_date": statement_date,
-
         "statement_url": statement_url,
-
         "target_lower": round(lower, 4),
-
         "target_upper": round(upper, 4),
-
         "direction": direction_map[action],
-
-        "decision_sentence": decision_sentence,
-
+        "decision_sentence": page_text[decision_start:sentence_end].strip(),
     }
 
 
+def get_startup_snapshot():
+    """Fetch a read-only Fed snapshot for the single combined startup email."""
+    latest = find_latest_statement()
+    decision = extract_rate_decision(latest["url"], latest["date"])
+    return decision
 
 
 
@@ -657,29 +566,21 @@ def find_latest_statement():
 
 
 def send_email(subject, body):
-    """Use bot.py's Gmail transport when integrated; retain standalone email support."""
-    if SHARED_NOTIFIER is not None:
-        sent = SHARED_NOTIFIER.send_custom_alert(subject, body)
-        if not sent:
-            raise RuntimeError("Shared Gmail notifier is disabled; Fed alert was not dispatched.")
-        logging.info("Fed alert dispatched through the bot Gmail notifier.")
-        return True
-    if not ENABLE_EMAIL:
-        logging.info("Email disabled; no email sent.")
-        return False
-    if not all([GMAIL_SENDER, GMAIL_APP_PASSWORD, GMAIL_RECIPIENT]):
-        raise RuntimeError("Email enabled, but Gmail configuration is incomplete.")
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = GMAIL_SENDER
-    message["To"] = GMAIL_RECIPIENT
-    message.set_content(body)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-        server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-        server.send_message(message)
-    logging.info("Gmail notification sent.")
-    return True
+    """Route Fed alerts through the main bot's shared Gmail notifier."""
+    if SHARED_NOTIFIER is None:
+        logging.warning("Shared notifier is not configured; Fed alert was logged only.")
+        logging.warning("%s\n%s", subject, body)
+        return
+    SHARED_NOTIFIER.send_custom_alert(subject, body)
 
+
+def _request_get(url, **kwargs):
+    if API_GUARD is not None:
+        return API_GUARD.get(SESSION, url, service="FED_RATE_API", **kwargs)
+    response = SESSION.get(url, **kwargs)
+    response.raise_for_status()
+    return response
+# ============================================================
 
 # RATE CHANGE DETECTOR
 
@@ -915,54 +816,38 @@ def check_once():
 
     logging.info("=" * 55)
 
-
-
-
-
 def ask_runtime_config():
-    """Ask for Fed detector options after bot.py's own setup questions."""
+    """Called by main_bot.py during the single startup questionnaire."""
     enabled = input("Enable Federal Reserve rate detector? (Y/n): ").strip().lower() != "n"
-    if not enabled:
-        print("[FED] Detector disabled for this run.")
-        return {"enabled": False}
-    raw = input("Fed detector polling interval in hours (default 6): ").strip()
     try:
-        hours = float(raw) if raw else 6.0
-        if not (0.1 <= hours <= 168):
-            raise ValueError
+        hours = float(input("Fed rate detector check interval in hours (default 6): ").strip() or "6")
+        hours = max(1.0, min(hours, 24.0))
     except ValueError:
-        print("Invalid interval; using 6 hours.")
         hours = 6.0
-    return {"enabled": True, "poll_seconds": int(hours * 3600)}
+    return {"enabled": enabled, "poll_seconds": int(hours * 3600)}
 
 
-def run_service(config, notifier=None, api_guard=None, stop_event=None):
-    """Independent Fed polling loop. Errors never escape and stop sibling services."""
+def run_service(notifier, api_guard, poll_seconds=21600, stop_event=None):
     global SHARED_NOTIFIER, API_GUARD
-    SHARED_NOTIFIER = notifier
-    API_GUARD = api_guard
-    interval = max(60, int(config.get("poll_seconds", 6 * 3600)))
-    logging.info("Fed detector service started; polling every %s seconds.", interval)
+    SHARED_NOTIFIER, API_GUARD = notifier, api_guard
+    logging.info("Fed rate detector background service started; interval=%ss", poll_seconds)
     while stop_event is None or not stop_event.is_set():
         try:
             check_once()
         except Exception:
             logging.exception("Fed rate detector cycle failed; will retry on next cycle")
         if stop_event is not None:
-            if stop_event.wait(interval):
+            if stop_event.wait(poll_seconds):
                 break
         else:
-            time.sleep(interval)
-    logging.info("Fed detector service stopped.")
+            import time as _time
+            _time.sleep(poll_seconds)
 
-
-def main():
-    try:
-        check_once()
-    except Exception:
-        logging.exception("Rate detector failed.")
-        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("Rate detector failed.")
+        raise
