@@ -384,6 +384,60 @@ def run_once(tickers: list[str], massive_key: str, fmp_key: str) -> None:
 
 
 
+
+def get_startup_snapshot(tickers: list[str], massive_key: str, fmp_key: str) -> dict[str, Any]:
+    """
+    Build the tech-index data used by bot.py's startup notification.
+    Does not update state.json or send alerts; run_service() handles those.
+    """
+    bars, cap_df = fetch_all_data(tickers, massive_key, fmp_key)
+    weights = cap_df["weight"]
+    index_df, stocks_df = build_synthetic_index(bars, weights)
+    save_csvs(cap_df, index_df, stocks_df)
+
+    latest_date = str(index_df.index[-1])
+    latest = index_df.iloc[-1]
+    signal = evaluate_latest(index_df)
+
+    # Align component candles to the same common dates used by the index.
+    common_dates = set(index_df.index)
+    components = []
+    for ticker in tickers:
+        frame = bars[ticker]
+        aligned = frame.loc[[d for d in frame.index if d.isoformat() in common_dates]]
+        if len(aligned) < 2:
+            raise RuntimeError(
+                f"Not enough aligned candles to calculate startup contribution for {ticker}."
+            )
+
+        previous_close = float(aligned["close"].iloc[-2])
+        latest_close = float(aligned["close"].iloc[-1])
+        if previous_close <= 0:
+            raise RuntimeError(f"Invalid previous close for {ticker}.")
+
+        daily_return = latest_close / previous_close - 1.0
+        weight = float(weights[ticker])
+        components.append({
+            "symbol": ticker,
+            "close": latest_close,
+            "weight_percent": float(cap_df.loc[ticker, "weight_percent"]),
+            "daily_return_percent": daily_return * 100.0,
+            "index_contribution_percent": weight * daily_return * 100.0,
+        })
+
+    return {
+        "date": latest_date,
+        "index_open": float(latest["open"]),
+        "index_high": float(latest["high"]),
+        "index_low": float(latest["low"]),
+        "index_close": float(latest["close"]),
+        "index_range": float(latest["range"]),
+        "lookback": LOOKBACK_CANDLES,
+        "signal": signal,
+        "components": components,
+    }
+
+
 def ask_runtime_config():
     """Called by main_bot.py after the main bot and Fed questions."""
     enabled = input("Enable US tech-stock index detector? (Y/n): ").strip().lower() != "n"
@@ -414,4 +468,3 @@ def run_service(config, notifier, api_guard, stop_event=None):
                 break
         else:
             time.sleep(wait_seconds)
-
