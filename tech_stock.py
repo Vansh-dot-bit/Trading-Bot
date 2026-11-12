@@ -19,8 +19,10 @@ Index methodology:
        LONG  if close > mean(previous 100 closes) AND range > mean(previous 100 ranges)
        SHORT if close < mean(previous 100 closes) AND range > mean(previous 100 ranges)
 
-The script prints alerts to the terminal and appends them to alerts.log. Email is not
-configured. Keep this process running for automatic polling.
+Version 2.0 adds a daily +/-7% movement alert. Each completed daily candle is
+compared with the previous completed daily close (the previous close is the new
+reference/base for that day). Alerts are printed, logged, and sent through the
+existing shared email notifier when configured. Keep this process running for polling.
 """
 
 from __future__ import annotations
@@ -41,8 +43,10 @@ import requests
 MASSIVE_BASE = "https://api.massive.com"
 FMP_BASE = "https://financialmodelingprep.com"
 NY_TZ = ZoneInfo("America/New_York")
+VERSION = "2.0"
 BASE_INDEX_VALUE = 1000.0
 LOOKBACK_CANDLES = 100
+DAILY_MOVE_ALERT_PCT = 7.0
 POLL_SECONDS = 15 * 60
 DATA_DIR = Path("tech_index_data")
 STATE_PATH = DATA_DIR / "state.json"
@@ -55,6 +59,9 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TechIndexDetector/1.0"})
 API_GUARD = None
 SHARED_NOTIFIER = None
+# Massive free/basic plans can enforce per-minute request limits.
+MASSIVE_MIN_REQUEST_INTERVAL = 15.0
+_LAST_MASSIVE_REQUEST_AT = 0.0
 
 
 def ask_secret(label: str, env_name: str) -> str:
@@ -93,12 +100,23 @@ def api_json(url: str, params: dict[str, Any], label: str) -> dict[str, Any] | l
 
 
 def fetch_daily_bars(ticker: str, api_key: str, start: date, end: date) -> pd.DataFrame:
+    global _LAST_MASSIVE_REQUEST_AT
+    # Space requests so sequential ticker downloads do not immediately hit
+    # Massive's per-minute rate limit. Retry/backoff remains handled by ApiResilience.
+    elapsed = time.monotonic() - _LAST_MASSIVE_REQUEST_AT
+    if _LAST_MASSIVE_REQUEST_AT and elapsed < MASSIVE_MIN_REQUEST_INTERVAL:
+        wait_for = MASSIVE_MIN_REQUEST_INTERVAL - elapsed
+        print(f"  [RATE LIMIT] Waiting {wait_for:.1f}s before Massive request for {ticker}...")
+        time.sleep(wait_for)
     url = f"{MASSIVE_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start.isoformat()}/{end.isoformat()}"
-    payload = api_json(
-        url,
-        {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key},
-        f"Massive daily candles for {ticker}",
-    )
+    try:
+        payload = api_json(
+            url,
+            {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key},
+            f"Massive daily candles for {ticker}",
+        )
+    finally:
+        _LAST_MASSIVE_REQUEST_AT = time.monotonic()
     if not isinstance(payload, dict):
         raise RuntimeError(f"Massive returned an unexpected response for {ticker}.")
     results = payload.get("results") or []
@@ -169,22 +187,12 @@ def fetch_all_data(tickers: list[str], massive_key: str, fmp_key: str) -> tuple[
     for ticker in tickers:
         try:
             bars[ticker] = fetch_daily_bars(ticker, massive_key, start, end)
-            latest = bars[ticker].iloc[-1]
-            latest_date = bars[ticker].index[-1].isoformat()
-            latest_open = float(latest["open"])
-            latest_high = float(latest["high"])
-            latest_low = float(latest["low"])
-            latest_close = float(latest["close"])
+            latest_close = float(bars[ticker]["close"].iloc[-1])
             float_shares = fetch_float_shares(ticker, fmp_key)
-            # Estimated free-float market capitalization uses the latest completed
-            # daily close multiplied by the provider's latest available float shares.
             free_float_cap = latest_close * float_shares
             rows.append({
                 "symbol": ticker,
-                "latest_completed_date": latest_date,
-                "latest_completed_open": latest_open,
-                "latest_completed_high": latest_high,
-                "latest_completed_low": latest_low,
+                "latest_completed_date": bars[ticker].index[-1].isoformat(),
                 "latest_completed_close": latest_close,
                 "float_shares": float_shares,
                 "estimated_free_float_market_cap": free_float_cap,
@@ -336,6 +344,42 @@ def print_and_log_alert(signal: dict[str, Any], tickers: list[str], cap_df: pd.D
         SHARED_NOTIFIER.send_custom_alert(f"Tech Stock Index {signal['direction']} Alert", message)
 
 
+def send_daily_move_alert(latest_date: str, previous_close: float, current_close: float,
+                          tickers: list[str], cap_df: pd.DataFrame) -> None:
+    """Alert when a completed daily close moves +/-7% from the prior close."""
+    if previous_close <= 0:
+        return
+    change_pct = (current_close / previous_close - 1.0) * 100.0
+    if change_pct >= DAILY_MOVE_ALERT_PCT:
+        direction = "INCREASE"
+    elif change_pct <= -DAILY_MOVE_ALERT_PCT:
+        direction = "DECREASE"
+    else:
+        return
+
+    message = (
+        f"\n{'=' * 68}\n"
+        f"TECH SYNTHETIC INDEX v{VERSION} — DAILY {direction} ALERT\n"
+        f"Completed candle date: {latest_date}\n"
+        f"Previous daily close (today's reference base): {previous_close:.4f}\n"
+        f"Latest daily close: {current_close:.4f}\n"
+        f"Daily movement: {change_pct:+.2f}% (threshold: +/-{DAILY_MOVE_ALERT_PCT:.1f}%)\n"
+        f"Stocks: {', '.join(tickers)}\n"
+        f"Weights: " + ", ".join(
+            f"{ticker} {cap_df.loc[ticker, 'weight_percent']:.2f}%" for ticker in tickers
+        ) + f"\n{'=' * 68}\n"
+    )
+    print(message, flush=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with ALERTS_PATH.open("a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now(timezone.utc).isoformat()}] {message}\n")
+    if SHARED_NOTIFIER is not None:
+        SHARED_NOTIFIER.send_custom_alert(
+            f"[TECH INDEX v{VERSION}] Daily {direction} above {DAILY_MOVE_ALERT_PCT:.0f}%",
+            message,
+        )
+
+
 def run_once(tickers: list[str], massive_key: str, fmp_key: str) -> None:
     bars, cap_df = fetch_all_data(tickers, massive_key, fmp_key)
     weights = cap_df["weight"]
@@ -345,29 +389,22 @@ def run_once(tickers: list[str], massive_key: str, fmp_key: str) -> None:
     latest_date = str(index_df.index[-1])
     state = load_state()
     print(f"Latest completed common index candle: {latest_date}")
-    print(f"Synthetic index OHLC: "
-          f"O={float(index_df['open'].iloc[-1]):.4f}  "
-          f"H={float(index_df['high'].iloc[-1]):.4f}  "
-          f"L={float(index_df['low'].iloc[-1]):.4f}  "
-          f"C={float(index_df['close'].iloc[-1]):.4f}")
-    print("Latest completed daily OHLC and estimated free-float market cap by stock:")
+    print(f"Synthetic index close: {float(index_df['close'].iloc[-1]):.4f}")
+    print("Current free-float weights:")
     for ticker in tickers:
-        row = cap_df.loc[ticker]
-        print(
-            f"  {ticker} ({row['latest_completed_date']}): "
-            f"O={row['latest_completed_open']:.2f}  "
-            f"H={row['latest_completed_high']:.2f}  "
-            f"L={row['latest_completed_low']:.2f}  "
-            f"C={row['latest_completed_close']:.2f} USD | "
-            f"Float shares={row['float_shares']:,.0f} | "
-            f"Est. free-float cap=${row['estimated_free_float_market_cap']:,.0f} | "
-            f"Index weight={row['weight_percent']:.2f}%"
-        )
+        print(f"  {ticker}: {cap_df.loc[ticker, 'weight_percent']:.2f}%")
 
     # Only evaluate/alert once per new completed candle.
     if state.get("last_processed_candle") == latest_date:
         print("This daily candle was already evaluated. Waiting for a new completed candle.")
         return
+
+    # The previous completed daily close is the reference base for this day.
+    # Check both upward and downward movement once for each newly completed candle.
+    if len(index_df) >= 2:
+        previous_close = float(index_df["close"].iloc[-2])
+        current_close = float(index_df["close"].iloc[-1])
+        send_daily_move_alert(latest_date, previous_close, current_close, tickers, cap_df)
 
     signal = evaluate_latest(index_df)
     if signal and signal["direction"]:
@@ -384,57 +421,44 @@ def run_once(tickers: list[str], massive_key: str, fmp_key: str) -> None:
 
 
 
-
 def get_startup_snapshot(tickers: list[str], massive_key: str, fmp_key: str) -> dict[str, Any]:
-    """
-    Build the tech-index data used by bot.py's startup notification.
-    Does not update state.json or send alerts; run_service() handles those.
+    """Fetch initial index + constituent contribution data for startup digest.
+
+    The current completed daily candle is marked processed here so the background
+    poller does not send a second email for the same initial candle.
     """
     bars, cap_df = fetch_all_data(tickers, massive_key, fmp_key)
-    weights = cap_df["weight"]
-    index_df, stocks_df = build_synthetic_index(bars, weights)
+    index_df, stocks_df = build_synthetic_index(bars, cap_df["weight"])
     save_csvs(cap_df, index_df, stocks_df)
-
-    latest_date = str(index_df.index[-1])
-    latest = index_df.iloc[-1]
     signal = evaluate_latest(index_df)
-
-    # Align component candles to the same common dates used by the index.
-    common_dates = set(index_df.index)
+    latest_date = str(index_df.index[-1])
     components = []
     for ticker in tickers:
-        frame = bars[ticker]
-        aligned = frame.loc[[d for d in frame.index if d.isoformat() in common_dates]]
-        if len(aligned) < 2:
-            raise RuntimeError(
-                f"Not enough aligned candles to calculate startup contribution for {ticker}."
-            )
-
-        previous_close = float(aligned["close"].iloc[-2])
-        latest_close = float(aligned["close"].iloc[-1])
-        if previous_close <= 0:
-            raise RuntimeError(f"Invalid previous close for {ticker}.")
-
-        daily_return = latest_close / previous_close - 1.0
-        weight = float(weights[ticker])
+        df = bars[ticker]
+        latest_close = float(df["close"].iloc[-1])
+        previous_close = float(df["close"].iloc[-2])
+        daily_return = (latest_close / previous_close - 1.0) if previous_close else 0.0
+        weight = float(cap_df.loc[ticker, "weight"])
         components.append({
             "symbol": ticker,
             "close": latest_close,
-            "weight_percent": float(cap_df.loc[ticker, "weight_percent"]),
+            "weight_percent": weight * 100.0,
             "daily_return_percent": daily_return * 100.0,
-            "index_contribution_percent": weight * daily_return * 100.0,
+            "index_contribution_percent": daily_return * weight * 100.0,
         })
-
+    state = load_state()
+    state["last_processed_candle"] = latest_date
+    save_state(state)
     return {
         "date": latest_date,
-        "index_open": float(latest["open"]),
-        "index_high": float(latest["high"]),
-        "index_low": float(latest["low"]),
-        "index_close": float(latest["close"]),
-        "index_range": float(latest["range"]),
-        "lookback": LOOKBACK_CANDLES,
+        "index_close": float(index_df["close"].iloc[-1]),
+        "index_open": float(index_df["open"].iloc[-1]),
+        "index_high": float(index_df["high"].iloc[-1]),
+        "index_low": float(index_df["low"].iloc[-1]),
+        "index_range": float(index_df["range"].iloc[-1]),
         "signal": signal,
         "components": components,
+        "lookback": LOOKBACK_CANDLES,
     }
 
 
@@ -468,3 +492,4 @@ def run_service(config, notifier, api_guard, stop_event=None):
                 break
         else:
             time.sleep(wait_seconds)
+
