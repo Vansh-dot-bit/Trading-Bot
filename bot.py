@@ -533,38 +533,6 @@ MONITORED SYMBOLS ({len(symbols)})
                 else:
                     body += "\n    (none)"
 
-        market = config.get("startup_market_data", {}) or {}
-        fed = market.get("fed")
-        if fed:
-            body += "\n\nFEDERAL RESERVE POLICY RATE\n-----------------------------"
-            body += (f"\nStatement date : {fed.get('statement_date', 'N/A')}"
-                     f"\nTarget range   : {fed.get('target_lower', 0):.2f}% - {fed.get('target_upper', 0):.2f}%"
-                     f"\nDecision       : {fed.get('direction', 'N/A')}"
-                     f"\nOfficial text  : {fed.get('decision_sentence', 'N/A')}"
-                     f"\nSource         : {fed.get('statement_url', 'N/A')}")
-        elif market.get("fed_error"):
-            body += f"\n\nFEDERAL RESERVE POLICY RATE\n-----------------------------\nUnavailable at startup: {market['fed_error']}"
-
-        tech = market.get("tech")
-        if tech:
-            signal = tech.get("signal") or {}
-            body += "\n\nUS TECH SYNTHETIC INDEX\n-----------------------------"
-            body += (f"\nCompleted candle : {tech.get('date', 'N/A')}"
-                     f"\nSynthetic close  : {tech.get('index_close', 0):.4f}"
-                     f"\nOHLC             : {tech.get('index_open', 0):.4f} / {tech.get('index_high', 0):.4f} / "
-                     f"{tech.get('index_low', 0):.4f} / {tech.get('index_close', 0):.4f}"
-                     f"\nCandle range     : {tech.get('index_range', 0):.4f}"
-                     f"\nIndex condition  : {signal.get('direction') or 'NO LONG/SHORT TRIGGER'}"
-                     f"\nBaseline         : previous {tech.get('lookback', 100)} completed candles")
-            body += "\n\nSTOCK WEIGHTS AND INDEX CONTRIBUTION"
-            for item in tech.get("components", []):
-                body += (f"\n  {item['symbol']}: close={item['close']:.4f} | weight={item['weight_percent']:.2f}%"
-                         f" | daily={item['daily_return_percent']:+.2f}%"
-                         f" | index contribution={item['index_contribution_percent']:+.3f}%")
-        elif market.get("tech_error"):
-            body += f"\n\nUS TECH SYNTHETIC INDEX\n-----------------------------\nUnavailable at startup: {market['tech_error']}"
-
-        body += "\n\nStartup digest only. Subsequent alerts are sent only for new events/candles."
         self._dispatch_async(subject, body)
         return True
 
@@ -1150,8 +1118,8 @@ TIMEOUT = 30
 CANDLE_SAFETY_SHIFT = 1
 
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 65.0
-RSI_OVERSOLD = 35.0
+RSI_OVERBOUGHT = 55.0
+RSI_OVERSOLD = 40.0
 RSI_MIN_CANDLES = RSI_PERIOD + 1
 
 FILL_POLL_INTERVAL = 0.5
@@ -1412,8 +1380,8 @@ def check_rsi_filter(closed_candles: List[dict], symbol: str = "",
              f"Insufficient candles for RSI({period}): have {len(closed_candles)}, "
              f"need {period + 1} - BLOCKING")
         return False, None
-    _log("info", f"RSI [{symbol}]", f"RSI({period}) = {rsi:.2f}  (threshold >= {threshold})")
-    return (rsi >= threshold), rsi
+    _log("info", f"RSI [{symbol}]", f"RSI({period}) = {rsi:.2f}  (threshold > {threshold})")
+    return (rsi > threshold), rsi
 
 
 # ================================================================
@@ -2248,19 +2216,32 @@ def check_short_signal(
         _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
         return True, signal_candle, strategy, rsi_value
 
+    triggered, signal_candle, strategy = check_short_signal_strategy_5(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
+        return True, signal_candle, strategy, rsi_value
+
+    triggered, signal_candle, strategy = check_short_signal_bearish_engulfing(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | RSI={rsi_value:.2f} > {RSI_OVERBOUGHT} - CONFIRMED")
+        return True, signal_candle, strategy, rsi_value
+
     return False, None, "", rsi_value
 
 
 def check_short_signal_no_rsi(
     candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
-    notifier: Optional[GmailNotifier] = None,
-    enable_volume_expansion: bool = False
+    notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
-    if enable_volume_expansion:
-        triggered, signal_candle, strategy = check_short_signal_vol_expansion(candles)
-        if triggered:
-            _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | VOLUME EXPANSION ENABLED - CONFIRMED")
-            return True, signal_candle, strategy, None
+    triggered, signal_candle, strategy = check_short_signal_range_break(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
+        return True, signal_candle, strategy, None
+
+    triggered, signal_candle, strategy = check_short_signal_vol_expansion(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED")
+        return True, signal_candle, strategy, None
 
     if len(candles) >= 4:
         confirm_candle = candles[-2]
@@ -2366,14 +2347,24 @@ def check_long_signal(
     rsi = compute_rsi(closed_candles, RSI_PERIOD)
     if rsi is None:
         return False, None, "", None
-    if rsi < Z_RSI_OVERSOLD_BLOCK:
-        _log("warning", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {Z_RSI_OVERSOLD_BLOCK} - BLOCKING LONG TRADE (extreme oversold)")
+    if rsi < 24.0:
+        _log("warning", f"RSI [{symbol}]", f"RSI={rsi:.2f} < 24 - BLOCKING LONG TRADE (extreme oversold)")
         return False, None, "", rsi
-    if rsi > RSI_OVERSOLD:
+    if rsi >= RSI_OVERSOLD:
         return False, None, "", rsi
-    _log("info", f"RSI [{symbol}]", f"{Z_RSI_OVERSOLD_BLOCK} <= RSI={rsi:.2f} <= {RSI_OVERSOLD} - LONG filter passes")
+    _log("info", f"RSI [{symbol}]", f"RSI={rsi:.2f} < {RSI_OVERSOLD} - LONG filter passes")
 
     triggered, signal_candle, strategy = check_long_signal_strategy_1(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
+        return True, signal_candle, strategy, rsi
+
+    triggered, signal_candle, strategy = check_long_signal_strategy_5(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
+        return True, signal_candle, strategy, rsi
+
+    triggered, signal_candle, strategy = check_long_signal_bullish_engulfing(candles)
     if triggered:
         _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | RSI={rsi:.2f} < {RSI_OVERSOLD} - CONFIRMED")
         return True, signal_candle, strategy, rsi
@@ -2383,14 +2374,17 @@ def check_long_signal(
 
 def check_long_signal_no_rsi(
     candles: List[dict], sr_manager: 'SRLevelManager', symbol: str = "",
-    notifier: Optional[GmailNotifier] = None,
-    enable_volume_expansion: bool = False
+    notifier: Optional[GmailNotifier] = None
 ) -> Tuple[bool, Optional[dict], str, Optional[float]]:
-    if enable_volume_expansion:
-        triggered, signal_candle, strategy = check_long_signal_vol_expansion(candles)
-        if triggered:
-            _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | VOLUME EXPANSION ENABLED - CONFIRMED")
-            return True, signal_candle, strategy, None
+    triggered, signal_candle, strategy = check_long_signal_range_break(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
+        return True, signal_candle, strategy, None
+
+    triggered, signal_candle, strategy = check_long_signal_vol_expansion(candles)
+    if triggered:
+        _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED")
+        return True, signal_candle, strategy, None
 
     if len(candles) >= 4:
         confirm_candle = candles[-2]
@@ -3608,46 +3602,6 @@ class DailyLossTracker:
 
 
 # ================================================================
-#  SINGLE-COIN MEAN-REVERSION STRATEGY (OPTIONAL)
-#  Uses the main bot's symbols, candles, risk sizing, orders, exits,
-#  notifications, daily-loss guard, cooldown, and recovery pipeline.
-# ================================================================
-
-Z_LOOKBACK = 200
-Z_ENTRY_THRESHOLD = 6.0
-Z_MEAN_EXIT_BAND = 0.25
-Z_HARD_STOP = 11.0
-Z_RSI_UPPER = RSI_OVERBOUGHT  # Same upper RSI threshold as main RSI strategies
-Z_RSI_LOWER = RSI_OVERSOLD    # Same lower RSI threshold as main RSI strategies
-Z_RSI_OVERSOLD_BLOCK = 24.0   # No RSI-based LONG entries below this level
-Z_STRATEGY_NAME = "SINGLE_COIN_MEAN_REVERSION"
-
-
-def calculate_price_zscore(candles: List[dict], lookback: int = Z_LOOKBACK) -> Optional[dict]:
-    """Calculate latest completed close's Z-score against a rolling close-price window."""
-    valid = [c for c in candles if isinstance(c, dict)
-             and isinstance(c.get("close"), (int, float))
-             and math.isfinite(float(c["close"])) and float(c["close"]) > 0]
-    if len(valid) < lookback:
-        return None
-    window = valid[-lookback:]
-    closes = [float(c["close"]) for c in window]
-    mean = sum(closes) / len(closes)
-    variance = sum((x - mean) ** 2 for x in closes) / len(closes)
-    std = math.sqrt(variance)
-    if std <= 1e-12 or not math.isfinite(std):
-        return None
-    latest = closes[-1]
-    z = (latest - mean) / std
-    if not math.isfinite(z):
-        return None
-    return {"timestamp": int(window[-1]["time"]), "close": latest,
-            "mean": mean, "std": std, "z": z,
-            "stop_high": mean + Z_HARD_STOP * std,
-            "stop_low": mean - Z_HARD_STOP * std, "count": len(closes)}
-
-
-# ================================================================
 #  22. TRADING BOT
 # ================================================================
 
@@ -3665,9 +3619,6 @@ class TradingBot:
         self.daily_loss_limit_pct = config.get("daily_loss_limit_pct", DAILY_LOSS_LIMIT_PCT)
         self.enable_short = config.get("enable_short", True)
         self.enable_long = config.get("enable_long", True)
-        self.enable_mean_reversion = bool(config.get("enable_mean_reversion", False))
-        self.enable_volume_expansion = bool(config.get("enable_volume_expansion", False))
-        self._z_last_eval_time: Dict[str, int] = {}
 
         self.user_lot_size = float(config.get("user_lot_size", 0.0))
         if self.user_lot_size <= 0:
@@ -3702,7 +3653,6 @@ class TradingBot:
         self.active_trades: Dict[str, dict] = {}
 
         self._capital_lock = threading.Lock()
-        self.mean_reversion_capital_pct = float(config.get("mean_reversion_capital_pct", 0.0))
 
         self.signals: List[dict] = []
         self.sl_events: List[dict] = []
@@ -3743,17 +3693,6 @@ class TradingBot:
         self.on_signal_callback = None
         self.on_trade_callback = None
         self.on_log_callback = None
-
-    def _capital_allocation_for_strategy(self, strategy_name: str) -> float:
-        """Return the latest virtual allocation; callers snapshot it for a new signal only."""
-        with self._capital_lock:
-            total_capital = max(0.0, float(self.trading_capital))
-        mr_share = (self.mean_reversion_capital_pct / 100.0
-                    if self.enable_mean_reversion else 0.0)
-        mr_share = min(0.99, max(0.0, mr_share))
-        if strategy_name == Z_STRATEGY_NAME:
-            return total_capital * mr_share
-        return total_capital * (1.0 - mr_share)
 
     def _log(self, level: str, tag: str, msg: str) -> None:
         _log(level, tag, msg)
@@ -3975,7 +3914,7 @@ class TradingBot:
                 trade["st_mode"] = True
                 trade["st_confirmed_at"] = datetime.now(timezone.utc).isoformat()
 
-                if not self.paper and not trade.get("local_exit_only", False):
+                if not self.paper:
                     pid = trade.get("product_id")
                     if pid:
                         self.rest.cancel_bracket_tp(pid)
@@ -4089,17 +4028,7 @@ class TradingBot:
         self._fetch_historical_candles()
 
         self._log("info", "STARTUP", "STEP  7/15: Running initial Support/Resistance detection on historical data...")
-        # Historical seeding can discover many levels. Suppress individual event
-        # emails here; the single startup digest below contains the final S/R map.
-        saved_sr_notifiers = {}
-        for _sym, _manager in self.sr_managers.items():
-            saved_sr_notifiers[_sym] = _manager.notifier
-            _manager.notifier = None
-        try:
-            self._run_initial_sr_detection()
-        finally:
-            for _sym, _manager in self.sr_managers.items():
-                _manager.notifier = saved_sr_notifiers.get(_sym)
+        self._run_initial_sr_detection()
 
         sr_levels_for_email: Dict[str, Dict[str, List[dict]]] = {}
         for sym in self.symbols:
@@ -4289,21 +4218,6 @@ class TradingBot:
         min_rsi = RSI_MIN_CANDLES
         min_st = ST2_LENGTH + 2
         for sym in self.symbols:
-            historical = list(self.candle_store.get(sym, []))
-            if self.enable_mean_reversion:
-                z_metrics = calculate_price_zscore(historical)
-                self._z_last_eval_time[sym] = (z_metrics["timestamp"] if z_metrics
-                                               else (int(historical[-1]["time"]) if historical else 0))
-                if z_metrics:
-                    self._log("info", "Z-INIT",
-                              f"[{sym}] mean-reversion historical seed | n={z_metrics['count']} "
-                              f"close={smart_fmt(z_metrics['close'])} mean={smart_fmt(z_metrics['mean'])} "
-                              f"std={smart_fmt(z_metrics['std'])} Z={z_metrics['z']:.4f}; "
-                              "will only consider new closed candles for entries.")
-                else:
-                    self._log("warning", "Z-INIT",
-                              f"[{sym}] mean-reversion waiting for {Z_LOOKBACK} valid completed candles "
-                              f"(currently {len(historical)}).")
             have = len(self.candle_store.get(sym, []))
             rsi_ok = have >= min_rsi
             st_ok = have >= min_st
@@ -4547,25 +4461,10 @@ class TradingBot:
                       f"[{symbol}] Closed candle t={closed_candle['time']} processed exactly once "
                       f"(store size={len(store_snapshot)})")
 
-            if symbol in self.sr_managers:
-                self.sr_managers[symbol].update_levels(store_snapshot, initializing=False)
-
-            z_metrics = None
-            if self.enable_mean_reversion:
-                candidate_metrics = calculate_price_zscore(store_snapshot)
-                if candidate_metrics and candidate_metrics["timestamp"] > self._z_last_eval_time.get(symbol, 0):
-                    self._z_last_eval_time[symbol] = candidate_metrics["timestamp"]
-                    z_metrics = candidate_metrics
-                    self.last_eval_time[symbol] = time.time()
-                    self._log("info", "Z-UPDATE",
-                              f"[{symbol}] closed candle Z-score | close={smart_fmt(z_metrics['close'])} "
-                              f"mean={smart_fmt(z_metrics['mean'])} std={smart_fmt(z_metrics['std'])} "
-                              f"Z={z_metrics['z']:.4f} lookback={z_metrics['count']} "
-                              f"timestamp={z_metrics['timestamp']}")
-                elif not candidate_metrics:
-                    self._log("info", "Z-UPDATE",
-                              f"[{symbol}] mean-reversion waiting for {Z_LOOKBACK} valid completed candles "
-                              f"(store={len(store_snapshot)}).")
+            # IMPORTANT: Keep the S/R manager unchanged while this newly closed
+            # candle is evaluated. Strategies must use the S/R snapshot that was
+            # established before this candle closed. The manager is updated once
+            # after evaluation below, ready for the next candle.
 
             if symbol in self.active_trades:
                 trade = self.active_trades.get(symbol)
@@ -4575,18 +4474,7 @@ class TradingBot:
                     trade = self.active_trades.get(symbol)
                     if trade and not trade.get("_reserved"):
                         st_mode = trade.get("st_mode", False)
-                        if (trade.get("strategy") == Z_STRATEGY_NAME and not st_mode
-                                and z_metrics is not None):
-                            z = float(z_metrics["z"])
-                            if abs(z) >= Z_HARD_STOP:
-                                self._log("warning", "Z-EXIT",
-                                          f"[{symbol}] mean-reversion hard Z-stop | Z={z:.4f}; closing trade.")
-                                self._close_trade(symbol, trade, "STOP_LOSS", exit_price=z_metrics["close"])
-                            elif abs(z) <= Z_MEAN_EXIT_BAND:
-                                self._log("info", "Z-EXIT",
-                                          f"[{symbol}] price returned to rolling mean | Z={z:.4f}; closing trade.")
-                                self._close_trade(symbol, trade, "TAKE_PROFIT", exit_price=z_metrics["close"])
-                        elif not st_mode and trade.get("strategy") != Z_STRATEGY_NAME:
+                        if not st_mode:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
             if symbol not in self.active_trades:
@@ -4616,8 +4504,7 @@ class TradingBot:
                     if self.enable_short:
                         triggered, signal_candle, strategy_name, rsi_value = check_short_signal_no_rsi(
                             candle_list, self.sr_managers[symbol], symbol=symbol,
-                            notifier=self.notifier,
-                            enable_volume_expansion=self.enable_volume_expansion
+                            notifier=self.notifier
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
@@ -4635,8 +4522,7 @@ class TradingBot:
                     if self.enable_long and symbol not in self.active_trades:
                         triggered, signal_candle, strategy_name, rsi_value = check_long_signal_no_rsi(
                             candle_list, self.sr_managers[symbol], symbol=symbol,
-                            notifier=self.notifier,
-                            enable_volume_expansion=self.enable_volume_expansion
+                            notifier=self.notifier
                         )
                         if triggered and signal_candle is not None:
                             self._on_signal(symbol, signal_candle, strategy_name,
@@ -4651,55 +4537,6 @@ class TradingBot:
                                                  rsi_value, "LONG", no_rsi=False)
                                 signal_found = True
 
-                    if (self.enable_mean_reversion and not signal_found
-                            and symbol not in self.active_trades and z_metrics is not None):
-                        z = float(z_metrics["z"])
-                        # RSI is calculated only from completed candles and is an additional
-                        # direction-specific filter for mean-reversion entries.
-                        z_rsi = compute_rsi(store_snapshot, RSI_PERIOD)
-                        direction = None
-                        z_stop = 0.0
-                        rsi_block_reason = None
-
-                        if Z_ENTRY_THRESHOLD <= z < Z_HARD_STOP and self.enable_short:
-                            if z_rsi is not None and z_rsi >= Z_RSI_UPPER:
-                                direction = "SHORT"
-                                z_stop = float(z_metrics["stop_high"])
-                            else:
-                                rsi_block_reason = (f"SHORT requires RSI >= {Z_RSI_UPPER}; "
-                                                    f"current RSI={z_rsi if z_rsi is not None else 'N/A'}")
-                        elif -Z_HARD_STOP < z <= -Z_ENTRY_THRESHOLD and self.enable_long:
-                            if z_rsi is not None and Z_RSI_OVERSOLD_BLOCK <= z_rsi <= Z_RSI_LOWER:
-                                direction = "LONG"
-                                z_stop = float(z_metrics["stop_low"])
-                            else:
-                                rsi_block_reason = (f"LONG requires {Z_RSI_OVERSOLD_BLOCK} <= RSI <= {Z_RSI_LOWER}; "
-                                                    f"current RSI={z_rsi if z_rsi is not None else 'N/A'}")
-
-                        if direction:
-                            z_signal_candle = dict(closed_candle)
-                            z_signal_candle.update({
-                                "z_stop_loss": z_stop,
-                                "z_score": z,
-                                "z_mean": float(z_metrics["mean"]),
-                                "z_std": float(z_metrics["std"]),
-                                "z_timestamp": int(z_metrics["timestamp"]),
-                                "local_exit_only": True,
-                            })
-                            self._log("info", "Z-SIGNAL",
-                                      f"[{symbol}] {direction} signal | Z={z:.4f} RSI({RSI_PERIOD})={z_rsi:.2f} "
-                                      f"| entry=±{Z_ENTRY_THRESHOLD} hard_stop=±{Z_HARD_STOP} "
-                                      f"| mean={smart_fmt(z_metrics['mean'])} std={smart_fmt(z_metrics['std'])}")
-                            self._on_signal(symbol, z_signal_candle, Z_STRATEGY_NAME,
-                                            z_rsi, direction, no_rsi=False)
-                            signal_found = True
-                        else:
-                            reason = (rsi_block_reason or
-                                      f"requires {Z_ENTRY_THRESHOLD}<=|Z|<{Z_HARD_STOP} and the matching trade direction enabled")
-                            self._log("info", "Z-NO-SIGNAL",
-                                      f"[{symbol}] no mean-reversion entry | Z={z:.4f} "
-                                      f"RSI({RSI_PERIOD})={z_rsi if z_rsi is not None else 'N/A'}; {reason}.")
-
                     self._log("info", "PIPELINE",
                               f"[{symbol}] Strategy evaluation COMPLETE - "
                               f"{'signal generated' if signal_found else 'no signal, all strategies rejected'}")
@@ -4707,6 +4544,18 @@ class TradingBot:
                     self.last_eval_time[symbol] = time.time()
             else:
                 self._log("info", "EVAL-SKIP", f"[{symbol}] strategy evaluation skipped: an active trade is already open for this symbol")
+
+            # Update S/R only AFTER the current candle's strategy evaluation.
+            # This preserves the previous S/R levels for the candle being tested,
+            # while applying new swings, strength changes, merging, reclassification
+            # and proximity filtering for the next candle.
+            if symbol in self.sr_managers:
+                self._log(
+                    "info", "S/R-ORDER",
+                    f"[{symbol}] Updating S/R levels after current-candle strategy evaluation; "
+                    f"updated levels will be used from the next candle."
+                )
+                self.sr_managers[symbol].update_levels(store_snapshot, initializing=False)
 
             if self._symbol_error_counts.get(symbol):
                 self._symbol_error_counts[symbol] = 0
@@ -4719,7 +4568,7 @@ class TradingBot:
             trade = self.active_trades.get(symbol)
             if not trade or "_reserved" in trade:
                 return
-            if trade.get("st_mode", False) or trade.get("local_exit_only", False):
+            if trade.get("st_mode", False):
                 return
 
             tp = trade.get("take_profit")
@@ -4743,7 +4592,7 @@ class TradingBot:
             trade = self.active_trades.get(symbol)
             if not trade or "_reserved" in trade:
                 return
-            if trade.get("st_mode", False) or trade.get("local_exit_only", False):
+            if trade.get("st_mode", False):
                 return
 
             sl = trade["stop_loss"]
@@ -4766,9 +4615,7 @@ class TradingBot:
         try:
             entry = signal_candle["close"]
 
-            if strategy_name == Z_STRATEGY_NAME:
-                sl = float(signal_candle.get("z_stop_loss", 0.0))
-            elif direction == "SHORT":
+            if direction == "SHORT":
                 if strategy_name in ("SUPPORT_BREAKDOWN_SHORT", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"):
                     sl = signal_candle.get("pattern_high", signal_candle["high"])
                 elif strategy_name == "BEARISH_DOJI":
@@ -4795,8 +4642,7 @@ class TradingBot:
                 self._log("warning", "SIGNAL", f"risk_per_unit=0 for {symbol} - skip")
                 return
 
-            local_exit_only = strategy_name == Z_STRATEGY_NAME
-            tp = 0.0 if local_exit_only else compute_take_profit(entry, sl, direction)
+            tp = compute_take_profit(entry, sl, direction)
 
             with self._trade_lock:
                 if len(self.active_trades) >= self.max_trades:
@@ -4806,11 +4652,8 @@ class TradingBot:
                     self._log("info", "SIGNAL", f"[{symbol}] {direction} {strategy_name} REJECTED: Active trade exists")
                     return
 
-                current_capital = self._capital_allocation_for_strategy(strategy_name)
-                if current_capital <= 0:
-                    self._log("warning", "SIGNAL",
-                              f"[{symbol}] {strategy_name} has no allocated trading capital; signal skipped.")
-                    return
+                with self._capital_lock:
+                    current_capital = self.trading_capital
 
                 risk_usd = round(current_capital * self.risk_pct, 2)
                 signal = {
@@ -4823,11 +4666,6 @@ class TradingBot:
                     "product_id": self.product_map.get(symbol),
                     "risk_usd": risk_usd,
                     "trading_capital": current_capital,
-                    "strategy_capital": current_capital,
-                    # Freeze the allocation and risk inputs for this signal/trade.
-                    # Later balance refreshes affect only signals generated afterward.
-                    "strategy_capital_snapshot": current_capital,
-                    "risk_pct_snapshot": self.risk_pct,
                     "strategy": strategy_name,
                     "rsi": rsi_value,
                     "no_rsi": no_rsi,
@@ -4838,11 +4676,6 @@ class TradingBot:
                     "confirmation_close": signal_candle.get("confirmation_close", None),
                     "false_breakout_high": signal_candle.get("false_breakout_high", None),
                     "false_breakout_low": signal_candle.get("false_breakout_low", None),
-                    "local_exit_only": local_exit_only,
-                    "z_score": signal_candle.get("z_score"),
-                    "rolling_mean": signal_candle.get("z_mean"),
-                    "rolling_std": signal_candle.get("z_std"),
-                    "signal_timestamp": signal_candle.get("z_timestamp"),
                 }
                 self.signals.append(signal)
 
@@ -4855,13 +4688,6 @@ class TradingBot:
                         "strategy": strategy_name, "rsi": rsi_value,
                         "st_mode": False, "no_rsi": no_rsi,
                         "balance_before_entry": current_capital,
-                        "strategy_capital_snapshot": current_capital,
-                        "risk_pct_snapshot": self.risk_pct,
-                        "risk_usd_snapshot": risk_usd,
-                        "local_exit_only": local_exit_only,
-                        "z_score": signal_candle.get("z_score"),
-                        "rolling_mean": signal_candle.get("z_mean"),
-                        "rolling_std": signal_candle.get("z_std"),
                     }
 
             rsi_str = "N/A (no RSI)" if no_rsi else (f"{rsi_value:.2f}" if rsi_value is not None else "N/A")
@@ -4885,12 +4711,7 @@ class TradingBot:
             print(f"  [SIGNAL] {symbol}  {direction_arrow}  [{self.timeframe}] - {strategy_name}{strategy_category}")
             print(f"           Entry       : {smart_fmt(entry)}")
             print(f"           Stop Loss   : {smart_fmt(sl)} (distance={smart_fmt(stop_dist)}) [CANDLE CLOSE]")
-            if local_exit_only:
-                print(f"           Z-score     : {signal_candle.get('z_score', float('nan')):.4f}")
-                print(f"           Rolling Mean: {smart_fmt(signal_candle.get('z_mean', 0.0))}")
-                print("           Take Profit : Managed by Z-score mean exit / Supertrend mode")
-            else:
-                print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
+            print(f"           Take Profit : {smart_fmt(tp)} (R:R = 1:{rr_actual:.2f}) [PRICE TOUCH]")
             print(f"           Risk        : ${risk_usd:,.2f} ({self.config['risk_pct']}%)")
             print(f"           Lot Size    : {self.user_lot_size}")
             print(f"           RSI(14)     : {rsi_str}")
@@ -4937,15 +4758,8 @@ class TradingBot:
                 self.active_trades[symbol] = {"_reserved": True}
 
             account_balance = self.rest.get_usd_balance() or 0.0
-            # Use the capital/risk snapshot captured when this signal was generated.
-            # A later balance refresh must never resize an already-open position.
-            capital_snapshot = float(signal.get(
-                "strategy_capital_snapshot",
-                signal.get("strategy_capital", signal.get("trading_capital", 0.0)),
-            ))
-            risk_pct_snapshot = float(signal.get("risk_pct_snapshot", self.risk_pct))
-            capital = capital_snapshot
-            if capital <= 0 or risk_pct_snapshot <= 0:
+            capital = self.trading_capital
+            if capital <= 0:
                 self._cleanup_trade(symbol)
                 return
             if account_balance < capital:
@@ -4965,7 +4779,7 @@ class TradingBot:
 
             position_size, size_diag = compute_position_size(
                 entry_price=entry, stop_loss_price=sl,
-                account_balance=capital, risk_pct=risk_pct_snapshot,
+                account_balance=capital, risk_pct=self.risk_pct,
                 leverage=self.leverage, user_lot_size=self.user_lot_size,
             )
 
@@ -5016,22 +4830,17 @@ class TradingBot:
 
             print(f"  [FILLED] {symbol} {direction} | order_id={order_id} | filled={actual_filled_size} contracts")
 
-            local_exit_only = bool(signal.get("local_exit_only", False))
-            if local_exit_only:
-                bracket_ok = False
-                self._log("info", "Z-EXIT-MODE",
-                          f"[{symbol}] no exchange TP bracket for mean-reversion trade; Z-score exits before ST mode "
-                          "and shared Supertrend reversal exits after confirmation are managed by the main pipeline.")
+            bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
+            bracket_ok = bracket_result and "error" not in bracket_result
+
+            if bracket_ok:
+                print(f"  [TP BRACKET OK] Take profit bracket placed at {smart_fmt(tp)}")
+                _log("info", "BRACKET", f"TP bracket placed for {symbol} at {smart_fmt(tp)}")
             else:
-                bracket_result = self.rest.place_take_profit_only(product_id=pid, tp_price=tp, symbol=symbol)
-                bracket_ok = bracket_result and "error" not in bracket_result
-                if bracket_ok:
-                    print(f"  [TP BRACKET OK] Take profit bracket placed at {smart_fmt(tp)}")
-                    _log("info", "BRACKET", f"TP bracket placed for {symbol} at {smart_fmt(tp)}")
-                else:
-                    self._log("warning", "BRACKET", f"TP bracket FAILED for {symbol}: {bracket_result} "
-                                                      f"(local candle-close stop loss still protects the position)")
-                self._log("info", "LOCAL-SL", f"Stop loss managed locally for {symbol} at {smart_fmt(sl)} (candle close)")
+                self._log("warning", "BRACKET", f"TP bracket FAILED for {symbol}: {bracket_result} "
+                                                  f"(local candle-close stop loss still protects the position)")
+
+            self._log("info", "LOCAL-SL", f"Stop loss managed locally for {symbol} at {smart_fmt(sl)} (candle close)")
 
             signal["executed"] = True
             signal["size"] = actual_filled_size
@@ -5050,26 +4859,14 @@ class TradingBot:
                 "no_rsi": signal.get("no_rsi", False),
                 "balance_before_entry": balance_before_entry,
                 "user_lot_size": self.user_lot_size,
-                # Immutable sizing inputs retained for the lifetime of this open trade.
-                "strategy_capital_snapshot": capital,
-                "risk_pct_snapshot": risk_pct_snapshot,
-                "risk_usd_snapshot": round(capital * risk_pct_snapshot, 2),
-                "local_exit_only": local_exit_only,
-                "z_score": signal.get("z_score"),
-                "rolling_mean": signal.get("rolling_mean"),
-                "rolling_std": signal.get("rolling_std"),
             }
 
             with self._trade_lock:
                 self.active_trades[symbol] = trade_record
 
             _log("info", "TRADE",
-                 f"[{symbol}] Trade opened. Strategy capital snapshot=${capital:,.2f} | "
-                 f"Risk snapshot={risk_pct_snapshot * 100:.2f}% "
-                 f"(risk amount~${capital * risk_pct_snapshot:,.2f}) | "
-                 f"balance_before_entry=${balance_before_entry:,.2f} "
-                 f"(used to derive trade PnL on close). These sizing inputs stay fixed "
-                 f"until this position is closed.")
+                 f"[{symbol}] Trade opened. balance_before_entry=${balance_before_entry:,.2f} "
+                 f"(will be used to derive trade PnL on close)")
 
             if self.notifier:
                 try:
@@ -5384,13 +5181,8 @@ class TradingBot:
         print("+--------------------------------------------------------+")
         print(f"  Mode              : {mode_str}")
         print(f"  Timeframe         : {self.timeframe}")
-        mr_pct = self.mean_reversion_capital_pct if self.enable_mean_reversion else 0.0
-        main_pct = 100.0 - mr_pct
-        print(f"  Total capital     : ${self.trading_capital:,.2f} USD")
-        print(f"  Main strategy cap : ${self.trading_capital * main_pct / 100:,.2f} ({main_pct:.1f}%)")
-        if self.enable_mean_reversion:
-            print(f"  Mean Rev. cap     : ${self.trading_capital * mr_pct / 100:,.2f} ({mr_pct:.1f}%)")
-        print(f"  Risk / trade      : {self.config['risk_pct']}% of each strategy allocation")
+        print(f"  Trading capital   : ${self.trading_capital:,.2f} USD")
+        print(f"  Risk / trade      : {self.config['risk_pct']}%  =  ~${risk_usd:,.2f} USD")
         print(f"  Lot / contract    : {self.user_lot_size} (user-provided)")
         print(f"  Take-Profit (def) : {TP_RR_RATIO:.1f}:1 (triggers on PRICE TOUCH)")
         print(f"  Take-Profit (ST)  : Both SuperTrends reverse direction")
@@ -5400,15 +5192,10 @@ class TradingBot:
         print(f"  Max open trades   : {self.max_trades}")
         print(f"  SHORT TRADES      : {'ENABLED' if self.enable_short else 'DISABLED'}")
         print(f"  LONG TRADES       : {'ENABLED' if self.enable_long else 'DISABLED'}")
-        print(f"  Mean Reversion    : {'ENABLED' if self.enable_mean_reversion else 'DISABLED'} "
-              f"(lookback={Z_LOOKBACK}, entry |Z| in [{Z_ENTRY_THRESHOLD}, {Z_HARD_STOP}), "
-              f"hard stop |Z|>={Z_HARD_STOP}, mean exit |Z|<={Z_MEAN_EXIT_BAND}, "
-              f"RSI SHORT>={Z_RSI_UPPER}/LONG<={Z_RSI_LOWER}, ST mode after both confirm)")
-        print(f"  RSI SHORT filter  : RSI(14) >= {RSI_OVERBOUGHT}")
-        print(f"  RSI LONG  filter  : {Z_RSI_OVERSOLD_BLOCK} <= RSI(14) <= {RSI_OVERSOLD}")
-        print(f"  RSI LONG  BLOCK   : RSI(14) < {Z_RSI_OVERSOLD_BLOCK} (extreme oversold - no trades)")
-        print(f"  NO RSI FILTER     : S/R Breakout/Breakdown and S/R False Breakout/Reversal")
-        print(f"  Volume Expansion : {'ENABLED' if self.enable_volume_expansion else 'DISABLED'}")
+        print(f"  RSI SHORT filter  : RSI(14) > {RSI_OVERBOUGHT}")
+        print(f"  RSI LONG  filter  : RSI(14) < {RSI_OVERSOLD}")
+        print(f"  RSI LONG  BLOCK   : RSI(14) < 24 (extreme oversold - no trades)")
+        print(f"  NO RSI FILTER     : Range Break, Vol Expansion, S/R Breakout, S/R Reversal")
         print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
               f"requires 1 confirmation candle after breakout")
         print(f"  S/R Trade Timing  : IMMEDIATE on confirmation candle close")
@@ -5579,23 +5366,6 @@ def ask_trading_capital(account_balance: float) -> float:
     return capital
 
 
-def ask_mean_reversion_capital_pct() -> float:
-    _divider("MEAN REVERSION CAPITAL ALLOCATION")
-    print("  Enter the percentage of selected trading capital reserved for Mean Reversion.")
-    print("  The remaining capital will be reserved for the main strategies.")
-    while True:
-        raw = input("  Mean Reversion allocation % (1-99, default = 50) : ").strip()
-        try:
-            pct = float(raw) if raw else 50.0
-        except ValueError:
-            print("  [ERROR] Enter a valid number between 1 and 99.")
-            continue
-        if 1.0 <= pct <= 99.0:
-            print(f"  Mean Reversion: {pct:.2f}% | Main strategies: {100.0-pct:.2f}%")
-            return pct
-        print("  [ERROR] Allocation must be between 1 and 99 so both strategy groups receive capital.")
-
-
 def ask_risk_params() -> Tuple[float, int]:
     _divider("RISK MANAGEMENT")
     try:
@@ -5701,10 +5471,6 @@ def main() -> None:
     print("  +========================================================+")
 
     _divider("SETUP")
-    enable_mean_reversion = input("  Enable Single-Coin Mean Reversion strategy? (y/N) : ").strip().lower() == "y"
-    print(f"  Single-Coin Mean Reversion: {'ENABLED' if enable_mean_reversion else 'DISABLED'} (uses the same configured coins)")
-    enable_volume_expansion = input("  Enable Volume Expansion strategy? (y/N) : ").strip().lower() == "y"
-    print(f"  Volume Expansion: {'ENABLED' if enable_volume_expansion else 'DISABLED'}")
     test_gmail_first = input("  Test Gmail notifications first? (y/N) : ").strip().lower()
     if test_gmail_first == 'y':
         test_gmail()
@@ -5744,9 +5510,6 @@ def main() -> None:
             account_balance = 1000.0
 
     trading_capital = ask_trading_capital(account_balance)
-    mean_reversion_capital_pct = 0.0
-    if enable_mean_reversion:
-        mean_reversion_capital_pct = ask_mean_reversion_capital_pct()
     risk_pct, max_trades = ask_risk_params()
     daily_loss_limit_pct = ask_daily_loss_limit()
 
@@ -5766,16 +5529,8 @@ def main() -> None:
     print(f"  Symbols           : {raw_symbols if raw_symbols else 'AUTO-SELECT'}")
     print(f"  Lot / contract    : {user_lot_size}")
     print(f"  Leverage          : {leverage}x")
-    main_capital = trading_capital * (100.0 - mean_reversion_capital_pct) / 100.0
-    mean_reversion_capital = trading_capital * mean_reversion_capital_pct / 100.0
-    print(f"  Total capital     : ${trading_capital:,.2f}")
-    print(f"  Main strategy cap : ${main_capital:,.2f} ({100.0 - mean_reversion_capital_pct:.1f}%)")
-    if enable_mean_reversion:
-        print(f"  Mean Rev. cap     : ${mean_reversion_capital:,.2f} ({mean_reversion_capital_pct:.1f}%)")
-    print(f"  Risk / trade      : {risk_pct}% of each strategy allocation")
-    print(f"  Main risk amount  : ~${main_capital * risk_pct / 100.0:,.2f}")
-    if enable_mean_reversion:
-        print(f"  Mean Rev. risk    : ~${mean_reversion_capital * risk_pct / 100.0:,.2f}")
+    print(f"  Trading capital   : ${trading_capital:,.2f}")
+    print(f"  Risk / trade      : {risk_pct}%  =  ~${risk_usd:,.2f}")
     print(f"  Take-Profit (def) : {TP_RR_RATIO:.1f}:1 R:R (triggers on PRICE TOUCH)")
     print(f"  Take-Profit (ST)  : Both SuperTrends reverse")
     print(f"  Stop Loss         : Triggers on CANDLE CLOSE only")
@@ -5784,7 +5539,6 @@ def main() -> None:
     print(f"  GMAIL             : {'ENABLED' if notifier and notifier.enabled else 'DISABLED'}")
     print(f"  Fed detector      : {'ENABLED' if fed_config.get('enabled') else 'DISABLED'}")
     print(f"  Tech index        : {'ENABLED' if tech_config.get('enabled') else 'DISABLED'}")
-    print(f"  Mean Reversion    : {'ENABLED' if enable_mean_reversion else 'DISABLED'} | lookback={Z_LOOKBACK} | entry |Z|>={Z_ENTRY_THRESHOLD} | mean exit |Z|<={Z_MEAN_EXIT_BAND} | hard stop |Z|>={Z_HARD_STOP} | RSI short>={Z_RSI_UPPER}, long<={Z_RSI_LOWER}")
     print(f"  Post-Exit Cooldown: {POST_EXIT_COOLDOWN_CANDLES} closed candles per symbol")
     print(f"  PnL Source        : TRADE-ONLY (final_balance - balance_before_entry)")
     print(f"  PnL Calculation   : realized_pnl = final_balance - balance_before_entry")
@@ -5795,11 +5549,12 @@ def main() -> None:
     print(f"  External Flows    : DISABLED (no deposit/withdrawal tracking)")
     print(f"  Position Sizing   : contracts = int(coin_qty / user_lot_size); "
           f"rejects if contracts < 1 (no max(1,...) fallback)")
-    print(f"  RSI Filters       : SHORT >= {RSI_OVERBOUGHT}; LONG {Z_RSI_OVERSOLD_BLOCK} to {RSI_OVERSOLD}; below {Z_RSI_OVERSOLD_BLOCK} blocked")
-    print(f"  Volume Expansion  : {'ENABLED' if enable_volume_expansion else 'DISABLED'}")
-    if enable_volume_expansion:
-        print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | confirmation required")
-    print("  Removed Strategies: Doji, Engulfing, Range Break")
+    print(f"  Vol Expansion     : lookback={VOL_EXP_LOOKBACK} | tolerance={VOL_EXP_TOLERANCE*100:.2f}% | "
+          f"requires 1 confirmation candle after breakout")
+    print(f"  Engulfing Logic   : Bullish Engulf -> Bullish Confirm (close > Engulf close) -> LONG")
+    print(f"                      Bearish Engulf -> Bearish Confirm (close < Engulf close) -> SHORT")
+    print(f"                      SL: Bullish=Engulf low | Bearish=Engulf high")
+    print(f"  Doji Body Max     : {DOJI_BODY_RATIO_MAX * 100:.0f}% of candle range (inclusive)")
     print()
 
     if trading_capital <= 0:
@@ -5815,26 +5570,7 @@ def main() -> None:
         print("  Cancelled.")
         return
 
-    # Collect the market context before bot.start(), so its existing startup
-    # report can deliver one combined message (S/R + tech index + Fed rate).
-    startup_market_data = {}
-    if fed_config.get("enabled"):
-        try:
-            startup_market_data["fed"] = fed_rate_detector.get_startup_snapshot()
-        except Exception as exc:
-            startup_market_data["fed_error"] = str(exc)
-            _log_exc("STARTUP-DIGEST", f"Fed snapshot unavailable: {exc}")
-    if tech_config.get("enabled"):
-        try:
-            startup_market_data["tech"] = tech_stock.get_startup_snapshot(
-                tech_config["tickers"], tech_config["massive_key"], tech_config["fmp_key"]
-            )
-        except Exception as exc:
-            startup_market_data["tech_error"] = str(exc)
-            _log_exc("STARTUP-DIGEST", f"Tech index snapshot unavailable: {exc}")
-
     cfg = {
-        "startup_market_data": startup_market_data,
         "paper_mode": paper,
         "symbols": raw_symbols,
         "risk_pct": risk_pct,
@@ -5847,18 +5583,13 @@ def main() -> None:
         "daily_loss_limit_pct": daily_loss_limit_pct / 100.0,
         "enable_short": enable_short,
         "enable_long": enable_long,
-        "enable_mean_reversion": enable_mean_reversion,
-        "mean_reversion_capital_pct": mean_reversion_capital_pct,
-        "enable_volume_expansion": enable_volume_expansion,
         "user_lot_size": user_lot_size,
     }
 
     # Bind legacy security helpers to this runtime and create shared API recovery.
     serede.bind_runtime_globals(globals())
     stop_event = threading.Event()
-    # Avoid separate API failure/recovery emails during the startup digest phase.
-    # After the single digest is queued, normal deduplicated service alerts resume.
-    api_guard = serede.ApiResilience(notifier=None)
+    api_guard = serede.ApiResilience(notifier=notifier)
     service_threads = []
 
     bot = None
@@ -5866,7 +5597,6 @@ def main() -> None:
     try:
         bot = TradingBot(cfg, notifier=notifier)
         bot.start()
-        api_guard.notifier = notifier
         if bot.running and bot.symbols:
             main_bot_supervisor = serede.MainBotSupervisor(bot, notifier=notifier)
             main_bot_supervisor.start()
