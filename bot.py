@@ -2105,7 +2105,7 @@ def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'S
     if not is_bullish(false_breakout_candle):
         return False, None, ""
 
-    _, supports = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
+    supports, _ = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
 
     if not supports:
         return False, None, ""
@@ -2444,7 +2444,7 @@ def check_long_signal_no_rsi(
         false_breakout_candle = candles[-3]
         confirm_candle = candles[-2]
 
-        _, supports = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
+        supports, _ = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
 
         if supports:
             support_found = False
@@ -2517,6 +2517,7 @@ class SRLevelManager:
 
         self._processed_indices: set = set()
         self._last_processed_index = -1
+        self._last_strength_index = -1
 
         self._lock = threading.RLock()
 
@@ -2655,6 +2656,9 @@ class SRLevelManager:
                     "strength": min(5, total_strength),
                     "touches": total_touches,
                     "type": level_type,
+                    "index": min(l.get("index", 0) for l in group),
+                    "_touch_active": any(l.get("_touch_active", False) for l in group),
+                    "_touch_counted": any(l.get("_touch_counted", False) for l in group),
                     "_merged_from": len(group),
                     "_original_prices": [l["price"] for l in group],
                 }
@@ -2732,6 +2736,9 @@ class SRLevelManager:
                         "strength": min(5, total_strength),
                         "touches": total_touches,
                         "type": level_type,
+                        "index": min(l.get("index", 0) for l in group),
+                        "_touch_active": any(l.get("_touch_active", False) for l in group),
+                        "_touch_counted": any(l.get("_touch_counted", False) for l in group),
                         "_proximity_merged_from": len(group),
                         "_proximity_prices": [l["price"] for l in group],
                     }
@@ -2766,6 +2773,7 @@ class SRLevelManager:
                 self._reset_all_levels()
                 self._processed_indices.clear()
                 self._last_processed_index = -1
+                self._last_strength_index = -1
 
                 self._run_initial_scan(candles)
 
@@ -2811,11 +2819,14 @@ class SRLevelManager:
                 self._progress_log(f"LIVE INCREMENTAL UPDATE | New Candles={len(unprocessed)} | Range={unprocessed[0]}→{unprocessed[-1]}")
 
                 for idx in unprocessed:
-                    context_start = max(0, idx - SR_SWING_SENSITIVITY - 1)
-                    context_end = min(len(candles), idx + SR_SWING_SENSITIVITY + 2)
-                    context = candles[context_start:context_end]
-
-                    self._process_candle_at_index(idx, context, candles)
+                    # A swing at candidate_idx is only confirmed once five candles
+                    # to its right have closed. The newly closed candle is idx.
+                    candidate_idx = idx - SR_SWING_SENSITIVITY
+                    if candidate_idx >= SR_SWING_SENSITIVITY:
+                        context_start = candidate_idx - SR_SWING_SENSITIVITY
+                        context_end = candidate_idx + SR_SWING_SENSITIVITY + 1
+                        context = candles[context_start:context_end]
+                        self._process_candle_at_index(candidate_idx, context, candles)
 
                     self._processed_indices.add(idx)
                     self._last_processed_index = max(self._last_processed_index, idx)
@@ -2873,7 +2884,9 @@ class SRLevelManager:
                         "strength": 1,
                         "touches": 1,
                         "type": "RESISTANCE",
-                        "index": i
+                        "index": i,
+                        "_touch_active": False,
+                        "_touch_counted": False
                     }
                     self.resistance_levels.append(new_level)
                     self.pending_swing_highs.append(price)
@@ -2894,7 +2907,9 @@ class SRLevelManager:
                         "strength": 1,
                         "touches": 1,
                         "type": "SUPPORT",
-                        "index": i
+                        "index": i,
+                        "_touch_active": False,
+                        "_touch_counted": False
                     }
                     self.support_levels.append(new_level)
                     self.pending_swing_lows.append(price)
@@ -2928,7 +2943,10 @@ class SRLevelManager:
                     "age": 0,
                     "strength": 1,
                     "touches": 1,
-                    "type": "RESISTANCE"
+                    "type": "RESISTANCE",
+                    "index": idx,
+                    "_touch_active": False,
+                    "_touch_counted": False
                 }
                 self.resistance_levels.append(new_level)
                 self.pending_swing_highs.append(price)
@@ -2951,7 +2969,10 @@ class SRLevelManager:
                     "age": 0,
                     "strength": 1,
                     "touches": 1,
-                    "type": "SUPPORT"
+                    "type": "SUPPORT",
+                    "index": idx,
+                    "_touch_active": False,
+                    "_touch_counted": False
                 }
                 self.support_levels.append(new_level)
                 self.pending_swing_lows.append(price)
@@ -2965,24 +2986,71 @@ class SRLevelManager:
         return False
 
     def _update_level_strength(self, candles: List[dict]) -> None:
+        """Count distinct wick tests that reject an S/R level.
+
+        A candle must overlap the level's 0.2% zone. Resistance rejection means
+        the candle closes below resistance; support rejection means it closes
+        above support. Consecutive candles in one uninterrupted test count only
+        once. Each candle index is processed once to avoid duplicate strength.
+        """
         if not candles:
             return
-        current_price = candles[-1]["close"]
-        threshold = current_price * SR_PRICE_TOUCH_THRESHOLD
 
-        for level in self.resistance_levels:
-            if abs(level["price"] - current_price) <= threshold:
-                level["strength"] = min(5, level["strength"] + 1)
-                level["touches"] += 1
-                level["age"] = 0
-                self._progress_log(f"RESISTANCE touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
+        start_idx = max(0, self._last_strength_index + 1)
+        if start_idx >= len(candles):
+            return
 
-        for level in self.support_levels:
-            if abs(level["price"] - current_price) <= threshold:
-                level["strength"] = min(5, level["strength"] + 1)
-                level["touches"] += 1
-                level["age"] = 0
-                self._progress_log(f"SUPPORT touched: {smart_fmt(level['price'])} {'*' * level['strength']}")
+        levels = [
+            (self.resistance_levels, "RESISTANCE"),
+            (self.support_levels, "SUPPORT"),
+        ]
+
+        for candle_idx in range(start_idx, len(candles)):
+            candle = candles[candle_idx]
+            candle_high = candle["high"]
+            candle_low = candle["low"]
+            candle_close = candle["close"]
+
+            for level_list, level_type in levels:
+                for level in level_list:
+                    # Do not count tests that occurred before this swing formed.
+                    if candle_idx <= level.get("index", -1):
+                        continue
+
+                    level_price = level["price"]
+                    threshold = level_price * SR_PRICE_TOUCH_THRESHOLD
+                    overlaps_zone = (
+                        candle_low <= level_price + threshold
+                        and candle_high >= level_price - threshold
+                    )
+
+                    if not overlaps_zone:
+                        level["_touch_active"] = False
+                        level["_touch_counted"] = False
+                        continue
+
+                    # A rejection can occur on any candle within this same
+                    # continuous test, but the test contributes at most once.
+                    if level.get("_touch_counted", False):
+                        continue
+
+                    if level_type == "RESISTANCE":
+                        rejected = candle_close < level_price
+                    else:
+                        rejected = candle_close > level_price
+
+                    level["_touch_active"] = True
+                    if rejected:
+                        level["strength"] = min(5, level.get("strength", 1) + 1)
+                        level["touches"] = level.get("touches", 1) + 1
+                        level["age"] = 0
+                        level["_touch_counted"] = True
+                        self._progress_log(
+                            f"{level_type} rejected: {smart_fmt(level_price)} "
+                            f"{'*' * level['strength']} (touches={level['touches']})"
+                        )
+
+        self._last_strength_index = len(candles) - 1
 
     def _age_levels(self) -> List[Dict]:
         expired_levels = []
