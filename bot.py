@@ -3760,13 +3760,16 @@ class TradingBot:
                 f"Confirmation : {smart_fmt(float(signal_candle.get('confirmation_close', 0) or 0))}\n"
                 f"Strength     : {signal_candle.get('level_strength', 1)}\n"
                 f"Touches      : {signal_candle.get('level_touches', 0)}\n\n"
-                f"No trade was entered at confirmation. Entry will be attempted on the first "
-                f"live retest after price has moved away from the marked level."
+                f"No trade was entered at confirmation. Entry will be attempted only after "
+                f"a subsequent candle closes within the retest zone, after price has moved away."
             )
 
     def _check_pending_false_breakout(self, symbol: str, price_candle: dict,
                                       closed_candle: bool = False) -> bool:
-        """Arm on departure, expire/invalidate safely, and enter on a live retest."""
+        """Arm on a completed-candle departure and enter only on a completed-candle retest."""
+        # Ignore forming-candle updates. The strategy must confirm the retest at candle close.
+        if not closed_candle:
+            return False
         try:
             price = float(price_candle.get("close", 0.0))
             candle_time = int(price_candle.get("time", 0) or 0)
@@ -4616,7 +4619,6 @@ class TradingBot:
 
         if same_time_update:
             self._check_take_profit(symbol, normalized)
-            self._check_pending_false_breakout(symbol, normalized, closed_candle=False)
             return
 
         if closed_for_processing is not None:
@@ -4693,11 +4695,9 @@ class TradingBot:
                         elif not st_mode and trade.get("strategy") != Z_STRATEGY_NAME:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
-            # Existing marked levels are monitored independently of normal candle strategy evaluation.
-            # Use the new forming candle's latest close as the live price; the completed candle is
-            # used only for expiry/invalidation checks.
+            # Existing marked levels are monitored only on completed candles. A retest entry
+            # is submitted immediately after the candle closes inside the configured zone.
             self._check_pending_false_breakout(symbol, closed_candle, closed_candle=True)
-            self._check_pending_false_breakout(symbol, new_forming_candle, closed_candle=False)
 
             if symbol not in self.active_trades:
                 if self._post_exit_cooldown.get(symbol, 0) > 0:
