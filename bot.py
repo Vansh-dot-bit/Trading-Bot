@@ -1176,6 +1176,10 @@ SR_MAX_LEVEL_AGE = 100
 SR_MIN_STRENGTH = 1
 SR_PRICE_TOUCH_THRESHOLD = 0.002
 
+# Retest proximity as a fraction of the marked S/R level (0.002 = 0.20%).
+FALSE_BREAKOUT_PROXIMITY_PCT = 0.002
+FALSE_BREAKOUT_LEVEL_MAX_AGE_CANDLES = SR_MAX_LEVEL_AGE
+
 MIN_SR_DISTANCE_PERCENT = 1.5
 
 ST1_LENGTH = 14
@@ -1824,52 +1828,35 @@ def check_short_signal_support_resistance_manager(candles: List[dict], sr_manage
 
 
 def check_short_signal_resistance_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
+    # candles[-2] is the latest completed candle; candles[-1] is still forming.
+    if len(candles) < 3:
         return False, None, ""
 
-    false_breakout_candle = candles[-3]
-    confirm_candle = candles[-2]
-
-    if not is_bearish(false_breakout_candle):
-        return False, None, ""
-
+    false_breakout_candle = candles[-2]
     resistances, _ = sr_manager.get_levels_near_price(false_breakout_candle["high"], tolerance=0.02)
-
     if not resistances:
         return False, None, ""
 
     for level_dict in resistances:
-        resistance = level_dict["price"]
-
+        resistance = float(level_dict["price"])
         if false_breakout_candle["high"] <= resistance:
             continue
-
         if false_breakout_candle["close"] >= resistance:
             continue
 
-        if not is_bearish(confirm_candle):
-            continue
-
-        if confirm_candle["close"] >= false_breakout_candle["close"]:
-            continue
-
-        signal_candle = confirm_candle.copy()
+        signal_candle = false_breakout_candle.copy()
         signal_candle["pattern_high"] = false_breakout_candle["high"]
         signal_candle["breakout_level"] = resistance
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
+        signal_candle["confirmation_close"] = false_breakout_candle["close"]
         signal_candle["false_breakout_high"] = false_breakout_candle["high"]
 
-        stars = "*" * level_dict["strength"]
-
         _log("info", "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT",
-             f"SHORT: Resistance false breakout reversal at {smart_fmt(resistance)} "
-             f"(High {smart_fmt(false_breakout_candle['high'])} > Resistance > Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bearish candle close {smart_fmt(confirm_candle['close'])} < false breakout close "
-             f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
-
+             f"SHORT setup marked at {smart_fmt(resistance)}: candle high "
+             f"{smart_fmt(false_breakout_candle['high'])} > resistance and close "
+             f"{smart_fmt(false_breakout_candle['close'])} < resistance; waiting for retest.")
         return True, signal_candle, "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT"
 
     return False, None, ""
@@ -2096,52 +2083,35 @@ def check_long_signal_support_resistance_manager(candles: List[dict], sr_manager
 
 
 def check_long_signal_support_false_breakout(candles: List[dict], sr_manager: 'SRLevelManager') -> Tuple[bool, Optional[dict], str]:
-    if len(candles) < 4:
+    # candles[-2] is the latest completed candle; candles[-1] is still forming.
+    if len(candles) < 3:
         return False, None, ""
 
-    false_breakout_candle = candles[-3]
-    confirm_candle = candles[-2]
-
-    if not is_bullish(false_breakout_candle):
-        return False, None, ""
-
+    false_breakout_candle = candles[-2]
     supports, _ = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
-
     if not supports:
         return False, None, ""
 
     for level_dict in supports:
-        support = level_dict["price"]
-
+        support = float(level_dict["price"])
         if false_breakout_candle["low"] >= support:
             continue
-
         if false_breakout_candle["close"] <= support:
             continue
 
-        if not is_bullish(confirm_candle):
-            continue
-
-        if confirm_candle["close"] <= false_breakout_candle["close"]:
-            continue
-
-        signal_candle = confirm_candle.copy()
+        signal_candle = false_breakout_candle.copy()
         signal_candle["pattern_low"] = false_breakout_candle["low"]
         signal_candle["breakout_level"] = support
         signal_candle["level_strength"] = level_dict["strength"]
         signal_candle["level_touches"] = level_dict["touches"]
         signal_candle["reversal_candle_close"] = false_breakout_candle["close"]
-        signal_candle["confirmation_close"] = confirm_candle["close"]
+        signal_candle["confirmation_close"] = false_breakout_candle["close"]
         signal_candle["false_breakout_low"] = false_breakout_candle["low"]
 
-        stars = "*" * level_dict["strength"]
-
         _log("info", "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG",
-             f"LONG: Support false breakout reversal at {smart_fmt(support)} "
-             f"(Low {smart_fmt(false_breakout_candle['low'])} < Support < Close {smart_fmt(false_breakout_candle['close'])}) "
-             f"CONFIRMED by bullish candle close {smart_fmt(confirm_candle['close'])} > false breakout close "
-             f"(Strength: {stars}, {level_dict['touches']} touches) -> TRADE IMMEDIATE")
-
+             f"LONG setup marked at {smart_fmt(support)}: candle low "
+             f"{smart_fmt(false_breakout_candle['low'])} < support and close "
+             f"{smart_fmt(false_breakout_candle['close'])} > support; waiting for retest.")
         return True, signal_candle, "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG"
 
     return False, None, ""
@@ -2310,51 +2280,12 @@ def check_short_signal_no_rsi(
             rejection_reason = "No valid Support levels available (strength >= 1 required)"
             _log("info", "S/R-REJECT", f"[{symbol}] SHORT S/R Breakdown: {rejection_reason}")
 
-    if len(candles) >= 4:
-        false_breakout_candle = candles[-3]
-        confirm_candle = candles[-2]
-
-        resistances, _ = sr_manager.get_levels_near_price(false_breakout_candle["high"], tolerance=0.02)
-
-        if resistances:
-            resistance_found = False
-            for level_dict in resistances:
-                resistance = level_dict["price"]
-                resistance_found = True
-
-                if false_breakout_candle["high"] <= resistance:
-                    rejection_reason = f"False breakout high {smart_fmt(false_breakout_candle['high'])} not above Resistance {smart_fmt(resistance)}"
-                    _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    continue
-
-                if false_breakout_candle["close"] >= resistance:
-                    rejection_reason = f"False breakout close {smart_fmt(false_breakout_candle['close'])} not below Resistance {smart_fmt(resistance)}"
-                    _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    continue
-
-                if not is_bearish(confirm_candle):
-                    rejection_reason = f"Confirmation candle is not Bearish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
-                    _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    continue
-
-                if confirm_candle["close"] >= false_breakout_candle["close"]:
-                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not below false breakout close {smart_fmt(false_breakout_candle['close'])}"
-                    _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-                    continue
-
-                triggered, signal_candle, strategy = check_short_signal_resistance_false_breakout(candles, sr_manager)
-                if triggered:
-                    _log("info", "SIGNAL", f"[{symbol}] SHORT {strategy} | NO RSI FILTER - CONFIRMED IMMEDIATE")
-                    return True, signal_candle, strategy, None
-
-                break
-
-            if not resistance_found:
-                rejection_reason = "No matching Resistance level found near false breakout high"
-                _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
-        else:
-            rejection_reason = "No Resistance levels found near false breakout high (tolerance 2%)"
-            _log("info", "S/R-REJECT", f"[{symbol}] SHORT Resistance False Breakout: {rejection_reason}")
+    if len(candles) >= 3:
+        triggered, signal_candle, strategy = check_short_signal_resistance_false_breakout(candles, sr_manager)
+        if triggered:
+            _log("info", "SIGNAL",
+                 f"[{symbol}] SHORT {strategy} | false-breakout level marked; awaiting live retest")
+            return True, signal_candle, strategy, None
 
     return False, None, "", None
 
@@ -2440,51 +2371,12 @@ def check_long_signal_no_rsi(
             rejection_reason = "No valid Resistance levels available (strength >= 1 required)"
             _log("info", "S/R-REJECT", f"[{symbol}] LONG S/R Breakout: {rejection_reason}")
 
-    if len(candles) >= 4:
-        false_breakout_candle = candles[-3]
-        confirm_candle = candles[-2]
-
-        supports, _ = sr_manager.get_levels_near_price(false_breakout_candle["low"], tolerance=0.02)
-
-        if supports:
-            support_found = False
-            for level_dict in supports:
-                support = level_dict["price"]
-                support_found = True
-
-                if false_breakout_candle["low"] >= support:
-                    rejection_reason = f"False breakout low {smart_fmt(false_breakout_candle['low'])} not below Support {smart_fmt(support)}"
-                    _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    continue
-
-                if false_breakout_candle["close"] <= support:
-                    rejection_reason = f"False breakout close {smart_fmt(false_breakout_candle['close'])} not above Support {smart_fmt(support)}"
-                    _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    continue
-
-                if not is_bullish(confirm_candle):
-                    rejection_reason = f"Confirmation candle is not Bullish (close={smart_fmt(confirm_candle['close'])}, open={smart_fmt(confirm_candle['open'])})"
-                    _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    continue
-
-                if confirm_candle["close"] <= false_breakout_candle["close"]:
-                    rejection_reason = f"Confirmation close {smart_fmt(confirm_candle['close'])} not above false breakout close {smart_fmt(false_breakout_candle['close'])}"
-                    _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-                    continue
-
-                triggered, signal_candle, strategy = check_long_signal_support_false_breakout(candles, sr_manager)
-                if triggered:
-                    _log("info", "SIGNAL", f"[{symbol}] LONG {strategy} | NO RSI FILTER - CONFIRMED IMMEDIATE")
-                    return True, signal_candle, strategy, None
-
-                break
-
-            if not support_found:
-                rejection_reason = "No matching Support level found near false breakout low"
-                _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
-        else:
-            rejection_reason = "No Support levels found near false breakout low (tolerance 2%)"
-            _log("info", "S/R-REJECT", f"[{symbol}] LONG Support False Breakout: {rejection_reason}")
+    if len(candles) >= 3:
+        triggered, signal_candle, strategy = check_long_signal_support_false_breakout(candles, sr_manager)
+        if triggered:
+            _log("info", "SIGNAL",
+                 f"[{symbol}] LONG {strategy} | false-breakout level marked; awaiting live retest")
+            return True, signal_candle, strategy, None
 
     return False, None, "", None
 
@@ -3736,6 +3628,16 @@ class TradingBot:
         self.enable_mean_reversion = bool(config.get("enable_mean_reversion", False))
         self.enable_volume_expansion = bool(config.get("enable_volume_expansion", False))
         self._z_last_eval_time: Dict[str, int] = {}
+        self.false_breakout_proximity_pct = max(
+            0.0, float(config.get("false_breakout_proximity_pct", FALSE_BREAKOUT_PROXIMITY_PCT))
+        )
+        self.false_breakout_level_max_age = max(
+            1, int(config.get("false_breakout_level_max_age_candles", FALSE_BREAKOUT_LEVEL_MAX_AGE_CANDLES))
+        )
+        self._pending_false_breakouts: Dict[Tuple[str, str, str], dict] = {}
+        self._used_false_breakout_levels: set = set()
+        self._seen_false_breakout_levels: set = set()
+        self._false_breakout_lock = threading.RLock()
 
         self.user_lot_size = float(config.get("user_lot_size", 0.0))
         if self.user_lot_size <= 0:
@@ -3811,6 +3713,142 @@ class TradingBot:
         self.on_signal_callback = None
         self.on_trade_callback = None
         self.on_log_callback = None
+
+    def _register_false_breakout_level(self, symbol: str, signal_candle: dict,
+                                       strategy_name: str, direction: str) -> None:
+        """Save a confirmed false-breakout level; do not enter on its confirmation candle."""
+        level = float(signal_candle.get("breakout_level", 0.0))
+        confirm_time = int(signal_candle.get("time", 0) or 0)
+        if level <= 0 or confirm_time <= 0:
+            self._log("warning", "FALSE-BREAKOUT",
+                      f"[{symbol}] invalid marked level/timestamp; setup ignored safely.")
+            return
+
+        # Stable identity per symbol + strategy + exact marked level prevents duplicate alerts
+        # or reuse of the same level after an expiry/invalidation.
+        level_key = (symbol, strategy_name, f"{level:.10f}")
+        with self._false_breakout_lock:
+            if (level_key in self._seen_false_breakout_levels
+                    or level_key in self._used_false_breakout_levels
+                    or level_key in self._pending_false_breakouts):
+                return
+            self._seen_false_breakout_levels.add(level_key)
+            self._pending_false_breakouts[level_key] = {
+                "symbol": symbol, "strategy": strategy_name, "direction": direction,
+                "level": level, "marked_time": confirm_time, "armed": False,
+                "pattern_low": float(signal_candle.get("pattern_low", signal_candle.get("low", level))),
+                "pattern_high": float(signal_candle.get("pattern_high", signal_candle.get("high", level))),
+                "level_strength": signal_candle.get("level_strength", 1),
+                "level_touches": signal_candle.get("level_touches", 0),
+                "reversal_candle_close": signal_candle.get("reversal_candle_close"),
+                "confirmation_close": signal_candle.get("confirmation_close"),
+            }
+
+        self._log("info", "FALSE-BREAKOUT",
+                  f"[{symbol}] {strategy_name}: marked {direction} retest level {smart_fmt(level)}; "
+                  f"waiting for departure and revisit within {self.false_breakout_proximity_pct * 100:.3f}%.")
+        if self.notifier:
+            self.notifier.send_custom_alert(
+                f"[FALSE-BREAKOUT MARKED] {symbol} {direction} - {smart_fmt(level)}",
+                "FALSE-BREAKOUT LEVEL MARKED\n"
+                f"Symbol       : {symbol}\n"
+                f"Strategy     : {strategy_name}\n"
+                f"Direction    : {direction}\n"
+                f"Marked level : {smart_fmt(level)}\n"
+                f"Level type   : {'SUPPORT' if direction == 'LONG' else 'RESISTANCE'}\n"
+                f"Proximity    : {self.false_breakout_proximity_pct * 100:.3f}%\n"
+                f"Confirmation : {smart_fmt(float(signal_candle.get('confirmation_close', 0) or 0))}\n"
+                f"Strength     : {signal_candle.get('level_strength', 1)}\n"
+                f"Touches      : {signal_candle.get('level_touches', 0)}\n\n"
+                f"No trade was entered at confirmation. Entry will be attempted on the first "
+                f"live retest after price has moved away from the marked level."
+            )
+
+    def _check_pending_false_breakout(self, symbol: str, price_candle: dict,
+                                      closed_candle: bool = False) -> bool:
+        """Arm on departure, expire/invalidate safely, and enter on a live retest."""
+        try:
+            price = float(price_candle.get("close", 0.0))
+            candle_time = int(price_candle.get("time", 0) or 0)
+            if price <= 0:
+                return False
+
+            with self._false_breakout_lock:
+                pending_items = [
+                    (key, dict(item)) for key, item in self._pending_false_breakouts.items()
+                    if item.get("symbol") == symbol
+                ]
+
+            for key, item in pending_items:
+                level = float(item["level"])
+                direction = item["direction"]
+                tolerance = level * self.false_breakout_proximity_pct
+                age = max(0, (candle_time - int(item["marked_time"])) // max(1, self._tf.secs))
+
+                if age > self.false_breakout_level_max_age:
+                    with self._false_breakout_lock:
+                        self._pending_false_breakouts.pop(key, None)
+                    self._log("info", "FALSE-BREAKOUT",
+                              f"[{symbol}] expired {item['strategy']} level {smart_fmt(level)} after {age} candles.")
+                    continue
+
+                if closed_candle:
+                    invalid = ((direction == "LONG" and price < level - tolerance) or
+                               (direction == "SHORT" and price > level + tolerance))
+                    if invalid:
+                        with self._false_breakout_lock:
+                            self._pending_false_breakouts.pop(key, None)
+                        self._log("warning", "FALSE-BREAKOUT",
+                                  f"[{symbol}] invalidated {item['strategy']} level {smart_fmt(level)} "
+                                  f"by completed close {smart_fmt(price)}.")
+                        continue
+
+                if abs(price - level) > tolerance:
+                    if not item.get("armed"):
+                        with self._false_breakout_lock:
+                            current = self._pending_false_breakouts.get(key)
+                            if current:
+                                current["armed"] = True
+                        self._log("info", "FALSE-BREAKOUT",
+                                  f"[{symbol}] {item['strategy']} level {smart_fmt(level)} armed; "
+                                  f"price moved away to {smart_fmt(price)}.")
+                    continue
+
+                # Require an actual departure after marking, then enter immediately on return.
+                if not item.get("armed"):
+                    continue
+
+                if (symbol in self.active_trades or self.daily_loss_tracker.is_limit_reached()
+                        or self._post_exit_cooldown.get(symbol, 0) > 0):
+                    continue
+
+                entry_candle = dict(price_candle)
+                entry_candle.update({
+                    "close": price,
+                    "breakout_level": level,
+                    "pattern_low": item["pattern_low"],
+                    "pattern_high": item["pattern_high"],
+                    "level_strength": item["level_strength"],
+                    "level_touches": item["level_touches"],
+                    "reversal_candle_close": item.get("reversal_candle_close"),
+                    "confirmation_close": item.get("confirmation_close"),
+                    "false_breakout_retest": True,
+                })
+                self._log("info", "FALSE-BREAKOUT-ENTRY",
+                          f"[{symbol}] {item['strategy']} {direction} retest: "
+                          f"level={smart_fmt(level)}, live price={smart_fmt(price)}; submitting normal trade flow.")
+                self._on_signal(symbol, entry_candle, item["strategy"], None, direction, no_rsi=True)
+
+                trade = self.active_trades.get(symbol)
+                if trade and trade.get("strategy") == item["strategy"]:
+                    with self._false_breakout_lock:
+                        self._pending_false_breakouts.pop(key, None)
+                        self._used_false_breakout_levels.add(key)
+                    return True
+            return False
+        except Exception as exc:
+            _log_exc("FALSE-BREAKOUT", f"[{symbol}] pending retest evaluation failed safely: {exc}")
+            return False
 
     def _capital_allocation_for_strategy(self, strategy_name: str) -> float:
         """Return the latest virtual allocation; callers snapshot it for a new signal only."""
@@ -4578,6 +4616,7 @@ class TradingBot:
 
         if same_time_update:
             self._check_take_profit(symbol, normalized)
+            self._check_pending_false_breakout(symbol, normalized, closed_candle=False)
             return
 
         if closed_for_processing is not None:
@@ -4654,6 +4693,12 @@ class TradingBot:
                         elif not st_mode and trade.get("strategy") != Z_STRATEGY_NAME:
                             self._check_stop_loss_on_close(symbol, closed_candle)
 
+            # Existing marked levels are monitored independently of normal candle strategy evaluation.
+            # Use the new forming candle's latest close as the live price; the completed candle is
+            # used only for expiry/invalidation checks.
+            self._check_pending_false_breakout(symbol, closed_candle, closed_candle=True)
+            self._check_pending_false_breakout(symbol, new_forming_candle, closed_candle=False)
+
             if symbol not in self.active_trades:
                 if self._post_exit_cooldown.get(symbol, 0) > 0:
                     self._tick_post_exit_cooldown(symbol)
@@ -4685,8 +4730,13 @@ class TradingBot:
                             enable_volume_expansion=self.enable_volume_expansion
                         )
                         if triggered and signal_candle is not None:
-                            self._on_signal(symbol, signal_candle, strategy_name,
-                                             rsi_value, "SHORT", no_rsi=True)
+                            if strategy_name == "RESISTANCE_FALSE_BREAKOUT_REVERSAL_SHORT":
+                                self._register_false_breakout_level(
+                                    symbol, signal_candle, strategy_name, "SHORT"
+                                )
+                            else:
+                                self._on_signal(symbol, signal_candle, strategy_name,
+                                                 rsi_value, "SHORT", no_rsi=True)
                             signal_found = True
                         else:
                             triggered, signal_candle, strategy_name, rsi_value = check_short_signal(
@@ -4704,8 +4754,13 @@ class TradingBot:
                             enable_volume_expansion=self.enable_volume_expansion
                         )
                         if triggered and signal_candle is not None:
-                            self._on_signal(symbol, signal_candle, strategy_name,
-                                             rsi_value, "LONG", no_rsi=True)
+                            if strategy_name == "SUPPORT_FALSE_BREAKOUT_REVERSAL_LONG":
+                                self._register_false_breakout_level(
+                                    symbol, signal_candle, strategy_name, "LONG"
+                                )
+                            else:
+                                self._on_signal(symbol, signal_candle, strategy_name,
+                                                 rsi_value, "LONG", no_rsi=True)
                             signal_found = True
                         else:
                             triggered, signal_candle, strategy_name, rsi_value = check_long_signal(
